@@ -25,12 +25,21 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "▸ codesign (identity: $SIGN_ID)"
+# When using the dedicated dev cert, unlock its keychain and sign against it so
+# TCC grants (FDA/Accessibility) persist across rebuilds.
+KCARG=()
+SIGNKC="$HOME/Library/Keychains/maverything-signing.keychain-db"
+if [ "$SIGN_ID" != "-" ] && [ -f "$SIGNKC" ]; then
+    security unlock-keychain -p mav "$SIGNKC" 2>/dev/null || true
+    KCARG=(--keychain "$SIGNKC")
+fi
 codesign --force --options runtime \
     --entitlements Resources/Maverything.entitlements \
-    --sign "$SIGN_ID" \
+    --sign "$SIGN_ID" "${KCARG[@]}" \
     "$APP" 2>&1 | sed 's/^/   /' || {
-        echo "   (runtime-hardened sign failed; retrying ad-hoc without hardened runtime)"
-        codesign --force --entitlements Resources/Maverything.entitlements --sign "$SIGN_ID" "$APP"
+        echo "   (runtime-hardened sign failed; retrying without hardened runtime)"
+        codesign --force --entitlements Resources/Maverything.entitlements \
+            --sign "$SIGN_ID" "${KCARG[@]}" "$APP"
     }
 
 echo "✓ built $APP"

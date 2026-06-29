@@ -18,6 +18,11 @@ let package = Package(
             dependencies: ["MaverythingCore"],
             swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         ),
+        .executableTarget(
+            name: "mvsim",
+            dependencies: ["MaverythingCore"],
+            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

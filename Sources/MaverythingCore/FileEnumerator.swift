@@ -240,7 +240,7 @@ public final class FileEnumerator: @unchecked Sendable {
                 let nameLen = Int(p.loadUnaligned(fromByteOffset: OFF_NAMEREF + 4, as: UInt32.self))
                 let realLen = nameLen > 0 ? nameLen - 1 : 0
                 let nameBase = (p + OFF_NAMEREF + nameOff).assumingMemoryBound(to: UInt8.self)
-                let nameBytes = Array(UnsafeBufferPointer(start: nameBase, count: realLen))
+                let nameBytes = canonicalNameBytes(UnsafeBufferPointer(start: nameBase, count: realLen))
                 out.append(DirEntry(name: nameBytes, size: dataLen,
                                     mtime: modSec &* 1_000_000_000 &+ modNsec,
                                     objType: objType, flags: flags))

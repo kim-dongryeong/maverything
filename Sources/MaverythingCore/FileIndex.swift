@@ -279,6 +279,20 @@ public let VNODE_VLNK: UInt8 = 5
     (b >= 65 && b <= 90) ? b &+ 32 : b
 }
 
+/// Canonicalize a filename to NFC. macOS/APFS often returns decomposed (NFD)
+/// bytes from getattrlistbulk, while users type composed (NFC) — without this,
+/// non-ASCII (e.g. Korean/한글) searches silently miss. ASCII names skip the work.
+@inline(__always) func canonicalNameBytes(_ buf: UnsafeBufferPointer<UInt8>) -> [UInt8] {
+    for b in buf where b >= 0x80 {
+        let s = String(decoding: buf, as: UTF8.self).precomposedStringWithCanonicalMapping
+        return Array(s.utf8)
+    }
+    return Array(buf)
+}
+@inline(__always) func canonicalNameBytes(_ a: [UInt8]) -> [UInt8] {
+    a.withUnsafeBufferPointer { canonicalNameBytes($0) }
+}
+
 /// A per-directory accumulation buffer, built thread-locally then appended once.
 struct ChildBatch {
     var blob: [UInt8] = []
@@ -293,8 +307,21 @@ struct ChildBatch {
     /// (localIndex, name) of child directories, to enqueue for further crawling.
     var subdirs: [(Int32, String)] = []
 
-    mutating func add(nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
+    mutating func add(nameBytes raw: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
                       objType t: UInt8, flags f: UInt32) {
+        // ASCII fast path: no allocation. Non-ASCII: normalize to NFC once.
+        var nonAscii = false
+        for b in raw where b >= 0x80 { nonAscii = true; break }
+        if nonAscii {
+            let canon = canonicalNameBytes(raw)
+            canon.withUnsafeBufferPointer { appendName($0, size: s, mtime: mt, objType: t, flags: f) }
+        } else {
+            appendName(raw, size: s, mtime: mt, objType: t, flags: f)
+        }
+    }
+
+    private mutating func appendName(_ nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
+                                     objType t: UInt8, flags f: UInt32) {
         let localIdx = Int32(len.count)
         off.append(UInt32(blob.count))
         len.append(UInt16(nameBytes.count))
@@ -303,7 +330,6 @@ struct ChildBatch {
         size.append(s); mtime.append(mt); objType.append(t); flags.append(f)
         let isHidden = (nameBytes.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0
         hidden.append(isHidden)
-        // getattrlistbulk never returns "." or ".." — every dir child is real.
         if t == VNODE_VDIR {
             subdirs.append((localIdx, String(decoding: nameBytes, as: UTF8.self)))
         }

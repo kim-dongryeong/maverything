@@ -56,7 +56,7 @@ public enum QueryParser {
             }
 
             let scope: TermScope = (tok.lowercased().hasPrefix("path:")) ? .path : defaultScope
-            let body = stripScopePrefix(tok)
+            let body = stripScopePrefix(tok).precomposedStringWithCanonicalMapping  // NFC to match index
             if body.isEmpty { continue }
             let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
             q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: scope))

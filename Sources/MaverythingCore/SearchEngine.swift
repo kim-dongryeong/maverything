@@ -286,5 +286,5 @@ public final class SearchEngine: @unchecked Sendable {
 }
 
 @inline(__always) func foldedBytes(_ s: String) -> [UInt8] {
-    Array(s.utf8).map(asciiLower)
+    Array(s.precomposedStringWithCanonicalMapping.utf8).map(asciiLower)
 }

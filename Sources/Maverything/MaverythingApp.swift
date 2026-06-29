@@ -46,28 +46,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     weak var mainWindow: NSWindow?
     private var hotKey: HotKey?
+    private var tapHotKey: EventTapHotKey?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         _ = reregisterHotKey()   // user-configurable global hotkey (default ⌥Space)
+        // Re-register on activation so granting Accessibility upgrades us to the
+        // event-tap mechanism (any-combo, e.g. ⇧Space) without a relaunch.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onActive),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
     }
 
-    /// (Re)register the global hotkey from the persisted config. Returns false if
-    /// the OS refused the combo (e.g. already taken) — in that case we restore the
-    /// default so the user is never left with NO hotkey. The OLD hotkey is released
-    /// first (same hotKeyID can't be registered twice). No Accessibility perm needed.
+    @objc private func onActive() {
+        // switch Carbon → event tap once Accessibility is granted
+        if Accessibility.isTrusted, tapHotKey == nil { _ = reregisterHotKey() }
+    }
+
+    /// (Re)register the global hotkey. Prefers a CGEventTap when Accessibility is
+    /// granted (handles ANY combo incl. ⇧Space, like BetterTouchTool); otherwise
+    /// falls back to Carbon RegisterEventHotKey (no permission, but loses combos
+    /// another process already grabs). Returns false only if everything failed.
     @discardableResult
     func reregisterHotKey() -> Bool {
-        hotKey = nil
+        hotKey = nil; tapHotKey = nil
         let cfg = HotkeyConfig.current
-        if let hk = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods,
-                           action: { [weak self] in self?.toggle() }) {
+        let act: () -> Void = { [weak self] in self?.toggle() }
+        if Accessibility.isTrusted,
+           let t = EventTapHotKey(keyCode: cfg.keyCode, mods: cfg.cocoaFlags, action: act) {
+            tapHotKey = t
+            return true
+        }
+        if let hk = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods, action: act) {
             hotKey = hk
             return true
         }
         let d = HotkeyConfig.default
-        hotKey = HotKey(keyCode: d.keyCode, modifiers: d.carbonMods,
-                        action: { [weak self] in self?.toggle() })
+        hotKey = HotKey(keyCode: d.keyCode, modifiers: d.carbonMods, action: act)
         return false
     }
 

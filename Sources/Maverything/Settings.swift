@@ -28,6 +28,15 @@ struct HotkeyConfig: Equatable {
         d.set(display, forKey: "mv.hotkey.display")
     }
 
+    var cocoaFlags: NSEvent.ModifierFlags {
+        var f: NSEvent.ModifierFlags = []
+        if carbonMods & UInt32(cmdKey) != 0 { f.insert(.command) }
+        if carbonMods & UInt32(optionKey) != 0 { f.insert(.option) }
+        if carbonMods & UInt32(controlKey) != 0 { f.insert(.control) }
+        if carbonMods & UInt32(shiftKey) != 0 { f.insert(.shift) }
+        return f
+    }
+
     static func carbonMods(from f: NSEvent.ModifierFlags) -> UInt32 {
         var m: UInt32 = 0
         if f.contains(.command) { m |= UInt32(cmdKey) }
@@ -158,6 +167,19 @@ struct SettingsView: View {
                 }
             }
             Text("Click the field, then press the key combination to summon Maverything from anywhere.")
+                .font(.caption).foregroundStyle(.secondary)
+            LabeledContent("Any-combo hotkeys") {
+                if Accessibility.isTrusted {
+                    Label("Enabled (Accessibility)", systemImage: "checkmark.seal")
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Enable…") {
+                        Accessibility.requestTrust()
+                        Accessibility.openSettings()
+                    }
+                }
+            }
+            Text("Enable to use shortcuts other apps also grab — like ⇧Space, ⌃Space (works like BetterTouchTool/Karabiner). Without it, prefer a ⌘/⌥/⌃ combo.")
                 .font(.caption).foregroundStyle(.secondary)
             Divider()
             Picker("Match mode", selection: $model.matchMode) {

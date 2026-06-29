@@ -6,3 +6,5 @@ prototype/bulkscan
 prototype/bulkscan_mt
 prototype/offsetcheck
 *.mvidx
+logs/
+docs/worklog.md

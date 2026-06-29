@@ -31,6 +31,10 @@ KCARG=()
 SIGNKC="$HOME/Library/Keychains/maverything-signing.keychain-db"
 if [ "$SIGN_ID" != "-" ] && [ -f "$SIGNKC" ]; then
     security unlock-keychain -p mav "$SIGNKC" 2>/dev/null || true
+    # Sign by SHA-1 hash so a same-named cert lingering in the login keychain
+    # doesn't make the identity ambiguous.
+    H=$(security find-certificate -c "$SIGN_ID" -Z "$SIGNKC" 2>/dev/null | awk '/SHA-1 hash:/{print $NF}')
+    [ -n "$H" ] && SIGN_ID="$H"
     KCARG=(--keychain "$SIGNKC")
 fi
 codesign --force --options runtime \

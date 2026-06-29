@@ -47,12 +47,15 @@ EXISTING=$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"
 # shellcheck disable=SC2086
 security list-keychains -d user -s "$KC" $EXISTING
 
-echo "▸ self-test: signing a throwaway binary…"
+echo "▸ self-test: signing a throwaway binary (by hash, unambiguous)…"
+HASH=$(security find-certificate -c "$CN" -Z "$KC" 2>/dev/null | awk '/SHA-1 hash:/{print $NF}')
+if [ -z "$HASH" ]; then echo "✗ could not read cert hash from $KC"; exit 1; fi
 cp /bin/echo "$WORK/echobin"
-if codesign --force -s "$CN" --keychain "$KC" "$WORK/echobin" 2>"$WORK/err"; then
+if codesign --force -s "$HASH" --keychain "$KC" "$WORK/echobin" 2>"$WORK/err"; then
     echo ""
-    echo "✓ SUCCESS — '$CN' can sign. Tell Claude; builds will use it and your"
-    echo "  Full Disk Access / Accessibility grants will persist across rebuilds."
+    echo "✓ SUCCESS — '$CN' ($HASH) can sign."
+    echo "  Tell Claude; builds will use it and your Full Disk Access / Accessibility"
+    echo "  grants will persist across rebuilds. (Sign-by-hash ignores any name dupes.)"
 else
     echo "✗ codesign self-test failed:"; cat "$WORK/err"; exit 1
 fi

@@ -1,62 +1,57 @@
 ## TURN: CLAUDE
-**Updated:** 2026-06-30 01:00
+**Updated:** 2026-06-30 01:30
 
 ## GOAL
-Milestone **L2 — UI layout variants + result polish** for Maverything. The engine now
-has 3 matching modes (exact/fuzzy/wildcard), an Everything-style query parser
-(ext/size/dm/path/name/NOT/quotes), and a relevance sort — all landed on main and
-validated by `mvsim` (34/34). This milestone is **all about the UI**: build **multiple
-window layouts the human can switch between live and pick a favorite** (the explicit rule:
-when there are options A/B/C, build them ALL, switchable — never choose for the user).
+Milestone **L3 — power features + performance + hardening** for Maverything. The app now
+has: 3 match modes (exact/fuzzy/wildcard), Everything-style query syntax, relevance sort,
+3 switchable layouts (table / compact bar / two-pane QuickLook preview), themes + density,
+icons + Kind column. Engine validated by `mvsim` (34/34) and the `mvfind` CLI. This batch
+adds the remaining power + speed, cross-reviews what landed, and grows the sim suite.
+Rule still in force: when a choice has options A/B/C, build them ALL, switchable.
 
 ## CODEBASE MAP
-- `Sources/Maverything/MaverythingApp.swift` — `@main`; SwiftUI `Window` + `MenuBarExtra`;
-  `AppDelegate` owns the global ⌥Space hotkey + `WindowConfigurator` (floating panel look).
-- `Sources/Maverything/ContentView.swift` — search bar (mode picker, gear menu), status bar.
-- `Sources/Maverything/ResultsTableView.swift` — AppKit `NSTableView` grid (Name/Path/Size/Date),
-  sortable, context menu (Open/Reveal/Copy Path), double-click open.
-- `Sources/Maverything/AppModel.swift` — `@Published` query/matchMode/scope/sortKey/results;
-  `resultsStore.ids`, `resultsVersion`. Resolve a row via `model.name/path/directory(id)`.
-- Engine (do not need to change): `Sources/MaverythingCore/*` — `SearchEngine.search(query,
-  mode:scope:sortKey:ascending:limit:now:)`, `MatchMode`, `SortKey` (incl `.relevance`).
-- Build: `swift build -c release`. Run the app: `./build.sh run`.
+- Engine: `Sources/MaverythingCore/` — `SearchEngine` (fast exact path + general evaluator;
+  `orderArray` cache invalidated by `invalidate()`), `Matching.swift` (`MatchMode`),
+  `QueryParser.swift`, `FileIndex` (SoA + live deltas + NFC), `Watcher`, `Snapshot`, `Volumes`.
+- App: `ContentView` (search bar, gear menu, `layoutBody` switch, `shortcuts`),
+  `ResultsTableView` (table), `CompactResults` (bar), `PreviewPane` (QuickLook), `UILayout.swift`
+  (UILayout/Appearance/RowDensity), `AppModel` (state + query pipeline + watcher + snapshot).
+- Harness: `mvsim` (scenarios → SIMULATION-REPORT.md), `mvtest` (perf on /usr), `mvfind` (CLI).
+- Build: `swift build -c release`. Run app: `./build.sh run`. Sim: `.build/release/mvsim`.
 
-## OPEN QUESTIONS  (→ build ALL options, switchable; do not choose for the user)
-1. **Window layouts** — implement all three behind a `Layout` enum the user switches live
-   (gear menu + ⌘1/⌘2/⌘3). Persist the choice in `UserDefaults`.
-   - A) **Compact "Spotlight bar"**: a narrow centered bar; results appear in a slim dropdown
-     list (name + path, ~8–12 rows) below the field. Esc hides. Alfred/Spotlight feel.
-   - B) **Full window table** (current `ResultsTableView`) — keep as a layout option.
-   - C) **Two-pane + preview**: results table on the left, a detail pane on the right showing
-     the selected file's QuickLook thumbnail (`QLThumbnailGenerator`) + metadata (full path,
-     size, dates, kind). Selection-driven.
-2. **Row polish (applies to table layouts)** — add a file **icon** (`NSWorkspace.shared.icon(forFile:)`,
-   cached) and a **Kind** column (UTType/`localizedDescription`), lazily resolved for visible rows only.
-3. **Theme** — offer at least 2 appearances (e.g. System, and a dark "pro" high-contrast),
-   switchable in the gear menu. (If quick, add a compact/comfortable row-density toggle too.)
+## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
+1. **More match modes** — add to `MatchMode` (keep exact/fuzzy/wildcard):
+   - D) **Regex** (`NSRegularExpression`, case-insensitive by default) — match name (or path).
+     Compile once; only run on candidates surviving cheap filters; guard pathological patterns.
+   - (optional) **Word/prefix-boundary** boosted exact (rank whole-word/prefix hits higher).
+2. **Performance (the #1 user goal is "instant")** — pick the wins and implement what's safe:
+   - Prewarm ALL sort orders (name/size/date) in the background after index-ready (not just name).
+   - Reduce the per-keystroke first-build cost on ~4M: faster name argsort (e.g. radix on the
+     first 4–8 bytes then memcmp tiebreak), or incremental order maintenance so a live FS delta
+     doesn't force a full re-sort. Measure with `mvtest` before/after; quote numbers.
+   - Don't rebuild the order when the search field is empty or the window is hidden.
+3. **Keyboard UX across layouts** — ↑/↓ move selection, ⏎ opens, ⌘⏎ reveals, in the compact bar
+   and two-pane (table already handles arrows). Esc clears then hides (already in ContentView).
 
 ## DONE-WHEN
-- [ ] `Layout` enum with all three layouts (A compact bar, B table, C two-pane preview); live switch + ⌘1/2/3; persisted.
-- [ ] Two-pane preview shows QuickLook thumbnail + metadata for the selected row.
-- [ ] File icons + Kind column in the table layouts (lazy, visible-rows-only, cached).
-- [ ] At least two switchable themes/appearances.
-- [ ] Each layout keeps search-as-you-type, ⌃U scope, mode switch, and column sort working.
-- [ ] Adversarially review the engine changes on main (run `mvsim`; add ≥4 new scenarios — e.g.
-      wildcard `?`, `size:` ranges, `dm:` ranges, NFC Korean) and confirm still 100% green.
-- [ ] build green (`swift build -c release`) · existing flows intact · no secrets · clean tree.
+- [ ] Regex match mode implemented + selectable; safe on big sets (filter-first, guarded).
+- [ ] All sort orders prewarmed off the main thread; empty-query/hidden-window skips rebuilds.
+- [ ] A measured name-sort or incremental-order improvement (mvtest numbers in the worklog).
+- [ ] Keyboard nav (↑/↓/⏎/⌘⏎) works in compact + two-pane layouts.
+- [ ] `mvsim` grown by ≥6 scenarios (regex, wildcard `?`, size ranges, dm ranges, NFC Korean,
+      snapshot resume, NOT+filters combo) — still 100% green.
+- [ ] Adversarially review the L2 UI + engine commits on main (red-team: lock discipline in any
+      engine edit, no eager per-row work in layouts, no regressions) — note findings in worklog.
+- [ ] build green · existing flows intact · no secrets · clean tree.
 
 ## CONSTRAINTS
 - Only edit files under this repo/worktree. NEVER `git push`. One focused increment per turn.
-- Prefer NEW files for new layouts (e.g. `CompactLayout.swift`, `PreviewPane.swift`) to keep
-  diffs reviewable. Don't regress the working table layout (it is layout B).
-- Keep the huge-result-set performance: visible-row-only work; no eager per-row icon/thumbnail
-  for all rows; `reloadData()` once per result batch.
-- Respect index lock discipline if you touch the engine. Prefer `## TURN: BLOCKED` + a crisp
-  question over guessing on irreversible choices.
+- Respect index lock discipline (search under `withReadLock`; `_name`/`_path` when locked).
+- Keep huge-result-set performance: visible-row-only work; `reloadData()` once per batch.
+- Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-CLAUDE: design round — sketch the `Layout` enum + how `ContentView` swaps subviews and persists
-the choice; then land increment 1 (the `Layout` enum, gear-menu switcher, ⌘1/2/3, and layout B
-wired through it with no behavior change). Hand to CODEX for the compact Spotlight-bar layout (A),
-then AGY for the two-pane QuickLook preview (C) + icons/Kind column. Loop back for themes + the
-mvsim cross-review.
+CLAUDE: design round — decide the perf approach (prewarm-all + skip-when-idle is the safe
+floor; radix name-sort is the stretch) and land increment 1 (prewarm all orders in background +
+skip rebuild on empty/hidden). Hand to CODEX for the Regex match mode, then AGY for keyboard nav
+across layouts. Loop back for the perf stretch + the mvsim growth + the L2 cross-review.

@@ -44,6 +44,12 @@ public final class SearchEngine: @unchecked Sendable {
                          sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
+        // Regex mode treats the whole query as one pattern (no term-splitting).
+        if mode == .regex, !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            return regexSearch(pattern: query, scope: scope, sortKey: sortKey,
+                               ascending: ascending, limit: limit, start: start, clock: clock)
+        }
+
         let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
 
         // empty query → return the chosen order directly
@@ -104,6 +110,48 @@ public final class SearchEngine: @unchecked Sendable {
             }}
         }}}}}
 
+        let total = chunkTotals.reduce(0, +)
+        var out = [Int32](); out.reserveCapacity(min(total, limit))
+        outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
+        return SearchResults(ids: out, total: total, truncated: total > out.count,
+                             queryMillis: secondsBetween(start, clock.now) * 1000)
+    }
+
+    // MARK: - regex mode (power mode; builds a String per candidate, so slower)
+
+    private func regexSearch(pattern: String, scope: SearchScope, sortKey: SortKey, ascending: Bool,
+                             limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return SearchResults(ids: [], total: 0, truncated: false,
+                                 queryMillis: secondsBetween(start, clock.now) * 1000)
+        }
+        let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+        let n = order.count
+        let usePath = (scope == .fullPath)
+        let nChunks = max(1, min(workerCount, n / 8_000 + 1))
+        let chunkSize = (n + nChunks - 1) / nChunks
+        var chunkIDs = [[Int32]](repeating: [], count: nChunks)
+        var chunkTotals = [Int](repeating: 0, count: nChunks)
+
+        order.withUnsafeBufferPointer { ordB in
+            chunkIDs.withUnsafeMutableBufferPointer { outIDs in
+            chunkTotals.withUnsafeMutableBufferPointer { outTot in
+                DispatchQueue.concurrentPerform(iterations: nChunks) { c in
+                    let lo = c * chunkSize, hi = min(n, lo + chunkSize)
+                    if lo >= hi { return }
+                    var ids = [Int32](); var total = 0
+                    for k in lo..<hi {
+                        let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        let s = usePath ? self.index._path(id) : self.index._name(id)
+                        let r = NSRange(s.startIndex..., in: s)
+                        if re.firstMatch(in: s, options: [], range: r) != nil {
+                            total += 1; if ids.count < limit { ids.append(Int32(id)) }
+                        }
+                    }
+                    outIDs[c] = ids; outTot[c] = total
+                }
+            }}
+        }
         let total = chunkTotals.reduce(0, +)
         var out = [Int32](); out.reserveCapacity(min(total, limit))
         outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }

@@ -7,12 +7,14 @@ public enum MatchMode: Int, Sendable, CaseIterable {
     case exact      // substring (Everything default) — fastest
     case fuzzy      // fzf/Sublime-style subsequence with scoring
     case wildcard   // glob: * and ? against the whole name (Everything wildcard)
+    case regex      // full regular expression (NSRegularExpression); slower power mode
 
     public var label: String {
         switch self {
         case .exact: return "Exact"
         case .fuzzy: return "Fuzzy"
         case .wildcard: return "Wildcard"
+        case .regex: return "Regex"
         }
     }
 }
@@ -40,6 +42,7 @@ public enum Matcher {
         case .exact:    return exact(hay, hayLen, needle, needleLen)
         case .fuzzy:    return fuzzy(hay, hayLen, needle, needleLen)
         case .wildcard: return wildcard(hay, hayLen, needle, needleLen)
+        case .regex:    return .no   // regex is handled by SearchEngine.regexSearch, not here
         }
     }
 

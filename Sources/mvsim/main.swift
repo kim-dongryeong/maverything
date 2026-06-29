@@ -116,6 +116,12 @@ let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
 
+// regex mode
+check("regex: '^report\\.' matches report.txt", has("^report\\.", "report.txt", mode: .regex))
+check("regex: '\\.png$' matches image_001.png", has("\\.png$", "image_001.png", mode: .regex))
+check("regex: '\\.png$' excludes notes.md", !has("\\.png$", "notes.md", mode: .regex))
+check("regex: invalid pattern → no crash, empty", engine.search("[", mode: .regex, limit: 10, now: now).total == 0)
+
 // empty query returns everything
 check("empty query returns all \(index.count)", engine.search("", limit: 1_000_000, now: now).total == index.count)
 

@@ -28,13 +28,16 @@ EOF
 
 echo "▸ generating self-signed code-signing cert…"
 openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 3650 -config "$WORK/cfg" 2>/dev/null
+    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 3650 -config "$WORK/cfg"
 openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -out "$WORK/id.p12" -passout pass:mav -name "$CN" 2>/dev/null
+    -out "$WORK/id.p12" -passout pass:mav -name "$CN"
 
-echo "▸ importing into login keychain (-A lets codesign use the key without prompting)…"
+echo "▸ importing into login keychain (a dialog may ask you to Allow)…"
 security import "$WORK/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P mav -A
 
 echo "▸ verifying…"
-security find-identity -v -p codesigning | grep "$CN" || { echo "✗ not found after import"; exit 1; }
-echo "✓ created '$CN'. Build with:  MAVERYTHING_SIGN_ID=\"$CN\" ./build.sh"
+if security find-identity -v -p codesigning | grep -q "$CN"; then
+    echo "✓ created '$CN'. Now tell Claude — it will build with this identity so FDA/Accessibility stick."
+else
+    echo "✗ not found after import (see errors above)"; exit 1
+fi

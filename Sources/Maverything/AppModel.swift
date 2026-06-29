@@ -103,6 +103,9 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             self?.saveSnapshot(sync: true)
         }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appBecameActive),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
     }
 
     private var progressTimer: Timer?
@@ -242,11 +245,15 @@ final class AppModel: ObservableObject {
     // Coalesce bursts of filesystem changes into one index refresh so we don't
     // rebuild the sort order (and burn a core) on every individual event.
     private var liveRefreshScheduled = false
+    private var pendingLiveRefresh = false
     private func scheduleLiveRefresh() {
         snapshotDirty = true
+        // When the app isn't frontmost, background file churn shouldn't burn a core
+        // rebuilding the sort order — defer until the user comes back.
+        guard NSApp.isActive else { pendingLiveRefresh = true; return }
         guard !liveRefreshScheduled else { return }
         liveRefreshScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             guard let self else { return }
             self.liveRefreshScheduled = false
             guard !self.isIndexing else { return }
@@ -254,6 +261,12 @@ final class AppModel: ObservableObject {
             self.indexedCount = self.index.count
             self.runSearch()
         }
+    }
+
+    @objc private func appBecameActive() {
+        guard pendingLiveRefresh else { return }
+        pendingLiveRefresh = false
+        scheduleLiveRefresh()
     }
 
     // MARK: - Snapshot persistence
@@ -325,13 +338,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Build the default sort order off the main thread (so the first keystroke
-    /// is instant), then run the current query.
+    /// Warm ALL sort orders off the main thread (so the first search and any
+    /// column-sort switch are instant), then run the current query.
     private func prewarmAndSearch() {
         let engine = self.engine
-        let sk = sortKey, asc = ascending
         searchQueue.async {
-            _ = engine.search("", sortKey: sk, ascending: asc, limit: 1)  // warms the order cache
+            for k in [SortKey.name, .size, .dateModified] {
+                _ = engine.search("", sortKey: k, ascending: true, limit: 1)
+            }
         }
         runSearch()
     }

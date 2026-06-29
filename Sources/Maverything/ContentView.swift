@@ -44,13 +44,12 @@ struct ContentView: View {
                 }.buttonStyle(.plain)
             }
 
-            Picker("", selection: $model.scope) {
-                Text("Name").tag(SearchScope.nameOnly)
-                Text("Path").tag(SearchScope.fullPath)
+            Picker("", selection: $model.matchMode) {
+                ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 130)
-            .help("⌃U toggles matching the full path")
+            .frame(width: 200)
+            .help("Matching mode — build-all-variants: Exact / Fuzzy / Wildcard")
 
             gearMenu
         }
@@ -60,6 +59,19 @@ struct ContentView: View {
 
     private var gearMenu: some View {
         Menu {
+            Picker("Scope", selection: $model.scope) {
+                Text("Name only").tag(SearchScope.nameOnly)
+                Text("Full path  (⌃U)").tag(SearchScope.fullPath)
+            }
+            Picker("Sort by", selection: $model.sortKey) {
+                Text("Name").tag(SortKey.name)
+                Text("Path").tag(SortKey.path)
+                Text("Size").tag(SortKey.size)
+                Text("Date Modified").tag(SortKey.dateModified)
+                Text("Relevance").tag(SortKey.relevance)
+            }
+            Toggle("Ascending", isOn: $model.ascending)
+            Divider()
             Toggle("Include cloud storage (Google Drive, iCloud…)", isOn: Binding(
                 get: { model.includeCloud },
                 set: { model.setIncludeCloud($0) }))

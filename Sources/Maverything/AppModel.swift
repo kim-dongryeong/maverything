@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
     @Published var sortKey: SortKey = .name
     @Published var ascending = true
     @Published var scope: SearchScope = .nameOnly
+    @Published var matchMode: MatchMode = .exact
     @Published var isIndexing = true
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
@@ -72,10 +73,11 @@ final class AppModel: ObservableObject {
             .sink { [weak self] _ in self?.runSearch() }
             .store(in: &cancellables)
 
-        Publishers.Merge3(
+        Publishers.Merge4(
             $sortKey.map { _ in () },
             $ascending.map { _ in () },
-            $scope.map { _ in () }
+            $scope.map { _ in () },
+            $matchMode.map { _ in () }
         )
         .dropFirst()
         .sink { [weak self] in self?.runSearch() }
@@ -291,11 +293,12 @@ final class AppModel: ObservableObject {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
         searchSeq &+= 1
         let seq = searchSeq
-        let q = query, sk = sortKey, asc = ascending, sc = scope
+        let q = query, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
+        let now = Date().timeIntervalSince1970
         let engine = self.engine
         searchQueue.async { [weak self] in
             guard let self else { return }
-            let res = engine.search(q, scope: sc, sortKey: sk, ascending: asc)
+            let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc, now: now)
             DispatchQueue.main.async {
                 guard seq == self.searchSeq else { return }   // drop stale
                 self.resultsStore.ids = res.ids

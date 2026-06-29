@@ -121,6 +121,7 @@ private struct WindowConfigurator: NSViewRepresentable {
             window.titleVisibility = .hidden
             window.isMovableByWindowBackground = true
             window.standardWindowButton(.zoomButton)?.isHidden = false
+            window.setFrameAutosaveName("MaverythingMainWindow")   // remember size & position
         }
         return v
     }

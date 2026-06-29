@@ -249,7 +249,8 @@ struct ResultsTableView: NSViewRepresentable {
             let cell = makeCell(tableView, colID: colID)
             switch colID {
             case "name":
-                cell.textField?.stringValue = model.name(id)
+                if let attr = highlightedName(id) { cell.textField?.attributedStringValue = attr }
+                else { cell.textField?.stringValue = model.name(id) }
                 cell.imageView?.image = IconCache.icon(for: model.path(id))
             case "kind":
                 cell.textField?.stringValue = KindCache.kind(for: model.path(id),
@@ -281,6 +282,45 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.textField?.stringValue = ""
             }
             return cell
+        }
+
+        /// Highlight the matched part of the filename (exact substring or fuzzy
+        /// subsequence). Returns nil to render plain text.
+        private func highlightedName(_ id: Int32) -> NSAttributedString? {
+            let q = model.query.trimmingCharacters(in: .whitespaces)
+            guard !q.isEmpty else { return nil }
+            let name = model.name(id)
+            let attr = NSMutableAttributedString(string: name)
+            let hl: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.controlAccentColor,
+                .font: NSFont.boldSystemFont(ofSize: 12),
+            ]
+            switch model.matchMode {
+            case .exact:
+                if q.contains(" ") || q.contains("*") || q.contains("?") || q.contains(":") { return nil }
+                var range = name.startIndex..<name.endIndex
+                var found = false
+                while let r = name.range(of: q, options: .caseInsensitive, range: range) {
+                    found = true
+                    attr.addAttributes(hl, range: NSRange(r, in: name))
+                    range = r.upperBound..<name.endIndex
+                }
+                return found ? attr : nil
+            case .fuzzy:
+                let lowerQ = Array(q.lowercased())
+                var qi = 0
+                var s = name.startIndex
+                while s < name.endIndex && qi < lowerQ.count {
+                    if String(name[s]).lowercased().first == lowerQ[qi] {
+                        attr.addAttributes(hl, range: NSRange(s..<name.index(after: s), in: name))
+                        qi += 1
+                    }
+                    s = name.index(after: s)
+                }
+                return qi == lowerQ.count ? attr : nil
+            default:
+                return nil   // wildcard / regex: no inline highlight
+            }
         }
 
         private func makeCell(_ tableView: NSTableView, colID: String) -> NSTableCellView {

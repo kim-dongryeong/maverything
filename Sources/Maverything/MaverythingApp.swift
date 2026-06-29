@@ -72,15 +72,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKey = nil; tapHotKey = nil
         let cfg = HotkeyConfig.current
         let act: () -> Void = { [weak self] in self?.toggle() }
-        if Accessibility.isTrusted,
-           let t = EventTapHotKey(keyCode: cfg.keyCode, mods: cfg.cocoaFlags, action: act) {
-            tapHotKey = t
-            return true
+        let trusted = Accessibility.isTrusted
+        Diag.log("reregisterHotKey: \(cfg.display) keyCode=\(cfg.keyCode) carbonMods=\(cfg.carbonMods) AXtrusted=\(trusted)")
+        if trusted {
+            if let t = EventTapHotKey(keyCode: cfg.keyCode, mods: cfg.cocoaFlags, action: act) {
+                tapHotKey = t; Diag.log("  -> event tap OK")
+                return true
+            }
+            Diag.log("  -> event tap FAILED (will try Carbon)")
         }
         if let hk = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods, action: act) {
-            hotKey = hk
+            hotKey = hk; Diag.log("  -> Carbon OK")
             return true
         }
+        Diag.log("  -> Carbon FAILED; restoring default ⌥Space")
         let d = HotkeyConfig.default
         hotKey = HotKey(keyCode: d.keyCode, modifiers: d.carbonMods, action: act)
         return false

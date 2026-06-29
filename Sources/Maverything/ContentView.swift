@@ -54,6 +54,7 @@ struct ContentView: View {
             TextField("Search every file…", text: $model.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 16))
+                .frame(maxWidth: .infinity)           // absorb slack so controls don't overlap
                 .focused($searchFocused)
                 .onKeyPress(.downArrow) {                 // ↓ moves focus into the results
                     model.focusResultsNonce &+= 1; return .handled
@@ -72,55 +73,15 @@ struct ContentView: View {
                 ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 200)
-            .help("Matching mode — build-all-variants: Exact / Fuzzy / Wildcard")
+            .fixedSize()                              // size to its 4 segments; no overlap
+            .help("Matching mode: Exact / Fuzzy / Wildcard / Regex")
 
-            gearMenu
+            OptionsButton(model: model)
+                .frame(width: 22, height: 22)
+                .help("Options")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-    }
-
-    private var gearMenu: some View {
-        Menu {
-            Picker("Layout", selection: $model.layout) {
-                ForEach(UILayout.allCases) { Label($0.label, systemImage: $0.symbol).tag($0) }
-            }
-            Picker("Appearance", selection: $model.appearance) {
-                ForEach(Appearance.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Density", selection: $model.density) {
-                ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Scope", selection: $model.scope) {
-                Text("Name only").tag(SearchScope.nameOnly)
-                Text("Full path  (⌃U)").tag(SearchScope.fullPath)
-            }
-            Picker("Sort by", selection: $model.sortKey) {
-                Text("Name").tag(SortKey.name)
-                Text("Path").tag(SortKey.path)
-                Text("Size").tag(SortKey.size)
-                Text("Date Modified").tag(SortKey.dateModified)
-                Text("Date Created").tag(SortKey.dateCreated)
-                Text("Relevance").tag(SortKey.relevance)
-            }
-            Toggle("Ascending", isOn: $model.ascending)
-            Divider()
-            Toggle("Include cloud storage (Google Drive, iCloud…)", isOn: Binding(
-                get: { model.includeCloud },
-                set: { model.setIncludeCloud($0) }))
-            Button("Reindex Now") { model.reindex() }
-            Divider()
-            if model.hasFullDiskAccess {
-                Label("Full Disk Access granted", systemImage: "checkmark.seal")
-            } else {
-                Button("Grant Full Disk Access…") { model.showOnboarding = true }
-            }
-        } label: {
-            Image(systemName: "gearshape")
-        }
-        .menuStyle(.borderlessButton)
-        .frame(width: 28)
     }
 
     private var statusBar: some View {

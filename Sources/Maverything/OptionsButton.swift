@@ -49,6 +49,8 @@ struct OptionsButton: NSViewRepresentable {
             check(m, "Include cloud storage (Google Drive, iCloud…)", model.includeCloud, cmd: "cloud")
             item(m, "Reindex Now", cmd: "reindex")
             if !model.hasFullDiskAccess { item(m, "Grant Full Disk Access…", cmd: "fda") }
+            m.addItem(.separator())
+            item(m, "Settings…", cmd: "settings")
             m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
         }
 
@@ -95,6 +97,11 @@ struct OptionsButton: NSViewRepresentable {
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()
             case "fda":     model.showOnboarding = true
+            case "settings":
+                NSApp.activate(ignoringOtherApps: true)
+                if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+                    NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+                }
             default: break
             }
         }

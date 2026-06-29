@@ -27,9 +27,14 @@ struct MaverythingApp: App {
             }
         }
 
+        Settings {
+            SettingsView().environmentObject(model)
+        }
+
         MenuBarExtra("Maverything", systemImage: "magnifyingglass.circle") {
-            Button("Show Maverything  (⌥Space)") { delegate.summon() }
+            Button("Show Maverything") { delegate.summon() }
             Button("Reindex Now") { model.reindex() }
+            SettingsLink { Text("Settings…") }
             Divider()
             Button("Quit Maverything") { model.saveSnapshot(sync: true); NSApp.terminate(nil) }
         }
@@ -44,11 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        // ⌥Space summons/dismisses the window from anywhere (no Accessibility perm).
-        hotKey = HotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey)) { [weak self] in
+        registerHotKey()   // user-configurable global hotkey (default ⌥Space)
+    }
+
+    /// (Re)register the global hotkey from the persisted config. No Accessibility
+    /// permission needed (Carbon RegisterEventHotKey).
+    func registerHotKey() {
+        let cfg = HotkeyConfig.current
+        hotKey = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods) { [weak self] in
             self?.toggle()
         }
     }
+    func reregisterHotKey() { hotKey = nil; registerHotKey() }   // deinit unregisters the old one
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         summon(); return true

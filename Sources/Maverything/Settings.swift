@@ -163,6 +163,10 @@ struct SettingsView: View {
             Picker("Row density", selection: $model.density) {
                 ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
             }
+            Divider()
+            Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)
+            Text("F2 always renames. Space = Quick Look · ⌘⌫ = Move to Trash · drag rows to Finder to copy/move.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(20)
     }

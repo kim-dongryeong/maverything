@@ -22,10 +22,13 @@ final class MVTableView: NSTableView {
             coordinator?.moveToTrash(); return
         }
         switch event.keyCode {
+        case 120:           // F2 → rename
+            coordinator?.beginRename()
         case 49:            // space → toggle Quick Look
             toggleQuickLook()
-        case 36, 76:        // return / enter → open
-            coordinator?.openItem()
+        case 36, 76:        // return / enter → open (or rename, per setting)
+            if coordinator?.model.enterRenames == true { coordinator?.beginRename() }
+            else { coordinator?.openItem() }
         case 126:           // up arrow at the top → hand focus back to the search field
             if selectedRow <= 0 { coordinator?.focusSearch() } else { super.keyDown(with: event) }
         default:
@@ -205,7 +208,7 @@ struct ResultsTableView: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate,
-                             QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+                             QLPreviewPanelDataSource, QLPreviewPanelDelegate, NSTextFieldDelegate {
         var model: AppModel
         weak var tableView: NSTableView?
         var lastVersion = -1
@@ -283,9 +286,11 @@ struct ResultsTableView: NSViewRepresentable {
         private func makeCell(_ tableView: NSTableView, colID: String) -> NSTableCellView {
             let identifier = NSUserInterfaceItemIdentifier(colID)
             if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
-                // reset overridable attrs
-                reused.textField?.textColor = .labelColor
-                reused.textField?.alignment = .left
+                // reset overridable attrs (incl. any leftover rename-edit state)
+                let tf = reused.textField
+                tf?.textColor = .labelColor; tf?.alignment = .left
+                tf?.isEditable = false; tf?.isSelectable = false
+                tf?.isBordered = false; tf?.drawsBackground = false
                 return reused
             }
             let cell = NSTableCellView()
@@ -441,6 +446,44 @@ struct ResultsTableView: NSViewRepresentable {
         }
 
         @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }
+
+        // MARK: - inline rename (F2 / configurable Enter)
+
+        private var renamingID: Int32?
+        func beginRename() {
+            guard let tv = tableView, tv.selectedRow >= 0, tv.selectedRow < ids.count else { return }
+            let row = tv.selectedRow
+            let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+            guard col >= 0,
+                  let cell = tv.view(atColumn: col, row: row, makeIfNecessary: true) as? NSTableCellView,
+                  let tf = cell.textField else { return }
+            renamingID = ids[row]
+            tf.isEditable = true; tf.isSelectable = true; tf.isBordered = true
+            tf.drawsBackground = true; tf.backgroundColor = .textBackgroundColor
+            tf.delegate = self
+            tv.window?.makeFirstResponder(tf)
+            if let editor = tf.currentEditor() {   // select basename (like Finder)
+                let base = (tf.stringValue as NSString).deletingPathExtension
+                editor.selectedRange = NSRange(location: 0, length: (base as NSString).length)
+            }
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard let tf = obj.object as? NSTextField, let id = renamingID else { return }
+            renamingID = nil
+            tf.isEditable = false; tf.isSelectable = false; tf.isBordered = false; tf.drawsBackground = false
+            let newName = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let oldPath = model.path(Int32(id))
+            let oldName = (oldPath as NSString).lastPathComponent
+            guard !newName.isEmpty, newName != oldName, !newName.contains("/") else {
+                tf.stringValue = oldName; return
+            }
+            let newPath = ((oldPath as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent(newName)
+            do { try FileManager.default.moveItem(atPath: oldPath, toPath: newPath) }
+            catch { NSSound.beep(); tf.stringValue = oldName }
+            // the FSEvents watcher reconciles the rename into the index shortly
+        }
 
         @objc func moveToTrash() {
             for p in selectedPaths() {

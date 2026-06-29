@@ -45,6 +45,9 @@ final class AppModel: ObservableObject {
     @Published var showOnboarding = false
     @Published var includeCloud = false        // index ~/Library/CloudStorage etc.
     @Published var showHidden = true            // Everything-style: show everything
+    @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
+        didSet { UserDefaults.standard.set(enterRenames, forKey: "mv.enterRenames") }
+    }
     @Published var focusNonce = 0              // bumped to refocus the search field
     @Published var focusResultsNonce = 0       // bumped to move focus into the results list
     @Published var selectedID: Int32? = nil    // current selection (for the preview pane)

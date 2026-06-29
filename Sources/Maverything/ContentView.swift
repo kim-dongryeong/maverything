@@ -101,6 +101,7 @@ struct ContentView: View {
                 Text("Path").tag(SortKey.path)
                 Text("Size").tag(SortKey.size)
                 Text("Date Modified").tag(SortKey.dateModified)
+                Text("Date Created").tag(SortKey.dateCreated)
                 Text("Relevance").tag(SortKey.relevance)
             }
             Toggle("Ascending", isOn: $model.ascending)

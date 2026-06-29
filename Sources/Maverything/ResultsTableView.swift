@@ -11,6 +11,13 @@ final class MVTableView: NSTableView {
     weak var coordinator: ResultsTableView.Coordinator?
 
     override func keyDown(with event: NSEvent) {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == [.command, .option], event.keyCode == 8 {   // ⌘⌥C → copy path
+            coordinator?.copyPath(); return
+        }
+        if mods == [.command], event.keyCode == 15 {           // ⌘R → reveal in Finder
+            coordinator?.revealItem(); return
+        }
         switch event.keyCode {
         case 49:            // space → toggle Quick Look
             toggleQuickLook()
@@ -58,6 +65,23 @@ enum KindCache {
 struct ResultsTableView: NSViewRepresentable {
     @ObservedObject var model: AppModel
 
+    struct ColumnSpec { let id, title, sortKey: String; let width: CGFloat; let right: Bool; let visible: Bool }
+    static let columns: [ColumnSpec] = [
+        .init(id: "name",    title: "Name",          sortKey: "name",    width: 260, right: false, visible: true),
+        .init(id: "path",    title: "Path",          sortKey: "path",    width: 360, right: false, visible: true),
+        .init(id: "ext",     title: "Extension",     sortKey: "name",    width: 90,  right: false, visible: false),
+        .init(id: "kind",    title: "Kind",          sortKey: "name",    width: 130, right: false, visible: false),
+        .init(id: "size",    title: "Size",          sortKey: "size",    width: 90,  right: true,  visible: true),
+        .init(id: "date",    title: "Date Modified", sortKey: "date",    width: 150, right: false, visible: true),
+        .init(id: "created", title: "Date Created",  sortKey: "created", width: 150, right: false, visible: false),
+    ]
+    static func columnVisible(_ id: String, default def: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: "mv.col.\(id)") as? Bool ?? def
+    }
+    static func setColumnVisible(_ id: String, _ v: Bool) {
+        UserDefaults.standard.set(v, forKey: "mv.col.\(id)")
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -76,20 +100,39 @@ struct ResultsTableView: NSViewRepresentable {
         table.usesAutomaticRowHeights = false
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
 
-        addColumn(table, id: "name", title: "Name", width: 280, sortKey: "name")
-        addColumn(table, id: "path", title: "Path", width: 380, sortKey: "path")
-        addColumn(table, id: "kind", title: "Kind", width: 130, sortKey: "name")
-        addColumn(table, id: "size", title: "Size", width: 90, sortKey: "size", right: true)
-        addColumn(table, id: "date", title: "Date Modified", width: 160, sortKey: "date")
+        for col in Self.columns {
+            addColumn(table, id: col.id, title: col.title, width: col.width,
+                      sortKey: col.sortKey, right: col.right)
+        }
+        // apply persisted visibility (default per column)
+        for col in Self.columns {
+            if let c = table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(col.id)) {
+                c.isHidden = !Self.columnVisible(col.id, default: col.visible)
+            }
+        }
+        // right-click the header to choose columns (Everything-style)
+        table.headerView?.menu = context.coordinator.makeHeaderMenu()
 
         table.sortDescriptors = [NSSortDescriptor(key: "name", ascending: true)]
 
-        // Context menu
+        // Context menu (right-click)
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open", action: #selector(Coordinator.openItem), keyEquivalent: "")
-        menu.addItem(withTitle: "Reveal in Finder", action: #selector(Coordinator.revealItem), keyEquivalent: "")
-        menu.addItem(withTitle: "Copy Path", action: #selector(Coordinator.copyPath), keyEquivalent: "")
-        menu.items.forEach { $0.target = context.coordinator }
+        func add(_ title: String, _ sel: Selector, key: String = "",
+                 mask: NSEvent.ModifierFlags = []) {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+            it.keyEquivalentModifierMask = mask
+            it.target = context.coordinator
+            menu.addItem(it)
+        }
+        add("Open", #selector(Coordinator.openItem), key: "\r")
+        add("Open Enclosing Folder", #selector(Coordinator.openEnclosing))
+        add("Quick Look", #selector(Coordinator.quickLook), key: " ")
+        menu.addItem(.separator())
+        add("Reveal in Finder", #selector(Coordinator.revealItem), key: "r", mask: [.command])
+        menu.addItem(.separator())
+        add("Copy Path", #selector(Coordinator.copyPath), key: "c", mask: [.command, .option])
+        add("Copy Name", #selector(Coordinator.copyName))
+        add("Copy File", #selector(Coordinator.copyFile))
         table.menu = menu
 
         context.coordinator.tableView = table
@@ -184,6 +227,14 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.textField?.stringValue = KindCache.kind(for: model.path(id),
                                                               isDir: model.index.isDir(Int(id)))
                 cell.textField?.textColor = .secondaryLabelColor
+            case "ext":
+                cell.textField?.stringValue = (model.name(id) as NSString).pathExtension
+                cell.textField?.textColor = .secondaryLabelColor
+            case "created":
+                let ns = model.index.crtime[Int(id)]
+                cell.textField?.stringValue = ns == 0 ? "--"
+                    : dateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
+                cell.textField?.textColor = .secondaryLabelColor
             case "path":
                 cell.textField?.stringValue = model.directory(id)
                 cell.textField?.textColor = .secondaryLabelColor
@@ -253,6 +304,29 @@ struct ResultsTableView: NSViewRepresentable {
             }
         }
 
+        // MARK: - column chooser (right-click the header)
+
+        func makeHeaderMenu() -> NSMenu {
+            let menu = NSMenu()
+            for col in ResultsTableView.columns where col.id != "name" {   // Name always shown
+                let item = NSMenuItem(title: col.title, action: #selector(toggleColumn(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = col.id
+                item.state = ResultsTableView.columnVisible(col.id, default: col.visible) ? .on : .off
+                menu.addItem(item)
+            }
+            return menu
+        }
+
+        @objc func toggleColumn(_ sender: NSMenuItem) {
+            guard let id = sender.representedObject as? String, let tv = tableView,
+                  let c = tv.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(id)) else { return }
+            let nowVisible = c.isHidden          // was hidden → make visible
+            c.isHidden = !nowVisible
+            ResultsTableView.setColumnVisible(id, nowVisible)
+            sender.state = nowVisible ? .on : .off
+        }
+
         func rowForID(_ id: Int32) -> Int? {
             let arr = ids
             for i in 0..<arr.count where arr[i] == id { return i }
@@ -290,6 +364,7 @@ struct ResultsTableView: NSViewRepresentable {
             case "path": mapped = .path
             case "size": mapped = .size
             case "date": mapped = .dateModified
+            case "created": mapped = .dateCreated
             default: mapped = .name
             }
             model.sortKey = mapped
@@ -321,5 +396,25 @@ struct ResultsTableView: NSViewRepresentable {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(joined, forType: .string)
         }
+
+        @objc func copyName() {
+            let names = selectedPaths().map { ($0 as NSString).lastPathComponent }.joined(separator: "\n")
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(names, forType: .string)
+        }
+
+        @objc func copyFile() {   // copy the actual file(s) so they can be pasted in Finder
+            let urls = selectedPaths().map { URL(fileURLWithPath: $0) as NSURL }
+            guard !urls.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects(urls)
+        }
+
+        @objc func openEnclosing() {
+            let dirs = Set(selectedPaths().map { ($0 as NSString).deletingLastPathComponent })
+            for d in dirs { NSWorkspace.shared.open(URL(fileURLWithPath: d)) }
+        }
+
+        @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }
     }
 }

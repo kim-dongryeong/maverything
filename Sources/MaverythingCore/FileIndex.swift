@@ -20,7 +20,8 @@ public final class FileIndex: @unchecked Sendable {
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
     public internal(set) var size: [Int64] = []       // logical bytes (0 for dirs)
-    public internal(set) var mtime: [Int64] = []      // nanoseconds since 1970
+    public internal(set) var mtime: [Int64] = []      // modified, nanoseconds since 1970
+    public internal(set) var crtime: [Int64] = []     // created, nanoseconds since 1970
     public internal(set) var objType: [UInt8] = []    // VREG=1 VDIR=2 VLNK=5
     public internal(set) var flags: [UInt32] = []     // BSD st_flags
     public internal(set) var hidden: [Bool] = []      // name starts with '.' or UF_HIDDEN
@@ -53,7 +54,8 @@ public final class FileIndex: @unchecked Sendable {
         foldBlob.removeAll(keepingCapacity: false)
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
-        mtime.removeAll(keepingCapacity: false); objType.removeAll(keepingCapacity: false)
+        mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
+        objType.removeAll(keepingCapacity: false)
         flags.removeAll(keepingCapacity: false); hidden.removeAll(keepingCapacity: false)
         deleted.removeAll(keepingCapacity: false)
         childrenOf.removeAll(keepingCapacity: false)
@@ -63,6 +65,7 @@ public final class FileIndex: @unchecked Sendable {
     public func reserveCapacity(_ n: Int) {
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
+        crtime.reserveCapacity(n)
         objType.reserveCapacity(n); flags.reserveCapacity(n); hidden.reserveCapacity(n)
         deleted.reserveCapacity(n)
     }
@@ -79,7 +82,7 @@ public final class FileIndex: @unchecked Sendable {
         nameBlob.append(contentsOf: bytes)
         foldBlob.append(contentsOf: bytes.map(asciiLower))
         parent.append(-1)
-        size.append(0); mtime.append(0)
+        size.append(0); mtime.append(0); crtime.append(0)
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
         return idx   // live-update maps are built in bulk post-crawl (buildLiveIndexes)
     }
@@ -99,6 +102,7 @@ public final class FileIndex: @unchecked Sendable {
         nameLen.append(contentsOf: batch.len)
         size.append(contentsOf: batch.size)
         mtime.append(contentsOf: batch.mtime)
+        crtime.append(contentsOf: batch.crtime)
         objType.append(contentsOf: batch.objType)
         flags.append(contentsOf: batch.flags)
         hidden.append(contentsOf: batch.hidden)
@@ -213,7 +217,7 @@ public final class FileIndex: @unchecked Sendable {
                 newList.append(oi)
             } else {
                 let ni = _appendOne(parent: dirIdx, name: c.name, size: c.size,
-                                    mtime: c.mtime, objType: c.objType, flags: c.flags)
+                                    mtime: c.mtime, crtime: c.crtime, objType: c.objType, flags: c.flags)
                 newList.append(ni)
                 if c.objType == VNODE_VDIR {
                     let cp = displayPath == "/" ? "/" + nameStr : displayPath + "/" + nameStr
@@ -229,12 +233,12 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func _appendOne(parent p: Int32, name: [UInt8], size s: Int64, mtime mt: Int64,
-                            objType t: UInt8, flags f: UInt32) -> Int32 {
+                            crtime ct: Int64, objType t: UInt8, flags f: UInt32) -> Int32 {
         let idx = Int32(nameOff.count)
         nameOff.append(UInt32(nameBlob.count)); nameLen.append(UInt16(name.count))
         nameBlob.append(contentsOf: name)
         for b in name { foldBlob.append(asciiLower(b)) }
-        parent.append(p); size.append(s); mtime.append(mt); objType.append(t); flags.append(f)
+        parent.append(p); size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         hidden.append((name.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0)
         deleted.append(false)
         return idx
@@ -255,10 +259,12 @@ public struct DirEntry: Sendable {
     public let name: [UInt8]
     public let size: Int64
     public let mtime: Int64
+    public let crtime: Int64
     public let objType: UInt8
     public let flags: UInt32
-    public init(name: [UInt8], size: Int64, mtime: Int64, objType: UInt8, flags: UInt32) {
-        self.name = name; self.size = size; self.mtime = mtime; self.objType = objType; self.flags = flags
+    public init(name: [UInt8], size: Int64, mtime: Int64, crtime: Int64, objType: UInt8, flags: UInt32) {
+        self.name = name; self.size = size; self.mtime = mtime; self.crtime = crtime
+        self.objType = objType; self.flags = flags
     }
 }
 
@@ -301,6 +307,7 @@ struct ChildBatch {
     var len: [UInt16] = []
     var size: [Int64] = []
     var mtime: [Int64] = []
+    var crtime: [Int64] = []
     var objType: [UInt8] = []
     var flags: [UInt32] = []
     var hidden: [Bool] = []
@@ -308,26 +315,26 @@ struct ChildBatch {
     var subdirs: [(Int32, String)] = []
 
     mutating func add(nameBytes raw: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
-                      objType t: UInt8, flags f: UInt32) {
+                      crtime ct: Int64, objType t: UInt8, flags f: UInt32) {
         // ASCII fast path: no allocation. Non-ASCII: normalize to NFC once.
         var nonAscii = false
         for b in raw where b >= 0x80 { nonAscii = true; break }
         if nonAscii {
             let canon = canonicalNameBytes(raw)
-            canon.withUnsafeBufferPointer { appendName($0, size: s, mtime: mt, objType: t, flags: f) }
+            canon.withUnsafeBufferPointer { appendName($0, size: s, mtime: mt, crtime: ct, objType: t, flags: f) }
         } else {
-            appendName(raw, size: s, mtime: mt, objType: t, flags: f)
+            appendName(raw, size: s, mtime: mt, crtime: ct, objType: t, flags: f)
         }
     }
 
     private mutating func appendName(_ nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
-                                     objType t: UInt8, flags f: UInt32) {
+                                     crtime ct: Int64, objType t: UInt8, flags f: UInt32) {
         let localIdx = Int32(len.count)
         off.append(UInt32(blob.count))
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
         for b in nameBytes { fold.append(asciiLower(b)) }
-        size.append(s); mtime.append(mt); objType.append(t); flags.append(f)
+        size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         let isHidden = (nameBytes.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0
         hidden.append(isHidden)
         if t == VNODE_VDIR {

@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-public enum SortKey: Int, Sendable { case name, path, size, dateModified, relevance }
+public enum SortKey: Int, Sendable { case name, path, size, dateModified, dateCreated, relevance }
 public enum SearchScope: Int, Sendable { case nameOnly, fullPath }
 
 public struct SearchResults: Sendable {
@@ -312,6 +312,9 @@ public final class SearchEngine: @unchecked Sendable {
         case .dateModified:
             let mt = index.mtime
             ids.sort { mt[Int($0)] != mt[Int($1)] ? mt[Int($0)] < mt[Int($1)] : $0 < $1 }
+        case .dateCreated:
+            let ct = index.crtime
+            ids.sort { ct[Int($0)] != ct[Int($1)] ? ct[Int($0)] < ct[Int($1)] : $0 < $1 }
         case .name, .path, .relevance:   // path/relevance use name order as the scan base
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in

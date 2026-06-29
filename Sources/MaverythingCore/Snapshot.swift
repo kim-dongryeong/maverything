@@ -6,7 +6,7 @@ import Foundation
 /// lets us replay changes that happened while the app was closed.
 public enum Snapshot {
     static let magic: UInt32 = 0x4D56_4931   // "MVI1"
-    static let version: UInt32 = 2
+    static let version: UInt32 = 3           // v3 adds crtime (Date Created)
 
     public static func defaultURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -36,6 +36,7 @@ extension FileIndex {
         var oParent = [Int32](); oParent.reserveCapacity(live)
         var oSize = [Int64](); oSize.reserveCapacity(live)
         var oMtime = [Int64](); oMtime.reserveCapacity(live)
+        var oCrtime = [Int64](); oCrtime.reserveCapacity(live)
         var oType = [UInt8](); oType.reserveCapacity(live)
         var oFlags = [UInt32](); oFlags.reserveCapacity(live)
         var oHidden = [UInt8](); oHidden.reserveCapacity(live)
@@ -49,8 +50,8 @@ extension FileIndex {
             oFold.append(contentsOf: foldBlob[o..<o+l])
             let p = parent[i]
             oParent.append(p < 0 ? -1 : remap[Int(p)])
-            oSize.append(size[i]); oMtime.append(mtime[i]); oType.append(objType[i])
-            oFlags.append(flags[i]); oHidden.append(hidden[i] ? 1 : 0)
+            oSize.append(size[i]); oMtime.append(mtime[i]); oCrtime.append(crtime[i])
+            oType.append(objType[i]); oFlags.append(flags[i]); oHidden.append(hidden[i] ? 1 : 0)
         }
 
         var d = Data()
@@ -67,6 +68,7 @@ extension FileIndex {
         appendArrayBytes(oParent, &d)
         appendArrayBytes(oSize, &d)
         appendArrayBytes(oMtime, &d)
+        appendArrayBytes(oCrtime, &d)
         appendArrayBytes(oType, &d)
         appendArrayBytes(oFlags, &d)
         appendArrayBytes(oHidden, &d)
@@ -95,6 +97,7 @@ extension FileIndex {
             parent = readArray(raw, &off, count, Int32.self)
             size = readArray(raw, &off, count, Int64.self)
             mtime = readArray(raw, &off, count, Int64.self)
+            crtime = readArray(raw, &off, count, Int64.self)
             objType = readArray(raw, &off, count, UInt8.self)
             flags = readArray(raw, &off, count, UInt32.self)
             let hid = readArray(raw, &off, count, UInt8.self)

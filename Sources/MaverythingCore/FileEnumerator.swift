@@ -12,6 +12,7 @@ public final class FileEnumerator: @unchecked Sendable {
     private static let A_CMN_NAME: UInt32    = 0x0000_0001
     private static let A_CMN_FSID: UInt32    = 0x0000_0004
     private static let A_CMN_OBJTYPE: UInt32 = 0x0000_0008
+    private static let A_CMN_CRTIME: UInt32  = 0x0000_0200
     private static let A_CMN_MODTIME: UInt32 = 0x0000_0400
     private static let A_CMN_FLAGS: UInt32   = 0x0004_0000
     private static let A_CMN_FILEID: UInt32  = 0x0200_0000
@@ -19,15 +20,19 @@ public final class FileEnumerator: @unchecked Sendable {
     private static let OPT_PACK_INVAL: UInt64 = 0x0000_0008
     private static let OPT_NOFOLLOW: UInt64    = 0x0000_0001
 
-    // Tight-packed record field offsets.
+    // Tight-packed record field offsets (validated in prototype/offsetcheck).
+    // len(4) returned(20) name@24 fsid@32 objtype@40 crtime@44 modtime@60
+    // flags@76 fileid@80 datalen@88
     private static let OFF_NAMEREF = 24
     private static let OFF_FSID    = 32
     private static let OFF_OBJTYPE = 40
-    private static let OFF_MODSEC  = 44
-    private static let OFF_MODNSEC = 52
-    private static let OFF_FLAGS   = 60
-    private static let OFF_FILEID  = 64
-    private static let OFF_DATALEN = 72
+    private static let OFF_CRSEC   = 44
+    private static let OFF_CRNSEC  = 52
+    private static let OFF_MODSEC  = 60
+    private static let OFF_MODNSEC = 68
+    private static let OFF_FLAGS   = 76
+    private static let OFF_FILEID  = 80
+    private static let OFF_DATALEN = 88
 
     public struct Stats {
         public var files = 0
@@ -121,7 +126,7 @@ public final class FileEnumerator: @unchecked Sendable {
         var attr = attrlist()
         attr.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
         attr.commonattr = Self.A_CMN_RETURNED_ATTRS | Self.A_CMN_NAME | Self.A_CMN_FSID
-            | Self.A_CMN_OBJTYPE | Self.A_CMN_MODTIME | Self.A_CMN_FLAGS | Self.A_CMN_FILEID
+            | Self.A_CMN_OBJTYPE | Self.A_CMN_CRTIME | Self.A_CMN_MODTIME | Self.A_CMN_FLAGS | Self.A_CMN_FILEID
         attr.fileattr = Self.A_FILE_DATALENGTH
         let options = Self.OPT_PACK_INVAL | Self.OPT_NOFOLLOW
 
@@ -191,6 +196,8 @@ public final class FileEnumerator: @unchecked Sendable {
                 }
 
                 let objType = UInt8(truncatingIfNeeded: p.loadUnaligned(fromByteOffset: Self.OFF_OBJTYPE, as: UInt32.self))
+                let crSec = p.loadUnaligned(fromByteOffset: Self.OFF_CRSEC, as: Int64.self)
+                let crNsec = p.loadUnaligned(fromByteOffset: Self.OFF_CRNSEC, as: Int64.self)
                 let modSec = p.loadUnaligned(fromByteOffset: Self.OFF_MODSEC, as: Int64.self)
                 let modNsec = p.loadUnaligned(fromByteOffset: Self.OFF_MODNSEC, as: Int64.self)
                 let flags = p.loadUnaligned(fromByteOffset: Self.OFF_FLAGS, as: UInt32.self)
@@ -203,7 +210,9 @@ public final class FileEnumerator: @unchecked Sendable {
                 let nameBuf = UnsafeBufferPointer(start: nameBase, count: realLen)
 
                 let mtime = modSec &* 1_000_000_000 &+ modNsec
-                batch.add(nameBytes: nameBuf, size: dataLen, mtime: mtime, objType: objType, flags: flags)
+                let crtime = crSec &* 1_000_000_000 &+ crNsec
+                batch.add(nameBytes: nameBuf, size: dataLen, mtime: mtime, crtime: crtime,
+                          objType: objType, flags: flags)
                 if objType == VNODE_VDIR { local.dirs += 1 } else { local.files += 1 }
 
                 p = p + entryLen
@@ -220,7 +229,7 @@ public final class FileEnumerator: @unchecked Sendable {
         var attr = attrlist()
         attr.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
         attr.commonattr = A_CMN_RETURNED_ATTRS | A_CMN_NAME | A_CMN_FSID
-            | A_CMN_OBJTYPE | A_CMN_MODTIME | A_CMN_FLAGS | A_CMN_FILEID
+            | A_CMN_OBJTYPE | A_CMN_CRTIME | A_CMN_MODTIME | A_CMN_FLAGS | A_CMN_FILEID
         attr.fileattr = A_FILE_DATALENGTH
         let options = OPT_PACK_INVAL | OPT_NOFOLLOW
         let bufSize = 256 * 1024
@@ -237,6 +246,8 @@ public final class FileEnumerator: @unchecked Sendable {
             for _ in 0..<count {
                 let entryLen = Int(p.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
                 let objType = UInt8(truncatingIfNeeded: p.loadUnaligned(fromByteOffset: OFF_OBJTYPE, as: UInt32.self))
+                let crSec = p.loadUnaligned(fromByteOffset: OFF_CRSEC, as: Int64.self)
+                let crNsec = p.loadUnaligned(fromByteOffset: OFF_CRNSEC, as: Int64.self)
                 let modSec = p.loadUnaligned(fromByteOffset: OFF_MODSEC, as: Int64.self)
                 let modNsec = p.loadUnaligned(fromByteOffset: OFF_MODNSEC, as: Int64.self)
                 let flags = p.loadUnaligned(fromByteOffset: OFF_FLAGS, as: UInt32.self)
@@ -248,6 +259,7 @@ public final class FileEnumerator: @unchecked Sendable {
                 let nameBytes = canonicalNameBytes(UnsafeBufferPointer(start: nameBase, count: realLen))
                 out.append(DirEntry(name: nameBytes, size: dataLen,
                                     mtime: modSec &* 1_000_000_000 &+ modNsec,
+                                    crtime: crSec &* 1_000_000_000 &+ crNsec,
                                     objType: objType, flags: flags))
                 p = p + entryLen
             }

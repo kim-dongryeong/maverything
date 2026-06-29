@@ -49,18 +49,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        registerHotKey()   // user-configurable global hotkey (default ⌥Space)
+        _ = reregisterHotKey()   // user-configurable global hotkey (default ⌥Space)
     }
 
-    /// (Re)register the global hotkey from the persisted config. No Accessibility
-    /// permission needed (Carbon RegisterEventHotKey).
-    func registerHotKey() {
+    /// (Re)register the global hotkey from the persisted config. Returns false if
+    /// the OS refused the combo (e.g. already taken) — in that case we restore the
+    /// default so the user is never left with NO hotkey. The OLD hotkey is released
+    /// first (same hotKeyID can't be registered twice). No Accessibility perm needed.
+    @discardableResult
+    func reregisterHotKey() -> Bool {
+        hotKey = nil
         let cfg = HotkeyConfig.current
-        hotKey = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods) { [weak self] in
-            self?.toggle()
+        if let hk = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods,
+                           action: { [weak self] in self?.toggle() }) {
+            hotKey = hk
+            return true
         }
+        let d = HotkeyConfig.default
+        hotKey = HotKey(keyCode: d.keyCode, modifiers: d.carbonMods,
+                        action: { [weak self] in self?.toggle() })
+        return false
     }
-    func reregisterHotKey() { hotKey = nil; registerHotKey() }   // deinit unregisters the old one
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         summon(); return true

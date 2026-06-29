@@ -137,8 +137,17 @@ struct SettingsView: View {
             LabeledContent("Global hotkey") {
                 HStack {
                     HotkeyRecorder(display: $hotkeyDisplay) { cfg in
+                        let previous = HotkeyConfig.current
                         cfg.save()
-                        (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+                        let ok = (NSApp.delegate as? AppDelegate)?.reregisterHotKey() ?? false
+                        if !ok {                       // OS refused the combo → restore + tell the user
+                            previous.save()
+                            hotkeyDisplay = previous.display
+                            let a = NSAlert()
+                            a.messageText = "Couldn't set “\(cfg.display)”"
+                            a.informativeText = "That shortcut is reserved or already in use. Try another — combos with ⌘, ⌥, or ⌃ work best."
+                            a.runModal()
+                        }
                     }
                     .frame(width: 170, height: 26)
                     Button("Reset") {

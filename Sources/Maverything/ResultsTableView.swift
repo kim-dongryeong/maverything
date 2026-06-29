@@ -1,6 +1,23 @@
 import AppKit
 import MaverythingCore
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Caches "Kind" strings by extension (UTType lookup is not free).
+enum KindCache {
+    private static var cache: [String: String] = [:]
+    private static let lock = NSLock()
+    static func kind(for path: String, isDir: Bool) -> String {
+        if isDir { return "Folder" }
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ext.isEmpty { return "Document" }
+        lock.lock(); defer { lock.unlock() }
+        if let c = cache[ext] { return c }
+        let k = UTType(filenameExtension: ext)?.localizedDescription ?? "\(ext.uppercased()) file"
+        cache[ext] = k
+        return k
+    }
+}
 
 /// AppKit view-based NSTableView wrapped for SwiftUI. SwiftUI's own Table/List
 /// cannot handle these row counts; NSTableView recycles row views so cost is
@@ -25,7 +42,8 @@ struct ResultsTableView: NSViewRepresentable {
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
 
         addColumn(table, id: "name", title: "Name", width: 280, sortKey: "name")
-        addColumn(table, id: "path", title: "Path", width: 420, sortKey: "path")
+        addColumn(table, id: "path", title: "Path", width: 380, sortKey: "path")
+        addColumn(table, id: "kind", title: "Kind", width: 130, sortKey: "name")
         addColumn(table, id: "size", title: "Size", width: 90, sortKey: "size", right: true)
         addColumn(table, id: "date", title: "Date Modified", width: 160, sortKey: "date")
 
@@ -99,6 +117,11 @@ struct ResultsTableView: NSViewRepresentable {
             switch colID {
             case "name":
                 cell.textField?.stringValue = model.name(id)
+                cell.imageView?.image = IconCache.icon(for: model.path(id))
+            case "kind":
+                cell.textField?.stringValue = KindCache.kind(for: model.path(id),
+                                                              isDir: model.index.isDir(Int(id)))
+                cell.textField?.textColor = .secondaryLabelColor
             case "path":
                 cell.textField?.stringValue = model.directory(id)
                 cell.textField?.textColor = .secondaryLabelColor
@@ -135,11 +158,26 @@ struct ResultsTableView: NSViewRepresentable {
             tf.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(tf)
             cell.textField = tf
-            NSLayoutConstraint.activate([
-                tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-                tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            ])
+            if colID == "name" {
+                let iv = NSImageView()
+                iv.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(iv); cell.imageView = iv
+                NSLayoutConstraint.activate([
+                    iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                    iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    iv.widthAnchor.constraint(equalToConstant: 15),
+                    iv.heightAnchor.constraint(equalToConstant: 15),
+                    tf.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 5),
+                    tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+                    tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                ])
+            } else {
+                NSLayoutConstraint.activate([
+                    tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                    tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+                    tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                ])
+            }
             return cell
         }
 

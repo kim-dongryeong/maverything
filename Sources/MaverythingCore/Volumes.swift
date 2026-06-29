@@ -22,32 +22,20 @@ public enum Volumes {
         var roots: [CrawlRoot] = []
         var seen = Set<String>()
 
+        // The boot volume group: crawl "/" and FOLLOW firmlinks (they are real dirs
+        // on the Data volume spliced into "/"), giving the whole /Users…/Applications…
+        // namespace exactly once with normal paths. Cross-volume MOUNTS are skipped
+        // during this crawl (see Volumes.allMountPoints) and indexed as their own
+        // roots below — so nothing is double-counted and the Data volume is never
+        // reached via /System/Volumes/Data.
+        add(&roots, &seen, CrawlRoot(fsPath: "/", displayPath: "/"))
+
         for v in mounted() {
             let mp = v.mountPoint
-            guard v.isLocal else { continue }
+            guard v.isLocal, mp != "/" else { continue }
             if v.fsType == "devfs" || v.fsType == "autofs" || v.fsType == "fdesc" { continue }
-
-            if mp == "/" {
-                add(&roots, &seen, CrawlRoot(fsPath: "/", displayPath: "/"))
-            } else if mp == "/System/Volumes/Data" {
-                // firmlinked into / — present as "/"
-                add(&roots, &seen, CrawlRoot(fsPath: mp, displayPath: "/"))
-            } else if mp.hasPrefix("/System/Volumes/") {
-                continue   // VM, Preboot, Update, xarts, Hardware … system internals
-            } else {
-                // /Volumes/* removable & DMGs, CoreSimulator runtime volumes, etc.
-                if !includeRemovable && v.isRemovableOrBrowsable == false { /* keep */ }
-                add(&roots, &seen, CrawlRoot(fsPath: mp, displayPath: mp))
-            }
-        }
-
-        // Guarantee the two boot volumes even if getmntinfo ordering surprises us.
-        if !roots.contains(where: { $0.fsPath == "/" }) {
-            roots.insert(CrawlRoot(fsPath: "/", displayPath: "/"), at: 0)
-        }
-        if FileManager.default.fileExists(atPath: "/System/Volumes/Data"),
-           !roots.contains(where: { $0.fsPath == "/System/Volumes/Data" }) {
-            roots.append(CrawlRoot(fsPath: "/System/Volumes/Data", displayPath: "/"))
+            if mp.hasPrefix("/System/Volumes/") { continue }   // Data/VM/Preboot/… (Data via firmlinks)
+            add(&roots, &seen, CrawlRoot(fsPath: mp, displayPath: mp))   // /Volumes/*, simulator vols, …
         }
         return roots
     }
@@ -63,6 +51,13 @@ public enum Volumes {
         ]
         // Note: /Volumes and cross-volume mounts are handled by the fsid guard,
         // not by path exclusion (so explicit /Volumes/* roots still crawl fully).
+    }
+
+    /// All mount points on the system (any fs type). The crawler skips descending
+    /// into these (each real volume is crawled as its own root), which prevents
+    /// the `/` crawl from re-indexing the Data volume under `/System/Volumes/Data`.
+    public static func allMountPoints() -> Set<String> {
+        Set(mounted().map { $0.mountPoint })
     }
 
     // MARK: - getmntinfo

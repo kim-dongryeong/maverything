@@ -176,7 +176,8 @@ final class AppModel: ObservableObject {
                 self.index.reserveCapacity(3_000_000)
                 self.currentEnumerator = en
             }
-            let stats = en.crawl(roots: roots, restrictToVolume: true, exclude: exclude)
+            let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
+                                 mountPoints: Volumes.allMountPoints())
             if en.isCancelled { return }                     // superseded; skip extra work
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }

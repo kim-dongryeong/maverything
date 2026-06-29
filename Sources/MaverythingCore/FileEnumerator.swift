@@ -48,6 +48,7 @@ public final class FileEnumerator: @unchecked Sendable {
     private var cancelledFlag = false
     private var stat = Stats()
     private var excludePrefixes: [String] = []
+    private var mountPoints: Set<String> = []   // other volumes' mount points → don't descend
 
     /// Signals a running crawl to stop ASAP (workers drain and return).
     public func cancel() {
@@ -63,9 +64,9 @@ public final class FileEnumerator: @unchecked Sendable {
     /// Convenience: crawl plain paths (fsPath == displayPath).
     @discardableResult
     public func crawl(roots: [String], restrictToVolume: Bool = false,
-                      exclude: [String] = []) -> Stats {
+                      exclude: [String] = [], mountPoints: Set<String> = []) -> Stats {
         crawl(roots: roots.map { CrawlRoot(fsPath: $0, displayPath: $0) },
-              restrictToVolume: restrictToVolume, exclude: exclude)
+              restrictToVolume: restrictToVolume, exclude: exclude, mountPoints: mountPoints)
     }
 
     /// Crawl the given roots. `restrictToVolume: true` refuses descent into
@@ -74,10 +75,14 @@ public final class FileEnumerator: @unchecked Sendable {
     /// not descend into (cloud storage etc.). Blocks until complete.
     @discardableResult
     public func crawl(roots: [CrawlRoot], restrictToVolume: Bool = false,
-                      exclude: [String] = []) -> Stats {
+                      exclude: [String] = [], mountPoints: Set<String> = []) -> Stats {
         let clock = ContinuousClock()
         let start = clock.now
         excludePrefixes = exclude
+        // Don't descend into mount points (each real volume is crawled as its own
+        // root). A root's own fsPath is added directly, never via the child loop,
+        // so keeping it in the set is harmless (children are always deeper).
+        self.mountPoints = mountPoints
 
         for r in roots {
             let rootIdx = index.appendRoot(path: r.displayPath)
@@ -136,7 +141,7 @@ public final class FileEnumerator: @unchecked Sendable {
                         var pushed = false
                         for (localIdx, name) in batch.subdirs {
                             let childFs = fsPath == "/" ? "/" + name : fsPath + "/" + name
-                            if isExcluded(childFs) { continue }
+                            if isExcluded(childFs) || mountPoints.contains(childFs) { continue }
                             let childDisp = displayPath == "/" ? "/" + name : displayPath + "/" + name
                             stack.append((childFs, childDisp, base + localIdx, fsidGuard))
                             pushed = true

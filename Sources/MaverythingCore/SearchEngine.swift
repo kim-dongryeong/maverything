@@ -320,16 +320,28 @@ public final class SearchEngine: @unchecked Sendable {
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
                 let base = fb.baseAddress!
-                ids.sort { a, b in
-                    let ia = Int(a), ib = Int(b)
+                // Pack the first 8 folded bytes into a UInt64 so most comparisons are
+                // a single integer compare; fall back to memcmp only on an 8-byte tie.
+                @inline(__always) func key64(_ i: Int) -> UInt64 {
+                    let o = Int(offB[i]); let l = min(Int(lenB[i]), 8)
+                    var k: UInt64 = 0
+                    var j = 0
+                    while j < l { k |= UInt64(base[o + j]) << (56 - 8 * j); j += 1 }
+                    return k
+                }
+                var pairs = ids.map { (key64(Int($0)), $0) }
+                pairs.sort { a, b in
+                    if a.0 != b.0 { return a.0 < b.0 }
+                    let ia = Int(a.1), ib = Int(b.1)
                     let oa = Int(offB[ia]), la = Int(lenB[ia])
                     let ob = Int(offB[ib]), lb = Int(lenB[ib])
                     let m = min(la, lb)
                     let r = m > 0 ? memcmp(base + oa, base + ob, m) : 0
                     if r != 0 { return r < 0 }
                     if la != lb { return la < lb }
-                    return a < b
+                    return a.1 < b.1
                 }
+                for k in 0..<pairs.count { ids[k] = pairs[k].1 }
             }}}
         }
         return ids

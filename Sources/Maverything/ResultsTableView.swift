@@ -368,6 +368,14 @@ struct ResultsTableView: NSViewRepresentable {
             guard let tv = tableView else { return }
             let row = tv.selectedRow
             model.selectedID = (row >= 0 && row < ids.count) ? ids[row] : nil
+            // Finder-style selection summary
+            let rows = tv.selectedRowIndexes
+            model.selectionCount = rows.count
+            var bytes: Int64 = 0
+            for r in rows where r < ids.count {
+                let i = Int(ids[r]); if !model.index.isDir(i) { bytes += model.index.size[i] }
+            }
+            model.selectionBytes = bytes
             // keep an open Quick Look in sync as the selection moves (Finder-style)
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()

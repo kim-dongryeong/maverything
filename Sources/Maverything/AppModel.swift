@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     @Published var focusNonce = 0              // bumped to refocus the search field
     @Published var focusResultsNonce = 0       // bumped to move focus into the results list
     @Published var selectedID: Int32? = nil    // current selection (for the preview pane)
+    @Published var selectionCount = 0
+    @Published var selectionBytes: Int64 = 0
     @Published var layout: UILayout = UILayout(rawValue:
         UserDefaults.standard.string(forKey: "mv.layout") ?? "") ?? .table {
         didSet { UserDefaults.standard.set(layout.rawValue, forKey: "mv.layout") }

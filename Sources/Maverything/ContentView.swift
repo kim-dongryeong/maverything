@@ -89,6 +89,13 @@ struct ContentView: View {
             if model.isIndexing {
                 ProgressView().controlSize(.small)
                 Text(model.statusText)
+            } else if model.selectionCount > 1 {
+                Text("\(model.selectionCount.formatted()) selected")
+                Text("·").foregroundStyle(.tertiary)
+                Text(ByteCountFormatter.string(fromByteCount: model.selectionBytes, countStyle: .file))
+                    .foregroundStyle(.secondary)
+                Text("·").foregroundStyle(.tertiary)
+                Text("\(model.resultTotal.formatted()) results").foregroundStyle(.secondary)
             } else {
                 Text("\(model.resultTotal.formatted()) results")
                 Text("·").foregroundStyle(.tertiary)

@@ -1,59 +1,62 @@
 ## TURN: CLAUDE
-**Updated:** 2026-06-30 00:40
+**Updated:** 2026-06-30 01:00
 
 ## GOAL
-Milestone **L1 — Search power + matching-mode variants** for Maverything (a macOS
-voidtools-Everything clone, pure Swift). Add Everything-style query syntax AND build
-**multiple matching/ranking modes the user can switch between live** — so the human can
-test each and pick favorites. This is the explicit instruction: when a choice has options
-A/B/C, **build them all and make them switchable**, never pick one silently.
+Milestone **L2 — UI layout variants + result polish** for Maverything. The engine now
+has 3 matching modes (exact/fuzzy/wildcard), an Everything-style query parser
+(ext/size/dm/path/name/NOT/quotes), and a relevance sort — all landed on main and
+validated by `mvsim` (34/34). This milestone is **all about the UI**: build **multiple
+window layouts the human can switch between live and pick a favorite** (the explicit rule:
+when there are options A/B/C, build them ALL, switchable — never choose for the user).
 
 ## CODEBASE MAP
-- `Sources/MaverythingCore/SearchEngine.swift` — the search. Today: multi-core `memmem`
-  exact substring over `index.foldBlob`, scanned in a cached argsort order (`orderArray`),
-  top-K, name/size/date sort. `search(query, scope, sortKey, ascending, limit)`.
-- `Sources/MaverythingCore/FileIndex.swift` — struct-of-arrays index (nameBlob/foldBlob,
-  nameOff/nameLen, parent, size, mtime, objType, flags, hidden, deleted). `path(i)`, `name(i)`.
-- `Sources/MaverythingCore/{FileEnumerator,Watcher,Snapshot,Volumes,Permissions}.swift`.
-- `Sources/Maverything/` — app: `AppModel` (query pipeline, `scope`, `sortKey`), `ContentView`
-  (search bar, ⌃U scope toggle, gear menu), `ResultsTableView` (NSTableView).
-- `Sources/mvtest/main.swift` — headless engine harness (run: `swift build -c release && .build/release/mvtest /usr png`).
-- Build: `swift build -c release`. Keep the index lock discipline: search runs inside
-  `index.withReadLock`; use `_name`/`_path` (non-locking) when the lock is held.
+- `Sources/Maverything/MaverythingApp.swift` — `@main`; SwiftUI `Window` + `MenuBarExtra`;
+  `AppDelegate` owns the global ⌥Space hotkey + `WindowConfigurator` (floating panel look).
+- `Sources/Maverything/ContentView.swift` — search bar (mode picker, gear menu), status bar.
+- `Sources/Maverything/ResultsTableView.swift` — AppKit `NSTableView` grid (Name/Path/Size/Date),
+  sortable, context menu (Open/Reveal/Copy Path), double-click open.
+- `Sources/Maverything/AppModel.swift` — `@Published` query/matchMode/scope/sortKey/results;
+  `resultsStore.ids`, `resultsVersion`. Resolve a row via `model.name/path/directory(id)`.
+- Engine (do not need to change): `Sources/MaverythingCore/*` — `SearchEngine.search(query,
+  mode:scope:sortKey:ascending:limit:now:)`, `MatchMode`, `SortKey` (incl `.relevance`).
+- Build: `swift build -c release`. Run the app: `./build.sh run`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; do not choose for the user)
-1. **Matching modes** — implement all three behind a `MatchMode` enum the UI switches live:
-   - A) **Exact substring** (current behavior) — keep as the baseline.
-   - B) **Fuzzy subsequence** (fzf/Sublime style): all needle chars in order, scored
-     (consecutive + word-boundary + camelCase + path-depth bonuses), ranked by score.
-   - C) **Wildcard/glob**: `*` and `?` honored; whole-name match semantics like Everything.
-   Add a `MatchMode` segmented control (or gear submenu) in `ContentView`; wire through
-   `AppModel` → `SearchEngine.search`. Default = Exact.
-2. **Query syntax** (Everything-style; parse in a new `QueryParser`):
-   - space = AND of terms; `"quoted phrase"`; leading `!`/`-` = NOT a term.
-   - filters: `ext:swift`, `size:>1mb` / `size:<10k`, `dm:today` / `dm:>2026-01-01`,
-     `path:foo` (match path), `name:foo` (match name), `case:` (case-sensitive this query).
-   - Build it so unknown tokens fall back to a plain substring term (never error).
-3. **Ranking when sortKey = .name** — offer a `.relevance` sort option too (match position /
-   fuzzy score / shorter-path-first). Add `.relevance` to `SortKey` and the column/menu.
+1. **Window layouts** — implement all three behind a `Layout` enum the user switches live
+   (gear menu + ⌘1/⌘2/⌘3). Persist the choice in `UserDefaults`.
+   - A) **Compact "Spotlight bar"**: a narrow centered bar; results appear in a slim dropdown
+     list (name + path, ~8–12 rows) below the field. Esc hides. Alfred/Spotlight feel.
+   - B) **Full window table** (current `ResultsTableView`) — keep as a layout option.
+   - C) **Two-pane + preview**: results table on the left, a detail pane on the right showing
+     the selected file's QuickLook thumbnail (`QLThumbnailGenerator`) + metadata (full path,
+     size, dates, kind). Selection-driven.
+2. **Row polish (applies to table layouts)** — add a file **icon** (`NSWorkspace.shared.icon(forFile:)`,
+   cached) and a **Kind** column (UTType/`localizedDescription`), lazily resolved for visible rows only.
+3. **Theme** — offer at least 2 appearances (e.g. System, and a dark "pro" high-contrast),
+   switchable in the gear menu. (If quick, add a compact/comfortable row-density toggle too.)
 
 ## DONE-WHEN
-- [ ] `MatchMode` enum (exact/fuzzy/wildcard) implemented in the engine; all three work.
-- [ ] `QueryParser` parses terms + filters (ext/size/dm/path/name/quotes/NOT) with substring fallback.
-- [ ] `SortKey.relevance` added and selectable; results ranked sensibly per mode.
-- [ ] UI: a live mode switcher + the new sort option; ⌃U path scope still works.
-- [ ] `mvtest` extended with cases proving each mode + a few filters (printed PASS/FAIL).
-- [ ] build green (`swift build -c release`) · existing search/sort/watch flows intact · no secrets · clean tree.
+- [ ] `Layout` enum with all three layouts (A compact bar, B table, C two-pane preview); live switch + ⌘1/2/3; persisted.
+- [ ] Two-pane preview shows QuickLook thumbnail + metadata for the selected row.
+- [ ] File icons + Kind column in the table layouts (lazy, visible-rows-only, cached).
+- [ ] At least two switchable themes/appearances.
+- [ ] Each layout keeps search-as-you-type, ⌃U scope, mode switch, and column sort working.
+- [ ] Adversarially review the engine changes on main (run `mvsim`; add ≥4 new scenarios — e.g.
+      wildcard `?`, `size:` ranges, `dm:` ranges, NFC Korean) and confirm still 100% green.
+- [ ] build green (`swift build -c release`) · existing flows intact · no secrets · clean tree.
 
 ## CONSTRAINTS
 - Only edit files under this repo/worktree. NEVER `git push`. One focused increment per turn.
-- Do NOT regress current behavior (exact substring must stay the default and work).
-- Respect the index lock discipline (search under `withReadLock`; `_name`/`_path` when locked).
-- Avoid editing `Package.swift` unless you must add a target; if you do, keep it minimal.
-- Prefer `## TURN: BLOCKED` + a crisp question over guessing on anything irreversible.
+- Prefer NEW files for new layouts (e.g. `CompactLayout.swift`, `PreviewPane.swift`) to keep
+  diffs reviewable. Don't regress the working table layout (it is layout B).
+- Keep the huge-result-set performance: visible-row-only work; no eager per-row icon/thumbnail
+  for all rows; `reloadData()` once per result batch.
+- Respect index lock discipline if you touch the engine. Prefer `## TURN: BLOCKED` + a crisp
+  question over guessing on irreversible choices.
 
 ## NEXT
-CLAUDE: design round — in worklog, sketch the `MatchMode` enum + `QueryParser` shape and
-the engine dispatch, then land increment 1 (the `MatchMode` enum + a `FuzzyMatcher` that
-compiles and is unit-exercised in `mvtest`). Hand to CODEX to add the wildcard mode +
-QueryParser, then AGY to wire the UI switcher + relevance sort.
+CLAUDE: design round — sketch the `Layout` enum + how `ContentView` swaps subviews and persists
+the choice; then land increment 1 (the `Layout` enum, gear-menu switcher, ⌘1/2/3, and layout B
+wired through it with no behavior change). Hand to CODEX for the compact Spotlight-bar layout (A),
+then AGY for the two-pane QuickLook preview (C) + icons/Kind column. Loop back for themes + the
+mvsim cross-review.

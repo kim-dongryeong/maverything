@@ -55,6 +55,9 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 16))
                 .focused($searchFocused)
+                .onKeyPress(.downArrow) {                 // ↓ moves focus into the results
+                    model.focusResultsNonce &+= 1; return .handled
+                }
                 .onExitCommand {                         // ESC: clear, then dismiss
                     if model.query.isEmpty { model.requestHide?() } else { model.query = "" }
                 }

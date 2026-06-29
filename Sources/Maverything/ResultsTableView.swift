@@ -16,6 +16,8 @@ final class MVTableView: NSTableView {
             toggleQuickLook()
         case 36, 76:        // return / enter → open
             coordinator?.openItem()
+        case 126:           // up arrow at the top → hand focus back to the search field
+            if selectedRow <= 0 { coordinator?.focusSearch() } else { super.keyDown(with: event) }
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }
@@ -107,6 +109,15 @@ struct ResultsTableView: NSViewRepresentable {
             tv.rowHeight = model.density.rowHeight
             tv.reloadData()
         }
+        // ↓ from the search field moves focus into the list and selects a row
+        if coord.lastFocusResultsNonce != model.focusResultsNonce {
+            coord.lastFocusResultsNonce = model.focusResultsNonce
+            if let tv = coord.tableView, !model.resultsStore.ids.isEmpty {
+                tv.window?.makeFirstResponder(tv)
+                if tv.selectedRow < 0 { tv.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+                tv.scrollRowToVisible(max(0, tv.selectedRow))
+            }
+        }
         if coord.lastVersion != model.resultsVersion {
             coord.lastVersion = model.resultsVersion
             // Only a genuinely NEW query jumps to the top + drops selection. A live
@@ -144,6 +155,9 @@ struct ResultsTableView: NSViewRepresentable {
         weak var tableView: NSTableView?
         var lastVersion = -1
         var lastQueryNonce = -1
+        var lastFocusResultsNonce = 0
+
+        func focusSearch() { model.focusNonce &+= 1 }
         private let byteFormatter: ByteCountFormatter = {
             let f = ByteCountFormatter(); f.countStyle = .file; return f
         }()

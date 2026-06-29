@@ -35,6 +35,7 @@ final class AppModel: ObservableObject {
     @Published var indexedCount = 0
     @Published var queryMillis = 0.0
     @Published var resultsVersion = 0
+    @Published var queryNonce = 0          // bumps only on a NEW query (not live refresh)
     @Published var sortKey: SortKey = .name
     @Published var ascending = true
     @Published var scope: SearchScope = .nameOnly
@@ -83,7 +84,7 @@ final class AppModel: ObservableObject {
         $query
             .debounce(for: .milliseconds(35), scheduler: RunLoop.main)
             .removeDuplicates()
-            .sink { [weak self] _ in self?.runSearch() }
+            .sink { [weak self] _ in self?.queryNonce &+= 1; self?.runSearch() }
             .store(in: &cancellables)
 
         Publishers.Merge4(
@@ -93,7 +94,7 @@ final class AppModel: ObservableObject {
             $matchMode.map { _ in () }
         )
         .dropFirst()
-        .sink { [weak self] in self?.runSearch() }
+        .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
         .store(in: &cancellables)
 
         NotificationCenter.default.addObserver(

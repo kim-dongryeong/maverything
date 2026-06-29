@@ -57,8 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func summon() {
         NSApp.activate(ignoringOtherApps: true)
         if let w = mainWindow ?? NSApp.windows.first {
-            w.makeKeyAndOrderFront(nil)
-            w.center()
+            w.makeKeyAndOrderFront(nil)        // keep the user's position; no re-center
         }
         model?.focusNonce &+= 1
     }
@@ -81,12 +80,11 @@ private struct WindowConfigurator: NSViewRepresentable {
         DispatchQueue.main.async {
             guard let window = v.window else { return }
             (NSApp.delegate as? AppDelegate)?.mainWindow = window
-            window.level = .floating
+            window.level = .normal               // not always-on-top
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.isMovableByWindowBackground = true
             window.standardWindowButton(.zoomButton)?.isHidden = false
-            window.collectionBehavior.insert(.moveToActiveSpace)
         }
         return v
     }

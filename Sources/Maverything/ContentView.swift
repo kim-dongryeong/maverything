@@ -15,6 +15,7 @@ struct ContentView: View {
             statusBar
         }
         .background(shortcuts)
+        .preferredColorScheme(model.appearance.colorScheme)
         .onAppear { searchFocused = true }
         .onChange(of: model.focusNonce) { searchFocused = true }
         .sheet(isPresented: $model.showOnboarding) {
@@ -81,6 +82,12 @@ struct ContentView: View {
         Menu {
             Picker("Layout", selection: $model.layout) {
                 ForEach(UILayout.allCases) { Label($0.label, systemImage: $0.symbol).tag($0) }
+            }
+            Picker("Appearance", selection: $model.appearance) {
+                ForEach(Appearance.allCases) { Text($0.label).tag($0) }
+            }
+            Picker("Density", selection: $model.density) {
+                ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
             }
             Picker("Scope", selection: $model.scope) {
                 Text("Name only").tag(SearchScope.nameOnly)

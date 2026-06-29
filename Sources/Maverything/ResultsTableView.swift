@@ -52,6 +52,10 @@ struct ResultsTableView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         let coord = context.coordinator
         coord.model = model
+        if let tv = coord.tableView, tv.rowHeight != model.density.rowHeight {
+            tv.rowHeight = model.density.rowHeight
+            tv.reloadData()
+        }
         if coord.lastVersion != model.resultsVersion {
             coord.lastVersion = model.resultsVersion
             coord.tableView?.reloadData()

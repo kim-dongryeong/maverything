@@ -19,7 +19,7 @@
 
         // 🟩 진짜 외래(ColorSettings 비멤버) — active여도 Peacock이 안 건드림
         // "tab.inactiveBackground": "#3c3c45", // 중립(고정)
-        "tab.activeBackground": "#f1f1f1",   // 중립(고정)
+        "tab.activeBackground": "#f8fff8",   // 중립(고정)
         "tab.border": "#fad28e",             // 중립(고정)  탭의 좌우 세로 경계선
         "window.activeBorder": "#fad28e",    // 🅐  창 전체 테두리
         "window.inactiveBorder": "#fad28e",  // 🅐

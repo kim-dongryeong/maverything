@@ -50,6 +50,14 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.string(forKey: "mv.layout") ?? "") ?? .table {
         didSet { UserDefaults.standard.set(layout.rawValue, forKey: "mv.layout") }
     }
+    @Published var appearance: Appearance = Appearance(rawValue:
+        UserDefaults.standard.string(forKey: "mv.appearance") ?? "") ?? .system {
+        didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "mv.appearance") }
+    }
+    @Published var density: RowDensity = RowDensity(rawValue:
+        UserDefaults.standard.string(forKey: "mv.density") ?? "") ?? .comfortable {
+        didSet { UserDefaults.standard.set(density.rawValue, forKey: "mv.density") }
+    }
 
     /// Set by the AppDelegate so the search UI can dismiss the panel (ESC).
     var requestHide: (() -> Void)?

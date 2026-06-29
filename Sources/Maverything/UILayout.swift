@@ -1,4 +1,21 @@
 import Foundation
+import SwiftUI
+
+enum Appearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var colorScheme: ColorScheme? {
+        switch self { case .system: return nil; case .light: return .light; case .dark: return .dark }
+    }
+}
+
+enum RowDensity: String, CaseIterable, Identifiable {
+    case comfortable, compact
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var rowHeight: CGFloat { self == .compact ? 17 : 22 }
+}
 
 /// The window layouts the user can switch between live (the "build every option"
 /// rule). Persisted in UserDefaults.

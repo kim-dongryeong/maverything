@@ -18,6 +18,9 @@ final class MVTableView: NSTableView {
         if mods == [.command], event.keyCode == 15 {           // ⌘R → reveal in Finder
             coordinator?.revealItem(); return
         }
+        if mods == [.command], event.keyCode == 51 {           // ⌘⌫ → move to Trash
+            coordinator?.moveToTrash(); return
+        }
         switch event.keyCode {
         case 49:            // space → toggle Quick Look
             toggleQuickLook()
@@ -133,6 +136,9 @@ struct ResultsTableView: NSViewRepresentable {
         add("Copy Path", #selector(Coordinator.copyPath), key: "c", mask: [.command, .option])
         add("Copy Name", #selector(Coordinator.copyName))
         add("Copy File", #selector(Coordinator.copyFile))
+        menu.addItem(.separator())
+        add("Move to Trash", #selector(Coordinator.moveToTrash),
+            key: String(UnicodeScalar(NSDeleteCharacter)!), mask: [.command])
         table.menu = menu
 
         context.coordinator.tableView = table
@@ -164,16 +170,22 @@ struct ResultsTableView: NSViewRepresentable {
         if coord.lastVersion != model.resultsVersion {
             coord.lastVersion = model.resultsVersion
             // Only a genuinely NEW query jumps to the top + drops selection. A live
-            // FS refresh of the same query preserves the user's selection & scroll
-            // (otherwise arrow-key navigation gets yanked back to the top).
+            // FS refresh of the same query preserves the FULL (multi-)selection &
+            // scroll (otherwise multi-select / arrow nav gets yanked away).
             let newQuery = coord.lastQueryNonce != model.queryNonce
             coord.lastQueryNonce = model.queryNonce
-            let keepID: Int32? = newQuery ? nil : model.selectedID
-            coord.tableView?.reloadData()
+            let tv = coord.tableView
+            let keep: Set<Int32> = newQuery ? []
+                : Set((tv?.selectedRowIndexes ?? []).compactMap {
+                    $0 < coord.renderedIDs.count ? coord.renderedIDs[$0] : nil })
+            coord.renderedIDs = model.resultsStore.ids   // adopt the new result set
+            tv?.reloadData()
             if newQuery {
-                coord.tableView?.scrollRowToVisible(0)
-            } else if let kid = keepID, let row = coord.rowForID(kid) {
-                coord.tableView?.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                tv?.scrollRowToVisible(0)
+            } else if !keep.isEmpty {
+                var rows = IndexSet()
+                for (i, id) in coord.renderedIDs.enumerated() where keep.contains(id) { rows.insert(i) }
+                if !rows.isEmpty { tv?.selectRowIndexes(rows, byExtendingSelection: false) }
             }
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()
@@ -210,9 +222,22 @@ struct ResultsTableView: NSViewRepresentable {
 
         init(model: AppModel) { self.model = model }
 
-        private var ids: [Int32] { model.resultsStore.ids }
+        // The table renders from this snapshot (not the live store) so selection
+        // can be remapped across reloads.
+        var renderedIDs: [Int32] = []
+        private var ids: [Int32] { renderedIDs }
 
         func numberOfRows(in tableView: NSTableView) -> Int { ids.count }
+
+        // Drag a row out as a file URL → Finder/other apps copy (or move with ⌘).
+        func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+            guard row < ids.count else { return nil }
+            return URL(fileURLWithPath: model.path(ids[row])) as NSURL
+        }
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                       sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            [.copy, .move]
+        }
 
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard let tableColumn, row < ids.count else { return nil }
@@ -416,5 +441,12 @@ struct ResultsTableView: NSViewRepresentable {
         }
 
         @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }
+
+        @objc func moveToTrash() {
+            for p in selectedPaths() {
+                try? FileManager.default.trashItem(at: URL(fileURLWithPath: p), resultingItemURL: nil)
+            }
+            // FSEvents will reconcile the removals into the index shortly.
+        }
     }
 }

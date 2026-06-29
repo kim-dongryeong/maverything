@@ -1,24 +1,24 @@
 import Darwin
 import Foundation
 
-public enum SortKey: Int, Sendable { case name, path, size, dateModified }
+public enum SortKey: Int, Sendable { case name, path, size, dateModified, relevance }
 public enum SearchScope: Int, Sendable { case nameOnly, fullPath }
 
 public struct SearchResults: Sendable {
-    public var ids: [Int32]      // entry indices, already in requested sort order
+    public var ids: [Int32]      // entry indices, in requested order
     public var total: Int        // total matches (may exceed ids.count if truncated)
     public var truncated: Bool
     public var queryMillis: Double
 }
 
-/// Brute-force, multi-core substring search over the packed name blob — the
-/// Everything model. Results come out pre-sorted because we scan the index in a
-/// precomputed sort order (per-column argsort), so there is no per-keystroke sort.
+/// Multi-core search over the packed name blob (the Everything model). A simple
+/// exact-substring name query uses the tuned parallel `memmem` scan in precomputed
+/// sort order (no per-keystroke sort). Fuzzy / wildcard / filtered / multi-term /
+/// path queries go through a general evaluator; `.relevance` ranks by match score.
 public final class SearchEngine: @unchecked Sendable {
     private let index: FileIndex
     private let workerCount: Int
 
-    // cached argsort orders, invalidated by `generation`
     private var orderCache: [SortKey: [Int32]] = [:]
     private var cacheGen: Int = -1
     public internal(set) var generation: Int = 0
@@ -29,44 +29,50 @@ public final class SearchEngine: @unchecked Sendable {
         self.workerCount = max(1, workers)
     }
 
-    /// Bump after the index is mutated so cached sort orders rebuild.
-    public func invalidate() {
-        cacheLock.lock(); generation &+= 1; cacheLock.unlock()
-    }
+    public func invalidate() { cacheLock.lock(); generation &+= 1; cacheLock.unlock() }
 
-    public func search(_ query: String, scope: SearchScope = .nameOnly,
+    public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
-                       limit: Int = 100_000) -> SearchResults {
-        // Hold the index read lock for the whole scan so a concurrent live delta
-        // (reconciler appending / tombstoning) can never reallocate under us.
+                       limit: Int = 100_000, now: TimeInterval = 0) -> SearchResults {
         index.withReadLock {
-            _search(query, scope: scope, sortKey: sortKey, ascending: ascending, limit: limit)
+            _search(query, mode: mode, scope: scope, sortKey: sortKey,
+                    ascending: ascending, limit: limit, now: now)
         }
     }
 
-    private func _search(_ query: String, scope: SearchScope,
-                         sortKey: SortKey, ascending: Bool, limit: Int) -> SearchResults {
+    private func _search(_ query: String, mode: MatchMode, scope: SearchScope,
+                         sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
-        let order = orderArray(for: sortKey)
-        let n = order.count
+        let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
 
-        let needle = foldedBytes(query)
-        if needle.isEmpty {
-            var out = [Int32]()
-            out.reserveCapacity(min(limit, n))
+        // empty query → return the chosen order directly
+        if parsed.isEmpty {
+            let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+            let n = order.count
+            var out = [Int32](); out.reserveCapacity(min(limit, n))
             if ascending { for k in 0..<min(limit, n) { out.append(order[k]) } }
             else { for k in 0..<min(limit, n) { out.append(order[n - 1 - k]) } }
             return SearchResults(ids: out, total: n, truncated: n > limit,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
 
-        if scope == .fullPath {
-            return searchPaths(needle: needle, order: order, ascending: ascending,
-                               limit: limit, start: start, clock: clock)
+        // fast path: a single positive exact name term, no filters
+        if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive {
+            return fastExact(needle: needle, sortKey: sortKey, ascending: ascending,
+                             limit: limit, start: start, clock: clock)
         }
 
-        // name-only: scan foldBlob slices in sort order, chunked across cores.
+        return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
+                       limit: limit, start: start, clock: clock)
+    }
+
+    // MARK: - fast exact substring path (unchanged tuned scan)
+
+    private func fastExact(needle: [UInt8], sortKey: SortKey, ascending: Bool,
+                           limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+        let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+        let n = order.count
         let nChunks = max(1, min(workerCount, n / 16_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
         var chunkIDs = [[Int32]](repeating: [], count: nChunks)
@@ -83,68 +89,153 @@ public final class SearchEngine: @unchecked Sendable {
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkTotals.withUnsafeMutableBufferPointer { outTot in
                 DispatchQueue.concurrentPerform(iterations: nChunks) { c in
-                    let lo = c * chunkSize
-                    let hi = min(n, lo + chunkSize)
+                    let lo = c * chunkSize, hi = min(n, lo + chunkSize)
                     if lo >= hi { return }
-                    var ids = [Int32]()
-                    var total = 0
+                    var ids = [Int32](); var total = 0
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         let o = Int(offB[id]); let l = Int(lenB[id])
-                        if l >= needleLen,
-                           memmem(hayBase + o, l, needleBase, needleLen) != nil {
-                            total += 1
-                            ids.append(Int32(id))
+                        if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil {
+                            total += 1; ids.append(Int32(id))
                         }
                     }
-                    outIDs[c] = ids
-                    outTot[c] = total
+                    outIDs[c] = ids; outTot[c] = total
                 }
             }}
         }}}}}
 
         let total = chunkTotals.reduce(0, +)
-        var out = [Int32]()
-        out.reserveCapacity(min(total, limit))
-        outer: for c in 0..<nChunks {
-            for id in chunkIDs[c] {
-                if out.count >= limit { break outer }
-                out.append(id)
+        var out = [Int32](); out.reserveCapacity(min(total, limit))
+        outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
+        return SearchResults(ids: out, total: total, truncated: total > out.count,
+                             queryMillis: secondsBetween(start, clock.now) * 1000)
+    }
+
+    // MARK: - general evaluator (modes, filters, multi-term, NOT, path, relevance)
+
+    private func general(parsed: ParsedQuery, mode: MatchMode, sortKey: SortKey, ascending: Bool,
+                         limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+        let relevance = (sortKey == .relevance)
+        let order = orderArray(for: relevance ? .name : sortKey)
+        let n = order.count
+        let needsPath = parsed.terms.contains { $0.scope == .path }
+        let caseSensitive = parsed.caseSensitive
+
+        let nChunks = max(1, min(workerCount, n / 8_000 + 1))
+        let chunkSize = (n + nChunks - 1) / nChunks
+        var chunkIDs = [[Int32]](repeating: [], count: nChunks)
+        var chunkScores = [[Int32]](repeating: [], count: nChunks)
+        var chunkTotals = [Int](repeating: 0, count: nChunks)
+
+        index.foldBlob.withUnsafeBufferPointer { fb in
+        index.nameBlob.withUnsafeBufferPointer { nb in
+        index.nameOff.withUnsafeBufferPointer { offB in
+        index.nameLen.withUnsafeBufferPointer { lenB in
+        index.size.withUnsafeBufferPointer { szB in
+        index.mtime.withUnsafeBufferPointer { mtB in
+        order.withUnsafeBufferPointer { ordB in
+            let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
+            chunkIDs.withUnsafeMutableBufferPointer { outIDs in
+            chunkScores.withUnsafeMutableBufferPointer { outScores in
+            chunkTotals.withUnsafeMutableBufferPointer { outTot in
+                DispatchQueue.concurrentPerform(iterations: nChunks) { c in
+                    let lo = c * chunkSize, hi = min(n, lo + chunkSize)
+                    if lo >= hi { return }
+                    var ids = [Int32](); var scores = [Int32](); var total = 0
+                    for k in lo..<hi {
+                        let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        let o = Int(offB[id]); let l = Int(lenB[id])
+                        // filters first (cheap)
+                        if !parsed.exts.isEmpty && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
+                        if !parsed.sizes.isEmpty && !self.sizeMatches(szB[id], parsed.sizes) { continue }
+                        if let df = parsed.dateFrom, mtB[id] < df { continue }
+                        if let dt = parsed.dateTo, mtB[id] >= dt { continue }
+                        // terms
+                        let hayBase = caseSensitive ? nbBase : fbBase
+                        var score = 0; var ok = true
+                        var pathBytes: [UInt8]? = nil
+                        for term in parsed.terms {
+                            let out: MatchOutcome
+                            if term.scope == .path || (needsPath && false) {
+                                if pathBytes == nil {
+                                    let p = self.index._path(id)
+                                    pathBytes = caseSensitive ? Array(p.utf8) : Array(p.utf8).map(asciiLower)
+                                }
+                                out = term.bytes.withUnsafeBufferPointer { tb in
+                                    pathBytes!.withUnsafeBufferPointer { pb in
+                                        Matcher.match(hay: pb.baseAddress!, hayLen: pb.count,
+                                                      needle: tb.baseAddress!, needleLen: tb.count, mode: mode)
+                                    }
+                                }
+                            } else {
+                                out = term.bytes.withUnsafeBufferPointer { tb in
+                                    Matcher.match(hay: hayBase + o, hayLen: l,
+                                                  needle: tb.baseAddress!, needleLen: tb.count, mode: mode)
+                                }
+                            }
+                            let pass = term.negated ? !out.matched : out.matched
+                            if !pass { ok = false; break }
+                            if !term.negated { score += out.score }
+                        }
+                        if !ok { continue }
+                        total += 1
+                        if relevance {
+                            ids.append(Int32(id)); scores.append(Int32(clamping: score))
+                        } else if ids.count < limit {
+                            ids.append(Int32(id))
+                        }
+                    }
+                    outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
+                }
+            }}}
+        }}}}}}}
+
+        let total = chunkTotals.reduce(0, +)
+        var out: [Int32]
+        if relevance {
+            var pairs: [(Int32, Int32)] = []
+            pairs.reserveCapacity(min(total, 200_000))
+            for c in 0..<nChunks {
+                let ids = chunkIDs[c], scs = chunkScores[c]
+                for j in 0..<ids.count { pairs.append((ids[j], scs[j])) }
             }
+            pairs.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }   // score desc, stable by id
+            out = pairs.prefix(limit).map { $0.0 }
+        } else {
+            out = []; out.reserveCapacity(min(total, limit))
+            outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
         }
         return SearchResults(ids: out, total: total, truncated: total > out.count,
                              queryMillis: secondsBetween(start, clock.now) * 1000)
     }
 
-    // Full-path matching (Ctrl+U scope). Reconstructs each candidate's path —
-    // heavier, but only used in this mode.
-    private func searchPaths(needle: [UInt8], order: [Int32], ascending: Bool,
-                             limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
-        let n = order.count
-        let needleStr = String(decoding: needle, as: UTF8.self)
-        let nChunks = max(1, min(workerCount, n / 8_000 + 1))
-        let chunkSize = (n + nChunks - 1) / nChunks
-        var chunkIDs = [[Int32]](repeating: [], count: nChunks)
-        var chunkTotals = [Int](repeating: 0, count: nChunks)
-        chunkIDs.withUnsafeMutableBufferPointer { outIDs in
-        chunkTotals.withUnsafeMutableBufferPointer { outTot in
-            DispatchQueue.concurrentPerform(iterations: nChunks) { c in
-                let lo = c * chunkSize, hi = min(n, lo + chunkSize)
-                if lo >= hi { return }
-                var ids = [Int32](); var total = 0
-                for k in lo..<hi {
-                    let id = Int(ascending ? order[k] : order[n - 1 - k])
-                    let p = self.index._path(id).lowercased()   // lock already held by search()
-                    if p.contains(needleStr) { total += 1; if ids.count < limit { ids.append(Int32(id)) } }
-                }
-                outIDs[c] = ids; outTot[c] = total
+    @inline(__always)
+    private func extMatches(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int, _ exts: [[UInt8]]) -> Bool {
+        var dot = -1
+        var i = l - 1
+        while i >= 0 { if base[o + i] == UInt8(ascii: ".") { dot = i; break }; i -= 1 }
+        guard dot >= 0 else { return false }
+        let extStart = o + dot + 1, extLen = l - dot - 1
+        for e in exts where e.count == extLen {
+            var match = true
+            for j in 0..<extLen where base[extStart + j] != e[j] { match = false; break }
+            if match { return true }
+        }
+        return false
+    }
+
+    @inline(__always)
+    private func sizeMatches(_ s: Int64, _ filters: [(SizeOp, Int64)]) -> Bool {
+        for (op, n) in filters {
+            switch op {
+            case .gt: if !(s > n) { return false }
+            case .lt: if !(s < n) { return false }
+            case .ge: if !(s >= n) { return false }
+            case .le: if !(s <= n) { return false }
+            case .eq: if !(s == n) { return false }
             }
-        }}
-        let total = chunkTotals.reduce(0, +)
-        var out = [Int32](); out.reserveCapacity(min(total, limit))
-        outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
-        return SearchResults(ids: out, total: total, truncated: total > out.count,
-                             queryMillis: secondsBetween(start, clock.now) * 1000)
+        }
+        return true
     }
 
     // MARK: - sort order (argsort) with caching
@@ -154,7 +245,6 @@ public final class SearchEngine: @unchecked Sendable {
         if cacheGen != generation { orderCache.removeAll(); cacheGen = generation }
         if let cached = orderCache[key] { cacheLock.unlock(); return cached }
         cacheLock.unlock()
-
         let order = computeOrder(key)
         cacheLock.lock()
         if cacheGen == generation { orderCache[key] = order }
@@ -166,7 +256,7 @@ public final class SearchEngine: @unchecked Sendable {
         let n = index.count
         let del = index.deleted
         var ids = [Int32](); ids.reserveCapacity(n)
-        for i in 0..<n where !del[i] { ids.append(Int32(i)) }   // exclude tombstones
+        for i in 0..<n where !del[i] { ids.append(Int32(i)) }
         switch key {
         case .size:
             let size = index.size
@@ -174,7 +264,7 @@ public final class SearchEngine: @unchecked Sendable {
         case .dateModified:
             let mt = index.mtime
             ids.sort { mt[Int($0)] != mt[Int($1)] ? mt[Int($0)] < mt[Int($1)] : $0 < $1 }
-        case .name, .path:   // path sort falls back to name for now
+        case .name, .path, .relevance:   // path/relevance use name order as the scan base
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in

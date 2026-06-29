@@ -139,6 +139,12 @@ struct ResultsTableView: NSViewRepresentable {
             return cell
         }
 
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard let tv = tableView else { return }
+            let row = tv.selectedRow
+            model.selectedID = (row >= 0 && row < ids.count) ? ids[row] : nil
+        }
+
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
             guard let sd = tableView.sortDescriptors.first, let key = sd.key else { return }
             let mapped: SortKey

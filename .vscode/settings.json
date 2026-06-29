@@ -1,7 +1,7 @@
 {
     // ───────── [상수층] 모든 프로젝트 공통 — 새 프로젝트에 그대로 복붙 ─────────
     "window.title": "${rootName} ⌨️ ${activeEditorShort}", // 타이틀바에 프로젝트명 + 현재 파일
-    // "workbench.colorTheme": "Ayu Mojave", // 키가 미리 있어야 cmd+K cmd+T가 이 workspace에만 기록(아래 섹션)
+    "workbench.colorTheme": "Horla", // 키가 미리 있어야 cmd+K cmd+T가 이 workspace에만 기록(아래 섹션)
     "workbench.tree.indent": 16,
     "editor.fontSize": 18,
     "terminal.integrated.fontSize": 18,
@@ -19,39 +19,39 @@
 
         // 🟩 진짜 외래(ColorSettings 비멤버) — active여도 Peacock이 안 건드림
         // "tab.inactiveBackground": "#3c3c45", // 중립(고정)
-        "tab.activeBackground": "#5e5d68",   // 중립(고정)
-        "tab.border": "#2563eb",             // 중립(고정)  탭의 좌우 세로 경계선
-        "window.activeBorder": "#2563eb",    // 🅐  창 전체 테두리
-        "window.inactiveBorder": "#2563eb",  // 🅐
+        "tab.activeBackground": "#f1f1f1",   // 중립(고정)
+        "tab.border": "#fad28e",             // 중립(고정)  탭의 좌우 세로 경계선
+        "window.activeBorder": "#fad28e",    // 🅐  창 전체 테두리
+        "window.inactiveBorder": "#fad28e",  // 🅐
         // --- Layout & Panels --- (단순히 채워넣기)
-        "titleBar.border": "#2563eb",        // 🅐  Border at the bottom of the top title bar
-        "activityBar.border": "#2563eb",     // 🅐  activity bar(최왼쪽에 아이콘들)와 왼쪽 사이드바(Explorer) 사이 경계 (안중요)
-        "statusBar.border": "#2563eb",       // 🅐🟥  맨아래 (statusBar지만 affectStatusAndTitleBorders off → 삭제 대상) (Peacock이 삭제)
+        "titleBar.border": "#fad28e",        // 🅐  Border at the bottom of the top title bar
+        "activityBar.border": "#fad28e",     // 🅐  activity bar(최왼쪽에 아이콘들)와 왼쪽 사이드바(Explorer) 사이 경계 (안중요)
+        "statusBar.border": "#fad28e",       // 🅐🟥  맨아래 (statusBar지만 affectStatusAndTitleBorders off → 삭제 대상) (Peacock이 삭제)
         // 세로 선들
-        "sideBar.border": "#2563eb",         // 🅒🟥  좌우사이드바와 에디터 사이 경계(cmd+(opt)+B)
-        "panel.border": "#2563eb",           // 🅒🟥  에디터와 하단 패널 사이 경계(control+`)
-        "terminal.border": "#2563eb",        // 🅒 Borders separating split terminal instances
-        "editorGroup.border": "#7dd3fc",     // 🅑🟥  split 창 가운데 경계(cmd+\)
+        "sideBar.border": "#fad28e",         // 🅒🟥  좌우사이드바와 에디터 사이 경계(cmd+(opt)+B)
+        "panel.border": "#fad28e",           // 🅒🟥  에디터와 하단 패널 사이 경계(control+`)
+        "terminal.border": "#fad28e",        // 🅒 Borders separating split terminal instances
+        "editorGroup.border": "#0dc907",     // 🅑🟥  split 창 가운데 경계(cmd+\)
         "diffEditor.border": "#a5b0c9",      // 🅔  compare view 경계선
 
         // 선택
-        "tab.activeBorderTop": "#7dd3fc",           // 🅑 선택된 탭의 윗경계
-        "tab.activeBorder": "#7dd3fc",              // 🅑🟥  선택된 탭의 아래경계
-        "tab.unfocusedActiveBorderTop": "#7dd3fc",  // 🅑 선택된 탭의 윗경계 (다른 editor group)
-        "tab.unfocusedActiveBorder": "#7dd3fc",     // 🅑 선택된 탭의 아래경계 (다른 editor group)
-        "focusBorder": "#7dd3fc",                   // 🅑 Explorer 파일 선택 테두리
-        // "panelTitle.activeBorder": "#7dd3fc",      // 🅑 터미널 등의 탭 아래 선택 표시선 (기본 테마가 부족할 때만)
+        "tab.activeBorderTop": "#0dc907",           // 🅑 선택된 탭의 윗경계
+        "tab.activeBorder": "#0dc907",              // 🅑🟥  선택된 탭의 아래경계
+        "tab.unfocusedActiveBorderTop": "#0dc907",  // 🅑 선택된 탭의 윗경계 (다른 editor group)
+        "tab.unfocusedActiveBorder": "#0dc907",     // 🅑 선택된 탭의 아래경계 (다른 editor group)
+        "focusBorder": "#0dc907",                   // 🅑 Explorer 파일 선택 테두리
+        // "panelTitle.activeBorder": "#0dc907",      // 🅑 터미널 등의 탭 아래 선택 표시선 (기본 테마가 부족할 때만)
         
         // // --- Inputs, Buttons, & Dropdowns ---
-        "inputOption.activeBorder": "#7dd3fc", // 🅑 Border around active options in input fields (like Regex icon)
+        "inputOption.activeBorder": "#0dc907", // 🅑 Border around active options in input fields (like Regex icon)
         // "button.border": "#ff0000",           // 세팅에서 Border around primary buttons (일반 버튼)
         // "checkbox.border": "#ff0000",         // 세팅에서 Border around toggle checkboxes
         
         // // --- In-Editor Code Highlights --- (커서 행, 문자열 선택, 찾기, 괄호쌍 등) (기본 테마가 부족할 때)
-        "editor.lineHighlightBorder": "#7dd3fc",       // 🅓vs🅑 커서 행
-        "editor.selectionHighlightBorder": "#7dd3fc",  // 🅑 cmd+D
-        "editor.findMatchBorder": "#7dd3fc",           // 🅑 cmd+F
-        "editorBracketMatch.border": "#7dd3fc",        // 🅑 Border around the matching bracket pairs {} [] ()
+        "editor.lineHighlightBorder": "#0dc907",       // 🅓vs🅑 커서 행
+        "editor.selectionHighlightBorder": "#0dc907",  // 🅑 cmd+D
+        "editor.findMatchBorder": "#0dc907",           // 🅑 cmd+F
+        "editorBracketMatch.border": "#0dc907",        // 🅑 Border around the matching bracket pairs {} [] ()
         // "editor.findMatchHighlightBorder": "#0e275c", // Border around all other search result highlights
         
         // --- Global & Window Borders --- 보조 경계선 🅐와 비슷하지만 희미한 색 (기본 테마가 부족할 때)
@@ -66,7 +66,7 @@
         "sideBarSectionHeader.border": "#a5b0c9", // 🅔 Explorer, Search, Source Control 등 사이드바의 섹션 헤더 경계선, 에이전트 대화 세로 선
 
         // 기타
-        // "tab.activeForeground": "#7dd3fc",  // 선택되지 않은 탭의 글자와 변경 및 단기 아이콘 (안중요)
+        // "tab.activeForeground": "#0dc907",  // 선택되지 않은 탭의 글자와 변경 및 단기 아이콘 (안중요)
         // "editorGutter.background": "#ff0000",     // 에디터 행 번호 영역 배경색
         // "editorLineNumber.foreground": "#ff0000", // 에디터 행 번호 글자색
         

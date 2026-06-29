@@ -9,21 +9,41 @@ struct ContentView: View {
         VStack(spacing: 0) {
             searchBar
             Divider()
-            ResultsTableView(model: model)
+            layoutBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             statusBar
         }
-        .background(
-            Button("") { model.toggleScope() }          // ⌃U toggles name/path scope
-                .keyboardShortcut("u", modifiers: .control)
-                .hidden()
-        )
+        .background(shortcuts)
         .onAppear { searchFocused = true }
         .onChange(of: model.focusNonce) { searchFocused = true }
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView().environmentObject(model)
         }
+    }
+
+    @ViewBuilder private var layoutBody: some View {
+        switch model.layout {
+        case .table:
+            ResultsTableView(model: model)
+        case .twoPane:
+            HSplitView {
+                ResultsTableView(model: model).frame(minWidth: 360)
+                PreviewPane(model: model).frame(minWidth: 240, idealWidth: 320)
+            }
+        case .compact:
+            CompactResults(model: model)
+        }
+    }
+
+    // hidden keyboard shortcuts: ⌃U scope toggle, ⌘1/2/3 layout switch
+    private var shortcuts: some View {
+        Group {
+            Button("") { model.toggleScope() }.keyboardShortcut("u", modifiers: .control)
+            Button("") { model.layout = .table }.keyboardShortcut("1", modifiers: .command)
+            Button("") { model.layout = .compact }.keyboardShortcut("2", modifiers: .command)
+            Button("") { model.layout = .twoPane }.keyboardShortcut("3", modifiers: .command)
+        }.hidden()
     }
 
     private var searchBar: some View {
@@ -59,6 +79,9 @@ struct ContentView: View {
 
     private var gearMenu: some View {
         Menu {
+            Picker("Layout", selection: $model.layout) {
+                ForEach(UILayout.allCases) { Label($0.label, systemImage: $0.symbol).tag($0) }
+            }
             Picker("Scope", selection: $model.scope) {
                 Text("Name only").tag(SearchScope.nameOnly)
                 Text("Full path  (⌃U)").tag(SearchScope.fullPath)

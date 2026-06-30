@@ -9,7 +9,10 @@ cd "$(dirname "$0")"
 
 CONFIG="${CONFIG:-release}"
 APP="Maverything.app"
-SIGN_ID="${MAVERYTHING_SIGN_ID:--}"   # default: ad-hoc
+# Default to the stable dev cert if it exists (so TCC grants persist), else ad-hoc.
+DEFAULT_ID="-"
+[ -f "$HOME/Library/Keychains/maverything-signing.keychain-db" ] && DEFAULT_ID="Maverything Dev Cert"
+SIGN_ID="${MAVERYTHING_SIGN_ID:-$DEFAULT_ID}"
 
 echo "▸ swift build -c $CONFIG"
 swift build -c "$CONFIG"

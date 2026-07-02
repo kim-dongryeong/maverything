@@ -257,6 +257,10 @@ final class AppModel: ObservableObject {
     // rebuild the sort order (and burn a core) on every individual event.
     private var liveRefreshScheduled = false
     private var pendingLiveRefresh = false
+    /// Timestamp (monotonic) of the last keyboard navigation in the results list.
+    /// A live refresh reloads the table, which would reset scroll/selection under an
+    /// actively-held arrow key — so we defer it until the user pauses.
+    var lastNavAt: TimeInterval = 0
     private func scheduleLiveRefresh() {
         snapshotDirty = true
         // When the app isn't frontmost, background file churn shouldn't burn a core
@@ -268,6 +272,11 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.liveRefreshScheduled = false
             guard !self.isIndexing else { return }
+            // Don't yank the list out from under active keyboard navigation.
+            if ProcessInfo.processInfo.systemUptime - self.lastNavAt < 0.6 {
+                self.scheduleLiveRefresh()   // flag is clear now → reschedules for later
+                return
+            }
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()

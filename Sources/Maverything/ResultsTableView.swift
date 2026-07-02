@@ -12,6 +12,12 @@ final class MVTableView: NSTableView {
 
     override func keyDown(with event: NSEvent) {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // remember active list navigation so live refreshes don't reload under a held key
+        switch event.keyCode {
+        case 125, 126, 116, 121, 115, 119:   // ↓ ↑ pgDn pgUp home end
+            coordinator?.model.lastNavAt = ProcessInfo.processInfo.systemUptime
+        default: break
+        }
         if event.keyCode == 8, mods == [.command] || mods == [.command, .option] {  // ⌘C / ⌘⌥C → copy path
             coordinator?.copyPath(); return
         }
@@ -31,8 +37,16 @@ final class MVTableView: NSTableView {
             else { coordinator?.openItem() }
         case 126:           // up arrow at the top → hand focus back to the search field
             // …but only for direct table nav, not when forwarded from the Quick Look panel
-            if selectedRow <= 0, window?.firstResponder === self { coordinator?.focusSearch() }
-            else { super.keyDown(with: event) }
+            if selectedRow <= 0, window?.firstResponder === self {
+                // A deliberate tap at the top jumps to the search box; a HELD key just
+                // parks at row 0 (don't fire focusSearch every auto-repeat → no bounce).
+                if !event.isARepeat { coordinator?.focusSearch() }
+            } else {
+                super.keyDown(with: event)
+            }
+        case 125:           // down arrow — at the last row a held key would jump/over-scroll
+            if selectedRow >= 0, selectedRow == numberOfRows - 1, event.isARepeat { return }
+            super.keyDown(with: event)
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }

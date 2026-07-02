@@ -109,6 +109,14 @@ extension FileIndex {
             let hid = readArray(raw, &off, count, UInt8.self)
             hidden = hid.map { $0 != 0 }
             deleted = [Bool](repeating: false, count: count)
+            // Intra-file integrity: a valid-LENGTH but corrupt snapshot (bit rot) could hold
+            // out-of-range name offsets or parent indices that would trap in _name/_path.
+            // Verify in one pass; on any violation, reject → caller does a full crawl.
+            for i in 0..<count {
+                if Int(nameOff[i]) + Int(nameLen[i]) > blobLen { return nil }
+                let par = parent[i]
+                if par < -1 || Int(par) >= count { return nil }
+            }
             childrenOf.removeAll(); dirIndexByPath.removeAll()
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }

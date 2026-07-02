@@ -98,10 +98,12 @@ private func mvFSCallback(stream: ConstFSEventStreamRef,
 public final class Reconciler: @unchecked Sendable {
     private let index: FileIndex
     private let exclude: [String]
+    private let mountPoints: Set<String>   // other volumes' mounts — each is its OWN crawl root
 
-    public init(index: FileIndex, exclude: [String]) {
+    public init(index: FileIndex, exclude: [String], mountPoints: Set<String> = []) {
         self.index = index
         self.exclude = exclude
+        self.mountPoints = mountPoints
     }
 
     /// Reconcile the dirty directories implied by these event paths. Returns the
@@ -126,7 +128,16 @@ public final class Reconciler: @unchecked Sendable {
             let d = work[i]; i += 1
             if isExcluded(d) { continue }
             guard let di = index.liveDirIndex(forDisplayPath: d) else { continue }
-            guard let current = FileEnumerator.listDirectory(d) else { continue } // vanished
+            guard var current = FileEnumerator.listDirectory(d) else { continue } // vanished
+            // A mount point re-listed as a child of its parent (e.g. /Volumes) must NOT be
+            // re-added here — it's indexed as its own root, so drop it from the diff.
+            if !mountPoints.isEmpty {
+                current.removeAll { e in
+                    let nm = String(decoding: e.name, as: UTF8.self)
+                    let cp = d == "/" ? "/" + nm : d + "/" + nm
+                    return mountPoints.contains(cp)
+                }
+            }
             let r = index.applyDirDiff(dirIdx: di, displayPath: d, current: current, expectedEpoch: epoch)
             total.added += r.added; total.removed += r.removed; total.changed += r.changed
             for nd in r.newDirs where !isExcluded(nd.path) {   // recurse into new subtrees

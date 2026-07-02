@@ -209,6 +209,15 @@ public final class FileEnumerator: @unchecked Sendable {
                 let nameBase = (p + Self.OFF_NAMEREF + nameOff).assumingMemoryBound(to: UInt8.self)
                 let nameBuf = UnsafeBufferPointer(start: nameBase, count: realLen)
 
+                // A mounted volume is crawled as its OWN root, so don't also add it here as a
+                // childless stub under its parent (that duplicates the entry and, via
+                // dirIndexByPath last-write-wins, would orphan the real subtree).
+                if objType == VNODE_VDIR, !mountPoints.isEmpty {
+                    let childName = String(decoding: nameBuf, as: UTF8.self)
+                    let childFs = dir == "/" ? "/" + childName : dir + "/" + childName
+                    if mountPoints.contains(childFs) { p = p + entryLen; continue }
+                }
+
                 let mtime = modSec &* 1_000_000_000 &+ modNsec
                 let crtime = crSec &* 1_000_000_000 &+ crNsec
                 batch.add(nameBytes: nameBuf, size: dataLen, mtime: mtime, crtime: crtime,

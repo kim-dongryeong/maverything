@@ -325,7 +325,7 @@ final class AppModel: ObservableObject {
     private func startWatching(roots: [CrawlRoot], exclude: [String],
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
-        let rec = Reconciler(index: index, exclude: exclude)
+        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints())
         reconciler = rec
         let q = reconcileQueue
         watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, batchMax in

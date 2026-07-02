@@ -30,7 +30,9 @@ final class MVTableView: NSTableView {
             if coordinator?.model.enterRenames == true { coordinator?.beginRename() }
             else { coordinator?.openItem() }
         case 126:           // up arrow at the top → hand focus back to the search field
-            if selectedRow <= 0 { coordinator?.focusSearch() } else { super.keyDown(with: event) }
+            // …but only for direct table nav, not when forwarded from the Quick Look panel
+            if selectedRow <= 0, window?.firstResponder === self { coordinator?.focusSearch() }
+            else { super.keyDown(with: event) }
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }
@@ -184,6 +186,8 @@ struct ResultsTableView: NSViewRepresentable {
             coord.renderedIDs = model.resultsStore.ids   // adopt the new result set
             tv?.reloadData()
             if newQuery {
+                tv?.deselectAll(nil)   // reloadData keeps selection by position → drop it on a new query
+                model.selectedID = nil; model.selectionCount = 0; model.selectionBytes = 0
                 tv?.scrollRowToVisible(0)
             } else if !keep.isEmpty {
                 var rows = IndexSet()
@@ -498,6 +502,8 @@ struct ResultsTableView: NSViewRepresentable {
                   let cell = tv.view(atColumn: col, row: row, makeIfNecessary: true) as? NSTableCellView,
                   let tf = cell.textField else { return }
             renamingID = ids[row]
+            tf.stringValue = model.name(ids[row])   // drop any match-highlight so the editor shows plain text
+            tf.textColor = .labelColor; tf.font = .systemFont(ofSize: 12)
             tf.isEditable = true; tf.isSelectable = true; tf.isBordered = true
             tf.drawsBackground = true; tf.backgroundColor = .textBackgroundColor
             tf.delegate = self

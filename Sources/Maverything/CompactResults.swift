@@ -35,7 +35,7 @@ struct CompactResults: View {
                 if let s = model.selectedID { proxy.scrollTo(s, anchor: .center) }
             }
         }
-        .id(model.resultsVersion)
+        .id(model.queryNonce)   // only rebuild identity on a NEW query, not on every live refresh
         .overlay {
             if ids.isEmpty {
                 Text(model.query.isEmpty ? "Type to search" : "No results")

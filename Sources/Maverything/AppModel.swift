@@ -88,7 +88,7 @@ final class AppModel: ObservableObject {
         resultsStore.index = index
 
         $query
-            .debounce(for: .milliseconds(35), scheduler: RunLoop.main)
+            .debounce(for: .milliseconds(35), scheduler: DispatchQueue.main)  // fires during window tracking too
             .removeDuplicates()
             .sink { [weak self] _ in self?.queryNonce &+= 1; self?.runSearch() }
             .store(in: &cancellables)

@@ -42,6 +42,9 @@ final class EventTapHotKey {
             return Unmanaged.passUnretained(event)
         }
         if type == .keyDown {
+            if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+                return Unmanaged.passUnretained(event)   // don't fire on held-key auto-repeat
+            }
             let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
             if kc == keyCode {
                 var f: NSEvent.ModifierFlags = []

@@ -36,7 +36,7 @@ struct MaverythingApp: App {
             Button("Reindex Now") { model.reindex() }
             SettingsLink { Text("Settings…") }
             Divider()
-            Button("Quit Maverything") { model.saveSnapshot(sync: true); NSApp.terminate(nil) }
+            Button("Quit Maverything") { NSApp.terminate(nil) }   // willTerminate saves the snapshot once
         }
     }
 }

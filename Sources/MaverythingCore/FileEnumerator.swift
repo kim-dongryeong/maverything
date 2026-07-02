@@ -107,7 +107,7 @@ public final class FileEnumerator: @unchecked Sendable {
         cond.lock()
         while !((done && stack.isEmpty) || cancelledFlag) { cond.wait() }
         cond.unlock()
-        while !threads.allSatisfy({ $0.isFinished }) { /* spin briefly until exit */ }
+        while !threads.allSatisfy({ $0.isFinished }) { Thread.sleep(forTimeInterval: 0.001) }  // yield, don't pin a core
 
         stat.seconds = secondsBetween(start, clock.now)
         return stat

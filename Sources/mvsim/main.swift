@@ -10,13 +10,23 @@ import MaverythingCore
 let now = Date().timeIntervalSince1970
 let root = (CommandLine.arguments.count > 1 ? CommandLine.arguments[1]
             : NSTemporaryDirectory() + "mvsim-tree-\(getpid())")
+let dynamicRoot = NSTemporaryDirectory() + "mvsim-dynamic-volume-\(getpid())"
 let fm = FileManager.default
 try? fm.removeItem(atPath: root)
+try? fm.removeItem(atPath: dynamicRoot)
 
 // ---- tree builders ----
 func mkdir(_ p: String) { try? fm.createDirectory(atPath: p, withIntermediateDirectories: true) }
 func write(_ rel: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
     let p = root + "/" + rel
+    mkdir((p as NSString).deletingLastPathComponent)
+    FileManager.default.createFile(atPath: p, contents: Data(count: bytes))
+    if let m = mtime {
+        var tv = [timeval(tv_sec: Int(m), tv_usec: 0), timeval(tv_sec: Int(m), tv_usec: 0)]
+        _ = utimes(p, &tv)
+    }
+}
+func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
     mkdir((p as NSString).deletingLastPathComponent)
     FileManager.default.createFile(atPath: p, contents: Data(count: bytes))
     if let m = mtime {
@@ -266,6 +276,21 @@ try? fm.removeItem(atPath: root + "/selfheal_x.txt")
 _ = rec.reconcile(eventPaths: [root])          // again NO invalidate()
 check("mutationGen: deleted file gone w/o explicit invalidate()", !has("selfheal_x", "selfheal_x.txt"))
 
+// dynamic mount lifecycle: a new crawl root can be appended after launch, then tombstoned
+// as one subtree on unmount. Both operations must self-invalidate search caches.
+mkdir(dynamicRoot)
+writeAbs(dynamicRoot + "/mounted_alpha.txt", bytes: 13, mtime: now)
+writeAbs(dynamicRoot + "/nested/mounted_beta.txt", bytes: 17, mtime: now)
+let mountStats = FileEnumerator(index: index).crawl(roots: [dynamicRoot])
+index.buildLiveIndexes()
+check("dynamic mount: new root crawled after launch", mountStats.total >= 3 && has("mounted_alpha", "mounted_alpha.txt"))
+check("dynamic mount: nested content indexed", has("mounted_beta", "mounted_beta.txt"))
+let removedDynamic = index.markDeletedSubtree(displayPath: dynamicRoot)
+check("dynamic unmount: tombstones whole mounted root",
+      removedDynamic >= 3 && !has("mounted_alpha", "mounted_alpha.txt") && !has("mounted_beta", "mounted_beta.txt"),
+      "removed=\(removedDynamic)")
+check("dynamic unmount: root dir lookup removed", index.dirIndex(forPath: dynamicRoot) == nil)
+
 // ---- snapshot round-trip ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
 let idx2 = FileIndex()
@@ -305,4 +330,5 @@ try? md.write(toFile: reportPath, atomically: true, encoding: .utf8)
 print("report -> \(reportPath)")
 
 try? fm.removeItem(atPath: root)
+try? fm.removeItem(atPath: dynamicRoot)
 exit(failed == 0 ? 0 : 1)

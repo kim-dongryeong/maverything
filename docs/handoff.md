@@ -1,5 +1,5 @@
-## TURN: CLAUDE
-**Updated:** 2026-07-02 21:00
+## TURN: AGY
+**Updated:** 2026-07-02 22:03
 
 ## GOAL
 Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
@@ -21,7 +21,7 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
   `Matching`, `QueryParser`.
 - App `Sources/Maverything/`: `AppModel`, `ResultsTableView`, `CompactResults`, `PreviewPane`,
   `ContentView`, `FilterBar`, `SearchMenus`, `OptionsButton`, `Settings`.
-- Harness: `.build/release/mvsim` (75 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
+- Harness: `.build/release/mvsim` (79 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
 - Build: `swift build -c release`. Sim: `.build/release/mvsim`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
@@ -42,16 +42,18 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
    with dynamic sort/prune when the array exceeds `limit + max(512, limit)`. Combines
    and merges across workers, returning identical results with minimal allocation.
    mvsim +4 (71→75).
-4. **Dynamic mount/unmount** — volumes mounted AFTER launch aren't indexed/watched; unmounts
-   leave stale entries. Observe `NSWorkspace.shared.notificationCenter` didMount/didUnmount:
-   on mount → crawl+watch the new root; on unmount → tombstone that subtree. (Also handle
-   FSEvents RootChanged.)
+4. **Dynamic mount/unmount** — ✅ DONE (CODEX turn). AppModel observes
+   `NSWorkspace.shared.notificationCenter` didMount/didUnmount and syncs indexed roots
+   against `Volumes.localCrawlRoots()`: mount → append-crawl the new root, rebuild live
+   maps, restart FSEvents with the expanded root set; unmount → `FileIndex.markDeletedSubtree`
+   tombstones the volume under wrlock and bumps mutationGen. FSEvents RootChanged now forces
+   a correctness reindex fallback. mvsim +4 (75→79).
 
 ## DONE-WHEN
 - [x] Path-column sort yields true path order (not name order); mvsim asserts it. (64e4ffb)
 - [x] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
 - [x] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
-- [ ] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
+- [x] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
 - [ ] Name-blob offsets widened past the 4 GiB `UInt32` cap (UInt64 or segmented) — or a guarded graceful cap.
 - [x] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, …) — 100% green.
 - [ ] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
@@ -69,9 +71,8 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-CLAUDE: implement **OPEN QUESTION 4 (dynamic mounts)**: volumes mounted AFTER launch
-aren't indexed/watched; unmounts leave stale entries. Observe `NSWorkspace.shared.notificationCenter` didMount/didUnmount:
-on mount → crawl+watch the new root; on unmount → tombstone that subtree. Also handle
-FSEvents RootChanged.
+AGY: first red-team CODEX's dynamic mount increment: verify NSWorkspace mount/unmount
+sync cannot duplicate `/Volumes/*` stubs, `markDeletedSubtree` holds wrlock and bumps
+mutationGen, dynamic append-crawl does not expose stale live maps, watcher restarts resume
+from the last applied FSEvents id, and RootChanged fallback is acceptable.
 Then address the UInt32 4 GiB name-blob cap + remaining cross-reviews.
-

@@ -140,6 +140,9 @@ final class AppModel: ObservableObject {
     private let watcher = FSWatcher()
     private var reconciler: Reconciler?
     private let reconcileQueue = DispatchQueue(label: "maverything.reconcile", qos: .utility)
+    private var watchedRoots: [CrawlRoot] = []
+    private var volumeRefreshInFlight = false
+    private var pendingVolumeRefresh = false
 
     init() {
         resultsStore.index = index
@@ -178,6 +181,12 @@ final class AppModel: ObservableObject {
         NotificationCenter.default.addObserver(
             self, selector: #selector(appBecameActive),
             name: NSApplication.didBecomeActiveNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(volumeDidMount(_:)),
+            name: NSWorkspace.didMountNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(volumeDidUnmount(_:)),
+            name: NSWorkspace.didUnmountNotification, object: nil)
     }
 
     private var progressTimer: Timer?
@@ -223,9 +232,12 @@ final class AppModel: ObservableObject {
                 self.engine.invalidate()
                 self.prewarmAndSearch()
                 Diag.log("LOADED snapshot \(self.index.count) items, resume@\(meta.lastEventId)")
-                self.startWatching(roots: Volumes.localCrawlRoots(),
+                let roots = Volumes.localCrawlRoots()
+                let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
+                self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
                                    sinceWhen: meta.lastEventId)
+                self.refreshMountedVolumes(reason: "snapshot root sync")
                 // Correctness guard: FSEvents only retains a few days of history, so if we
                 // were offline longer than that, the resume above may have missed changes.
                 // Rather than blindly re-index on a timer (like some rivals), re-index ONLY
@@ -316,6 +328,10 @@ final class AppModel: ObservableObject {
                 self.prewarmAndSearch()
                 self.startWatching(roots: roots, exclude: exclude, sinceWhen: sinceId)
                 self.saveSnapshot()   // so the next launch is instant
+                if self.pendingVolumeRefresh {
+                    self.pendingVolumeRefresh = false
+                    self.refreshMountedVolumes(reason: "pending after reindex")
+                }
             }
         }
     }
@@ -324,6 +340,7 @@ final class AppModel: ObservableObject {
 
     private func startWatching(roots: [CrawlRoot], exclude: [String],
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
+        watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
         let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints())
         reconciler = rec
@@ -331,7 +348,8 @@ final class AppModel: ObservableObject {
         watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, batchMax in
             guard let self else { return }
             if mustScanAll {
-                // FSEvents history gap / dropped events → safest is a full re-crawl.
+                // FSEvents history gap, dropped events, or watched-root changed → safest is a full re-crawl.
+                Diag.log("FSEvents requested full reindex for roots: \(paths.joined(separator: ", "))")
                 DispatchQueue.main.async { self.beginIndexing() }
                 return
             }
@@ -345,6 +363,116 @@ final class AppModel: ObservableObject {
             }
         }
         Diag.log("watching: \(watchPaths.joined(separator: ", ")) since=\(sinceWhen)")
+    }
+
+    @objc private func volumeDidMount(_ note: Notification) {
+        refreshMountedVolumes(reason: "didMount \(volumePath(from: note) ?? "unknown")")
+    }
+
+    @objc private func volumeDidUnmount(_ note: Notification) {
+        refreshMountedVolumes(reason: "didUnmount \(volumePath(from: note) ?? "unknown")")
+    }
+
+    private func volumePath(from note: Notification) -> String? {
+        (note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL)?
+            .path.precomposedStringWithCanonicalMapping
+    }
+
+    private func rootsByDisplayPath(_ roots: [CrawlRoot]) -> [String: CrawlRoot] {
+        var out: [String: CrawlRoot] = [:]
+        for r in roots { out[r.displayPath] = r }
+        return out
+    }
+
+    private func refreshMountedVolumes(reason: String) {
+        guard started else { return }
+        guard !isIndexing, !volumeRefreshInFlight else {
+            pendingVolumeRefresh = true
+            Diag.log("volume sync deferred (\(reason)); indexing=\(isIndexing) inFlight=\(volumeRefreshInFlight)")
+            return
+        }
+
+        let desiredRoots = Volumes.localCrawlRoots()
+        let currentByPath = rootsByDisplayPath(watchedRoots)
+        let desiredByPath = rootsByDisplayPath(desiredRoots)
+        let removals = watchedRoots.filter { desiredByPath[$0.displayPath] == nil }
+        let additions = desiredRoots.filter { currentByPath[$0.displayPath] == nil }
+        guard !removals.isEmpty || !additions.isEmpty else { return }
+
+        volumeRefreshInFlight = true
+        let gen = indexGen
+        let exclude = currentExclusions()
+        let expectedRoots = watchedRoots.filter { desiredByPath[$0.displayPath] != nil } + additions
+        let dynamicEnumerator = additions.isEmpty ? nil : FileEnumerator(index: index)
+        if let dynamicEnumerator { currentEnumerator = dynamicEnumerator }
+        Diag.log("volume sync (\(reason)): +[\(additions.map(\.displayPath).joined(separator: ", "))] -[\(removals.map(\.displayPath).joined(separator: ", "))]")
+
+        indexQueue.async { [weak self] in
+            guard let self else { return }
+            var removedRows = 0
+            for r in removals {
+                removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+            }
+            // If /Volumes delivered an event before NSWorkspace did, a mount point may
+            // already exist as a child stub. Remove it before adding the real root.
+            for r in additions {
+                removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+            }
+
+            var addedRows = 0
+            var openErrors = 0
+            var seconds = 0.0
+            if let en = dynamicEnumerator {
+                let stats = en.crawl(roots: additions, restrictToVolume: false, exclude: exclude,
+                                     mountPoints: Volumes.allMountPoints())
+                if !en.isCancelled {
+                    self.index.buildLiveIndexes()
+                    addedRows = stats.total
+                    openErrors = stats.openErrors
+                    seconds = stats.seconds
+                }
+            }
+
+            var finalRoots = expectedRoots
+            if dynamicEnumerator?.isCancelled != true {
+                let stillMounted = Set(Volumes.localCrawlRoots().map { $0.displayPath })
+                for r in finalRoots where !stillMounted.contains(r.displayPath) {
+                    removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+                }
+                finalRoots.removeAll { !stillMounted.contains($0.displayPath) }
+            }
+            let finalRootKeys = Set(finalRoots.map { $0.displayPath })
+            let desiredKeysAfterWork = Set(Volumes.localCrawlRoots().map { $0.displayPath })
+            let needsAnotherPass = finalRootKeys != desiredKeysAfterWork
+            let cancelled = dynamicEnumerator?.isCancelled == true
+
+            DispatchQueue.main.async {
+                if let en = dynamicEnumerator, self.currentEnumerator === en {
+                    self.currentEnumerator = nil
+                }
+                self.volumeRefreshInFlight = false
+                guard !cancelled, gen == self.indexGen else {
+                    if self.pendingVolumeRefresh, !self.isIndexing {
+                        self.pendingVolumeRefresh = false
+                        self.refreshMountedVolumes(reason: "pending after cancelled volume sync")
+                    }
+                    return
+                }
+
+                self.startWatching(roots: finalRoots, exclude: self.currentExclusions(),
+                                   sinceWhen: self.watcher.appliedEventId)
+                if removedRows > 0 || addedRows > 0 {
+                    self.indexedCount = self.index.safeCount()
+                    self.scheduleLiveRefresh()
+                    self.saveSnapshot()
+                    Diag.log("volume sync applied: +\(addedRows) rows -\(removedRows) rows, \(openErrors) open-errors in \(String(format: "%.2f", seconds))s")
+                }
+                if needsAnotherPass || self.pendingVolumeRefresh {
+                    self.pendingVolumeRefresh = false
+                    self.refreshMountedVolumes(reason: "pending after volume sync")
+                }
+            }
+        }
     }
 
     // Coalesce bursts of filesystem changes into one index refresh so we don't

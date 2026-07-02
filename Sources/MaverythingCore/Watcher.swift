@@ -9,7 +9,7 @@ import Foundation
 public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "maverything.fsevents")
-    // onBatch(dirtyPaths, mustScanAll, batchMaxEventId)
+    // onBatch(dirtyPaths, mustReindexAll, batchMaxEventId)
     fileprivate var onBatch: (([String], Bool, UInt64) -> Void)?
     private let eventIdLock = NSLock()
     // The resume cursor we PERSIST. Critically it advances only when a batch's changes
@@ -72,7 +72,8 @@ public final class FSWatcher: @unchecked Sendable {
             let f = Int(flags[i])
             if f & (kFSEventStreamEventFlagMustScanSubDirs
                     | kFSEventStreamEventFlagUserDropped
-                    | kFSEventStreamEventFlagKernelDropped) != 0 {
+                    | kFSEventStreamEventFlagKernelDropped
+                    | kFSEventStreamEventFlagRootChanged) != 0 {
                 mustScanAll = true
             }
             if ids[i] > batchMax { batchMax = ids[i] }

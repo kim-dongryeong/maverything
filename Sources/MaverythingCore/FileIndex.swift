@@ -313,6 +313,18 @@ public final class FileIndex: @unchecked Sendable {
         return i
     }
 
+    /// Tombstone a mounted root (or any indexed directory subtree) by display path.
+    /// Used when a volume disappears after launch; returns the number of live rows removed.
+    @discardableResult
+    public func markDeletedSubtree(displayPath rawPath: String) -> Int {
+        wrlock(); defer { unlock() }
+        let p = rawPath.precomposedStringWithCanonicalMapping
+        guard let idx = dirIndexByPath[p], !deleted[Int(idx)] else { return 0 }
+        let removed = _markDeletedSubtree(idx)
+        if removed > 0 { bumpMut() }
+        return removed
+    }
+
     /// Diffs a directory's freshly-listed children against the index and applies
     /// adds / removes / attribute updates atomically. Returns what changed.
     func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry],
@@ -382,12 +394,15 @@ public final class FileIndex: @unchecked Sendable {
         return idx
     }
 
-    private func _markDeletedSubtree(_ idx: Int32) {
+    @discardableResult
+    private func _markDeletedSubtree(_ idx: Int32) -> Int {
+        var removed = 0
         var stack = [idx]
         while let cur = stack.popLast() {
             let c = Int(cur)
             if deleted[c] { continue }
             deleted[c] = true
+            removed += 1
             // Drop the path→id mapping so it can't leak for the whole session on high churn
             // (e.g. repeatedly deleted node_modules/build dirs). Guard on identity so we never
             // remove a same-path entry that was just re-created (file→dir flip re-adds after this).
@@ -397,6 +412,7 @@ public final class FileIndex: @unchecked Sendable {
             }
             if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
         }
+        return removed
     }
 }
 

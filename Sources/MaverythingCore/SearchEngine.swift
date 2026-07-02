@@ -202,6 +202,17 @@ public final class SearchEngine: @unchecked Sendable {
         return ul >= needleLen && memmem(unicodeBase + uo, ul, needle, needleLen) != nil
     }
 
+    /// One term against one haystack, honoring Everything's Match Whole Word (`ww:`)
+    /// for exact mode (other modes define their own shape, so ww: applies to exact).
+    @inline(__always)
+    private func matchTerm(hay: UnsafePointer<UInt8>, hayLen: Int,
+                           needle: UnsafePointer<UInt8>, needleLen: Int,
+                           mode: MatchMode, wholeWord: Bool) -> MatchOutcome {
+        wholeWord && mode == .exact
+            ? Matcher.wholeWordExact(hay, hayLen, needle, needleLen)
+            : Matcher.match(hay: hay, hayLen: hayLen, needle: needle, needleLen: needleLen, mode: mode)
+    }
+
     @inline(__always)
     private func matchFoldedName(id: Int,
                                  asciiBase: UnsafePointer<UInt8>,
@@ -212,14 +223,15 @@ public final class SearchEngine: @unchecked Sendable {
                                  unicodeLenB: UnsafeBufferPointer<UInt32>,
                                  needle: UnsafePointer<UInt8>,
                                  needleLen: Int,
-                                 mode: MatchMode) -> MatchOutcome {
+                                 mode: MatchMode,
+                                 wholeWord: Bool = false) -> MatchOutcome {
         let o = Int(offB[id]); let l = Int(lenB[id])
-        var best = Matcher.match(hay: asciiBase + o, hayLen: l,
-                                 needle: needle, needleLen: needleLen, mode: mode)
+        var best = matchTerm(hay: asciiBase + o, hayLen: l,
+                             needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord)
         guard unicodeOffB[id] != noUnicodeFoldOffset, let unicodeBase else { return best }
         let uo = Int(unicodeOffB[id]); let ul = Int(unicodeLenB[id])
-        let folded = Matcher.match(hay: unicodeBase + uo, hayLen: ul,
-                                   needle: needle, needleLen: needleLen, mode: mode)
+        let folded = matchTerm(hay: unicodeBase + uo, hayLen: ul,
+                               needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord)
         if !best.matched || (folded.matched && folded.score > best.score) { best = folded }
         return best
     }
@@ -415,6 +427,7 @@ public final class SearchEngine: @unchecked Sendable {
         let hasNotDates = !parsed.notDateRanges.isEmpty
         let df = parsed.dateFrom, dt = parsed.dateTo
         let onlyDirs = parsed.onlyDirs, onlyFiles = parsed.onlyFiles
+        let wholeWord = parsed.wholeWord
 
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
@@ -500,17 +513,20 @@ public final class SearchEngine: @unchecked Sendable {
                                                                              parB: parB, stack: isb, out: psb)
                                     }
                                 }
-                                out = Matcher.match(hay: psb.baseAddress!, hayLen: pathLen,
-                                                    needle: needlePtr, needleLen: tr.len, mode: mode)
+                                out = self.matchTerm(hay: psb.baseAddress!, hayLen: pathLen,
+                                                     needle: needlePtr, needleLen: tr.len,
+                                                     mode: mode, wholeWord: wholeWord)
                             } else if caseSensitive {
-                                out = Matcher.match(hay: nbBase + o, hayLen: l,
-                                                    needle: needlePtr, needleLen: tr.len, mode: mode)
+                                out = self.matchTerm(hay: nbBase + o, hayLen: l,
+                                                     needle: needlePtr, needleLen: tr.len,
+                                                     mode: mode, wholeWord: wholeWord)
                             } else {
                                 out = self.matchFoldedName(id: id, asciiBase: fbBase,
                                                            offB: offB, lenB: lenB,
                                                            unicodeBase: unicodeBase,
                                                            unicodeOffB: uOffB, unicodeLenB: uLenB,
-                                                           needle: needlePtr, needleLen: tr.len, mode: mode)
+                                                           needle: needlePtr, needleLen: tr.len,
+                                                           mode: mode, wholeWord: wholeWord)
                             }
                             let pass = tr.negated ? !out.matched : out.matched
                             if !pass { ok = false; break }

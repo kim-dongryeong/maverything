@@ -90,6 +90,7 @@ final class AppModel: ObservableObject {
     @Published var ascending = true
     @Published var scope: SearchScope = .nameOnly
     @Published var matchMode: MatchMode = .exact
+    @Published var wholeWord = false               // Everything's Match Whole Word (ww:)
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
     @Published var recentQueries: [String] = AppModel.loadRecents()
     @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
@@ -167,13 +168,14 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        Publishers.Merge6(
+        Publishers.Merge7(
             $sortKey.map { _ in () },
             $ascending.map { _ in () },
             $scope.map { _ in () },
             $matchMode.map { _ in () },
             $typeFilter.map { _ in () },
-            $scopeRoot.map { _ in () }
+            $scopeRoot.map { _ in () },
+            $wholeWord.map { _ in () }
         )
         .dropFirst()
         .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
@@ -618,10 +620,14 @@ final class AppModel: ObservableObject {
 
     /// The user's typed query combined with the active type-filter chip.
     var effectiveQuery: String {
-        let c = typeFilter.clause
-        if c.isEmpty { return query }
         let q = query.trimmingCharacters(in: .whitespaces)
-        return q.isEmpty ? c : c + " " + q
+        let c = typeFilter.clause
+        var parts: [String] = []
+        if !c.isEmpty { parts.append(c) }
+        if !q.isEmpty { parts.append(q) }
+        guard !parts.isEmpty else { return "" }
+        if wholeWord { parts.insert("ww:", at: 0) }   // gear-menu toggle = the ww: filter
+        return parts.joined(separator: " ")
     }
 
     // MARK: - recent queries & saved searches

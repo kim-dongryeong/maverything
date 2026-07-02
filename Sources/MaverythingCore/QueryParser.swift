@@ -23,12 +23,13 @@ public struct ParsedQuery: Sendable {
     public var notDateRanges: [(Int64?, Int64?)] = []
     public var onlyDirs = false                     // `folder:` — match directories only
     public var onlyFiles = false                    // `file:`   — match non-directories only
+    public var wholeWord = false                    // `ww:` — Everything's Match Whole Word
     public var caseSensitive = false
 
     public var hasFilters: Bool {
         !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
             || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
-            || onlyDirs || onlyFiles
+            || onlyDirs || onlyFiles || wholeWord
     }
     public var isEmpty: Bool { terms.isEmpty && !hasFilters }
 
@@ -104,6 +105,9 @@ public enum QueryParser {
             guard let (from, to) = parseDate(val, now: now) else { return false }
             if negated { q.notDateRanges.append((from, to)) }
             else { if let f = from { q.dateFrom = f }; if let t = to { q.dateTo = t } }
+            return true
+        case "ww", "wholeword":                // Everything's Match Whole Word
+            if !negated { q.wholeWord = true }
             return true
         case "folder", "folders", "dir":       // restrict to directories (Everything's folder:)
             applyTypeFilter(dir: true, val: val, negated: negated, into: &q)

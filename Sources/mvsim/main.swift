@@ -37,6 +37,7 @@ func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
 
 let oldTime = now - 200 * 86_400   // ~200 days ago
 write("report.txt", bytes: 200, mtime: now)
+write("reporting_x.txt", bytes: 4)                     // whole-word (ww:) negative case
 write("Report.PNG", bytes: 300, mtime: oldTime)        // case-insensitivity
 write("notes.md", bytes: 50)
 write("README.md", bytes: 80)
@@ -192,6 +193,11 @@ check("type: 'folder: -folder:data' → dirs excluding 'data' (not empty, keeps 
       !folderExclData.isEmpty && !folderExclData.contains("data") && folderExclData.contains("src"))
 check("type: '-file:report' excludes report.txt but keeps data.json",
       !has("-file:report", "report.txt") && has("-file:report", "data.json"))
+
+// Everything's Match Whole Word (ww: / wholeword:)
+check("wholeword: 'ww: report' matches report.txt", has("ww: report", "report.txt"))
+check("wholeword: 'ww: report' excludes reporting_x.txt", !has("ww: report", "reporting_x.txt"))
+check("wholeword: plain 'report' still matches reporting_x.txt", has("report", "reporting_x.txt"))
 
 // incremental "narrow as you type": extending a query must equal a from-scratch full scan
 _ = engine.search("re", limit: 100_000, now: now)                      // caches full set for "re"

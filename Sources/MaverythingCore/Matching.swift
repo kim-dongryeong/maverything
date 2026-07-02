@@ -110,6 +110,37 @@ public enum Matcher {
         return p == patLen ? MatchOutcome(true, max(1, 700 - hayLen), 0) : .no
     }
 
+    // MARK: whole-word exact (Everything's "Match Whole Word", ww:)
+
+    /// Substring match where the hit must not be flanked by word characters —
+    /// `report` matches "report.txt" but not "reporting_x.txt". Scans past
+    /// non-word-boundary hits to later occurrences.
+    @inline(__always)
+    static func wholeWordExact(_ hay: UnsafePointer<UInt8>, _ hayLen: Int,
+                               _ needle: UnsafePointer<UInt8>, _ needleLen: Int) -> MatchOutcome {
+        guard needleLen > 0, hayLen >= needleLen else { return .no }
+        var from = 0
+        while from + needleLen <= hayLen {
+            guard let hit = memmem(hay + from, hayLen - from, needle, needleLen) else { return .no }
+            let pos = UnsafeRawPointer(hit) - UnsafeRawPointer(hay)
+            let beforeOK = pos == 0 || !isWordByte(hay[pos - 1])
+            let afterOK = pos + needleLen == hayLen || !isWordByte(hay[pos + needleLen])
+            if beforeOK && afterOK {
+                var score = 1000 - min(pos, 900)
+                if pos == 0 || isBoundary(hay, pos) { score += 80 }
+                return MatchOutcome(true, score, pos)
+            }
+            from = pos + 1
+        }
+        return .no
+    }
+
+    /// ASCII letters/digits and any multi-byte UTF-8 unit count as word characters.
+    @inline(__always)
+    static func isWordByte(_ b: UInt8) -> Bool {
+        (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b >= 0x80
+    }
+
     // a byte is a "word boundary start" if the preceding byte is a separator
     @inline(__always)
     static func isBoundary(_ hay: UnsafePointer<UInt8>, _ i: Int) -> Bool {

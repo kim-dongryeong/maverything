@@ -37,6 +37,7 @@ struct OptionsButton: NSViewRepresentable {
                   selected: UILayout.allCases.firstIndex(of: model.layout) ?? 0, cmd: "layout")
             group(m, "Match mode", MatchMode.allCases.map(\.label),
                   selected: MatchMode.allCases.firstIndex(of: model.matchMode) ?? 0, cmd: "mode")
+            check(m, "Match whole word (ww:)", model.wholeWord, cmd: "ww")
             group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
                   selected: sortIndex(model.sortKey), cmd: "sort")
             group(m, "Scope", ["Name only", "Full path  (⌃U)"],
@@ -114,6 +115,7 @@ struct OptionsButton: NSViewRepresentable {
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
             case "asc":     model.ascending.toggle()
+            case "ww":      model.wholeWord.toggle()
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()
             case "fda":     model.showOnboarding = true

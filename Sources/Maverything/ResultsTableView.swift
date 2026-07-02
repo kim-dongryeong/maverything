@@ -125,6 +125,7 @@ final class MVTableView: NSTableView {
         y = max(minY, min(y, maxY))
         clip.setBoundsOrigin(NSPoint(x: visible.origin.x, y: y))                             // direct = no animation
         sv.reflectScrolledClipView(clip)
+        sv.flashScrollers()   // direct clip moves bypass the overlay-scroller reveal — show it like native scrolling
     }
 
     /// After a repeat step, re-assert the exact edge alignment (an in-flight smooth

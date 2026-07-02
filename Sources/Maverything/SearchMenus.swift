@@ -99,6 +99,7 @@ struct SyntaxHelpView: View {
         ("path:src",         "match against the full path"),
         ("name:data",        "match the name even in path mode"),
         ("case:on",          "make the whole query case-sensitive"),
+        ("ww:",              "match whole words only (report ≠ reporting)"),
     ]
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {

@@ -1,5 +1,5 @@
-## TURN: AGY
-**Updated:** 2026-07-02 20:54
+## TURN: CLAUDE
+**Updated:** 2026-07-02 21:00
 
 ## GOAL
 Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
@@ -21,7 +21,7 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
   `Matching`, `QueryParser`.
 - App `Sources/Maverything/`: `AppModel`, `ResultsTableView`, `CompactResults`, `PreviewPane`,
   `ContentView`, `FilterBar`, `SearchMenus`, `OptionsButton`, `Settings`.
-- Harness: `.build/release/mvsim` (71 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
+- Harness: `.build/release/mvsim` (75 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
 - Build: `swift build -c release`. Sim: `.build/release/mvsim`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
@@ -38,9 +38,10 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
    duplicate Unicode bytes. Query terms use the same NFC + case/diacritic-insensitive
    fold, so `CAFÉ.txt` is found by `café` and `cafe`; path-scope search and snapshot
    v4 round-trip are covered. mvsim +5 (66→71).
-3. **Relevance sort top-K** — `general()` relevance path stores + sorts EVERY match then
-   takes `limit`. Use per-chunk bounded top-K (or partial selection) then merge, so a broad
-   relevance query doesn't allocate/sort millions of pairs. Keep results identical.
+3. **Relevance sort top-K** — ✅ DONE (AGY turn). Added per-chunk bounded top-K
+   with dynamic sort/prune when the array exceeds `limit + max(512, limit)`. Combines
+   and merges across workers, returning identical results with minimal allocation.
+   mvsim +4 (71→75).
 4. **Dynamic mount/unmount** — volumes mounted AFTER launch aren't indexed/watched; unmounts
    leave stale entries. Observe `NSWorkspace.shared.notificationCenter` didMount/didUnmount:
    on mount → crawl+watch the new root; on unmount → tombstone that subtree. (Also handle
@@ -49,10 +50,10 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 ## DONE-WHEN
 - [x] Path-column sort yields true path order (not name order); mvsim asserts it. (64e4ffb)
 - [x] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
-- [ ] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
+- [x] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
 - [ ] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
 - [ ] Name-blob offsets widened past the 4 GiB `UInt32` cap (UInt64 or segmented) — or a guarded graceful cap.
-- [ ] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, …) — 100% green.
+- [x] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, …) — 100% green.
 - [ ] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
       reads via rdlock/withReadLock, mutations bump mutationGen under wrlock; no eager per-row work).
 - [ ] build green · existing flows intact · no secrets · clean tree.
@@ -68,12 +69,9 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-AGY: first red-team CODEX's Unicode-fold increment: verify `unicodeFoldOff`/`unicodeFoldLen`
-stay lock-step through `appendRoot`/`appendChildren`/`_appendOne`/`clear`/snapshot v4, pure-ASCII
-names use the sentinel fast path, query folding is shared by `QueryParser`, case-sensitive
-search still uses `nameBlob`, and all reads happen under `SearchEngine.search`'s index read lock.
-Then implement **OPEN QUESTION 3 (relevance top-K)**: `general()` currently stores and sorts
-every relevance match before applying `limit`; replace that with per-chunk bounded top-K or
-partial selection plus merge, keeping result order identical for both ascending and descending.
-Add mvsim parity coverage for relevance top-K. Then CLAUDE loops back for **4 (dynamic mounts)**
-+ the UInt32 4 GiB name-blob cap + remaining cross-review.
+CLAUDE: implement **OPEN QUESTION 4 (dynamic mounts)**: volumes mounted AFTER launch
+aren't indexed/watched; unmounts leave stale entries. Observe `NSWorkspace.shared.notificationCenter` didMount/didUnmount:
+on mount → crawl+watch the new root; on unmount → tombstone that subtree. Also handle
+FSEvents RootChanged.
+Then address the UInt32 4 GiB name-blob cap + remaining cross-reviews.
+

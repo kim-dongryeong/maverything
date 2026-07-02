@@ -1,5 +1,5 @@
-## TURN: CODEX
-**Updated:** 2026-07-02 22:26
+## TURN: DONE
+**Updated:** 2026-07-02 22:15
 
 ## GOAL
 Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
@@ -21,7 +21,7 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
   `Matching`, `QueryParser`.
 - App `Sources/Maverything/`: `AppModel`, `ResultsTableView`, `CompactResults`, `PreviewPane`,
   `ContentView`, `FilterBar`, `SearchMenus`, `OptionsButton`, `Settings`.
-- Harness: `.build/release/mvsim` (79 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
+- Harness: `.build/release/mvsim` (85 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
 - Build: `swift build -c release`. Sim: `.build/release/mvsim`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
@@ -58,10 +58,10 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
       `UInt64` end-to-end; snapshot bumped to **v5** (8-byte offsets) with a **v4 read-migration**
       (reads legacy UInt32 offsets → widens); all search helpers take `UnsafeBufferPointer<UInt64>`.
 - [x] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, v4→v5
-      migration) — 100% green (83/83).
-- [ ] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
+      migration and corrupt/truncated v4 rejection) — 100% green (85/85).
+- [x] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
       reads via rdlock/withReadLock, mutations bump mutationGen under wrlock; no eager per-row work).
-- [ ] build green · existing flows intact · no secrets · clean tree.
+- [x] build green · existing flows intact · no secrets · clean tree.
 
 ## CONSTRAINTS
 - Only edit files under this worktree. NEVER `git push`. One focused increment per turn.
@@ -74,11 +74,7 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-CODEX: red-team the UInt64 name-blob widening (this turn). Verify: no remaining `UInt32(nameBlob.count)`
-or 4-byte offset assumption survives (grep clean); the snapshot **v4→v5** read-migration maps legacy
-offsets correctly and `perEntry`/`expected` length math is right for BOTH versions (a short v4 blob must
-still reject → full crawl); `nameOff.append(o &+ blobBase)` in `appendChildBatch` cannot silently wrap;
-and every `withUnsafeBufferPointer { offB }` call site feeds the widened array to the `UInt64` helpers.
-Then: the two remaining DONE-WHEN boxes are cross-review + clean-tree/green — do a final adversarial
-cross-review sweep of the L4 batch (lock discipline, no eager per-row work) and, if clean, flip
-`## TURN: DONE`. Optional deferred perf: OQ1B directory-order tuple keys for cheaper path-sort rebuilds.
+DONE: L4 is complete. Final CODEX sweep made snapshot v4/v5 loading transactional on success,
+added corrupt/truncated v4 rejection coverage, replaced wrapping child-batch offset addition with
+checked addition, and re-ran release build + `mvsim` 85/85. Optional deferred perf only: OQ1B
+directory-order tuple keys for cheaper path-sort rebuilds if path-sort rebuild becomes hot in mvtest.

@@ -332,6 +332,30 @@ check("snapshot v4→v5: path-scope search intact after migration",
       e4.search("png", limit: 10_000, now: now).total > 0
       && e4.search("png", limit: 10_000, now: now).total == e2.search("png", limit: 10_000, now: now).total)
 
+let shortV4 = Data(v4blob.dropLast())
+let shortV4Idx = FileIndex()
+check("snapshot v4→v5: truncated legacy blob rejects",
+      shortV4Idx.loadSnapshot(shortV4) == nil && shortV4Idx.count == 0)
+
+let corruptV4: Data = {
+    var b = [UInt8](v4blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
+    if count > 0 {
+        let nameOffStart = 48 + blobLen*2 + uBlobLen
+        b[nameOffStart] = 0xff; b[nameOffStart + 1] = 0xff
+        b[nameOffStart + 2] = 0xff; b[nameOffStart + 3] = 0xff
+    }
+    return Data(b)
+}()
+let corruptV4Idx = FileIndex()
+_ = corruptV4Idx.appendRoot(path: "/sentinel")
+let corruptBefore = corruptV4Idx.count
+check("snapshot v4→v5: corrupt offsets reject without replacing index",
+      corruptV4Idx.loadSnapshot(corruptV4) == nil
+      && corruptV4Idx.count == corruptBefore
+      && corruptV4Idx.name(0) == "/sentinel")
+
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]
 var times: [Double] = []

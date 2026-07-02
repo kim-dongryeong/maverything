@@ -158,10 +158,10 @@ public final class FileIndex: @unchecked Sendable {
         nameBlob.append(contentsOf: batch.blob)
         foldBlob.append(contentsOf: batch.fold)
         unicodeFoldBlob.append(contentsOf: batch.unicodeFoldBlob)
-        for o in batch.off { nameOff.append(o &+ blobBase) }
+        for o in batch.off { nameOff.append(checkedBlobOffset(o, adding: blobBase)) }
         nameLen.append(contentsOf: batch.len)
         for o in batch.unicodeFoldOff {
-            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : o &+ unicodeBlobBase)
+            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : checkedBlobOffset(o, adding: unicodeBlobBase))
         }
         unicodeFoldLen.append(contentsOf: batch.unicodeFoldLen)
         size.append(contentsOf: batch.size)
@@ -444,6 +444,12 @@ public let VNODE_VLNK: UInt8 = 5
 
 let noUnicodeFoldOffset = UInt64.max
 private let searchFoldLocale = Locale(identifier: "en_US_POSIX")
+
+@inline(__always) private func checkedBlobOffset(_ local: UInt64, adding base: UInt64) -> UInt64 {
+    let (offset, overflow) = local.addingReportingOverflow(base)
+    if overflow { fatalError("Maverything name blob offset overflow") }
+    return offset
+}
 
 @inline(__always) func asciiLower(_ b: UInt8) -> UInt8 {
     (b >= 65 && b <= 90) ? b &+ 32 : b

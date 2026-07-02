@@ -115,45 +115,63 @@ extension FileIndex {
             let expected = 48 + blobLen * 2 + unicodeBlobLen + count * perEntry
             guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
-            wrlock(); defer { unlock() }   // replaces all arrays
-            bumpMutationLocked()           // new generation → search caches rebuild
-            nameBlob = readArray(raw, &off, blobLen, UInt8.self)
-            foldBlob = readArray(raw, &off, blobLen, UInt8.self)
-            unicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
+            let loadedNameBlob = readArray(raw, &off, blobLen, UInt8.self)
+            let loadedFoldBlob = readArray(raw, &off, blobLen, UInt8.self)
+            let loadedUnicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
+            let loadedNameOff: [UInt64]
             if v == 4 {
                 let tempOff = readArray(raw, &off, count, UInt32.self)
-                nameOff = tempOff.map { UInt64($0) }
+                loadedNameOff = tempOff.map { UInt64($0) }
             } else {
-                nameOff = readArray(raw, &off, count, UInt64.self)
+                loadedNameOff = readArray(raw, &off, count, UInt64.self)
             }
-            nameLen = readArray(raw, &off, count, UInt16.self)
-            unicodeFoldOff = readArray(raw, &off, count, UInt64.self)
-            unicodeFoldLen = readArray(raw, &off, count, UInt32.self)
-            parent = readArray(raw, &off, count, Int32.self)
-            size = readArray(raw, &off, count, Int64.self)
-            mtime = readArray(raw, &off, count, Int64.self)
-            crtime = readArray(raw, &off, count, Int64.self)
-            objType = readArray(raw, &off, count, UInt8.self)
-            flags = readArray(raw, &off, count, UInt32.self)
-            let hid = readArray(raw, &off, count, UInt8.self)
-            hidden = hid.map { $0 != 0 }
-            deleted = [Bool](repeating: false, count: count)
+            let loadedNameLen = readArray(raw, &off, count, UInt16.self)
+            let loadedUnicodeFoldOff = readArray(raw, &off, count, UInt64.self)
+            let loadedUnicodeFoldLen = readArray(raw, &off, count, UInt32.self)
+            let loadedParent = readArray(raw, &off, count, Int32.self)
+            let loadedSize = readArray(raw, &off, count, Int64.self)
+            let loadedMtime = readArray(raw, &off, count, Int64.self)
+            let loadedCrtime = readArray(raw, &off, count, Int64.self)
+            let loadedObjType = readArray(raw, &off, count, UInt8.self)
+            let loadedFlags = readArray(raw, &off, count, UInt32.self)
+            let loadedHiddenBytes = readArray(raw, &off, count, UInt8.self)
             // Intra-file integrity: a valid-LENGTH but corrupt snapshot (bit rot) could hold
             // out-of-range name offsets or parent indices that would trap in _name/_path.
             // Verify in one pass; on any violation, reject → caller does a full crawl.
+            let blobLen64 = UInt64(blobLen)
+            let unicodeBlobLen64 = UInt64(unicodeBlobLen)
             for i in 0..<count {
-                if Int(nameOff[i]) + Int(nameLen[i]) > blobLen { return nil }
-                let uo = unicodeFoldOff[i]
+                let nameOffset = loadedNameOff[i]
+                let nameLength = UInt64(loadedNameLen[i])
+                if nameOffset > blobLen64 || nameLength > blobLen64 - nameOffset { return nil }
+                let uo = loadedUnicodeFoldOff[i]
                 if uo == noUnicodeFoldOffset {
-                    if unicodeFoldLen[i] != 0 { return nil }
+                    if loadedUnicodeFoldLen[i] != 0 { return nil }
                 } else {
-                    let ul = UInt64(unicodeFoldLen[i])
-                    let uBlobLen = UInt64(unicodeBlobLen)
-                    if uo > uBlobLen || ul > uBlobLen - uo { return nil }
+                    let ul = UInt64(loadedUnicodeFoldLen[i])
+                    if uo > unicodeBlobLen64 || ul > unicodeBlobLen64 - uo { return nil }
                 }
-                let par = parent[i]
+                let par = loadedParent[i]
                 if par < -1 || Int(par) >= count { return nil }
             }
+
+            wrlock(); defer { unlock() }   // replaces all arrays only after validation succeeds
+            bumpMutationLocked()           // new generation → search caches rebuild
+            nameBlob = loadedNameBlob
+            foldBlob = loadedFoldBlob
+            unicodeFoldBlob = loadedUnicodeFoldBlob
+            nameOff = loadedNameOff
+            nameLen = loadedNameLen
+            unicodeFoldOff = loadedUnicodeFoldOff
+            unicodeFoldLen = loadedUnicodeFoldLen
+            parent = loadedParent
+            size = loadedSize
+            mtime = loadedMtime
+            crtime = loadedCrtime
+            objType = loadedObjType
+            flags = loadedFlags
+            hidden = loadedHiddenBytes.map { $0 != 0 }
+            deleted = [Bool](repeating: false, count: count)
             childrenOf.removeAll(); dirIndexByPath.removeAll()
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }

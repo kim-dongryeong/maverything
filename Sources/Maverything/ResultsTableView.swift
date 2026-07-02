@@ -122,6 +122,7 @@ struct ResultsTableView: NSViewRepresentable {
         table.doubleAction = #selector(Coordinator.doubleClicked)
         table.usesAutomaticRowHeights = false
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        table.registerForDraggedTypes([.fileURL])   // drop a folder onto the list → scope to it
 
         for col in Self.columns {
             addColumn(table, id: col.id, title: col.title, width: col.width,
@@ -178,6 +179,14 @@ struct ResultsTableView: NSViewRepresentable {
         if let tv = coord.tableView, tv.rowHeight != model.density.rowHeight {
             tv.rowHeight = model.density.rowHeight
             tv.reloadData()
+        }
+        // keep the header sort arrow in sync when sort is changed via the gear menu
+        if let tv = coord.tableView {
+            let key = coord.sortColumnKey(model.sortKey)
+            let cur = tv.sortDescriptors.first
+            if cur?.key != key || (key != nil && cur?.ascending != model.ascending) {
+                tv.sortDescriptors = key.map { [NSSortDescriptor(key: $0, ascending: model.ascending)] } ?? []
+            }
         }
         // ↓ from the search field moves focus into the list and selects a row
         if coord.lastFocusResultsNonce != model.focusResultsNonce {
@@ -262,6 +271,27 @@ struct ResultsTableView: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
                        sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
             [.copy, .move]
+        }
+
+        // Drop a folder onto the list → scope the search to that folder.
+        private func droppedFolder(_ info: NSDraggingInfo) -> String? {
+            guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] else { return nil }
+            for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                return u.path
+            }
+            return nil
+        }
+        func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                       proposedRow row: Int, proposedDropOperation op: NSTableView.DropOperation) -> NSDragOperation {
+            guard info.draggingSource == nil else { return [] }   // ignore our own row drags
+            if droppedFolder(info) != nil { tableView.setDropRow(-1, dropOperation: .on); return .copy }
+            return []
+        }
+        func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                       row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+            guard let folder = droppedFolder(info) else { return false }
+            model.searchInFolder(path: folder, isDir: true)
+            return true
         }
 
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -382,14 +412,31 @@ struct ResultsTableView: NSViewRepresentable {
             return cell
         }
 
+        private var pendingBytesWork: DispatchWorkItem?
+
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard let tv = tableView else { return }
             let row = tv.selectedRow
             model.selectedID = (row >= 0 && row < ids.count) ? ids[row] : nil
-            // Finder-style selection summary
             let rows = tv.selectedRowIndexes
             model.selectionCount = rows.count
-            model.selectionBytes = model.index.totalSize(of: rows.compactMap { $0 < ids.count ? ids[$0] : nil })
+            // The byte total is only shown for multi-selection. Computing it takes the
+            // index lock (which the reconciler can hold), so NEVER do it on the main
+            // thread during arrow nav — single selection skips it entirely; multi-select
+            // sums off-thread, debounced, so held ⇧↓ doesn't stutter.
+            pendingBytesWork?.cancel()
+            if rows.count > 1 {
+                let idSnapshot = rows.compactMap { $0 < ids.count ? ids[$0] : nil }
+                let index = model.index
+                let work = DispatchWorkItem { [weak self] in
+                    let bytes = index.totalSize(of: idSnapshot)
+                    DispatchQueue.main.async { self?.model.selectionBytes = bytes }
+                }
+                pendingBytesWork = work
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.1, execute: work)
+            } else {
+                model.selectionBytes = 0
+            }
             // keep an open Quick Look in sync as the selection moves (Finder-style)
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()
@@ -459,8 +506,17 @@ struct ResultsTableView: NSViewRepresentable {
             case "created": mapped = .dateCreated
             default: mapped = .name
             }
-            model.sortKey = mapped
-            model.ascending = sd.ascending
+            // guard prevents a feedback loop when we set sortDescriptors programmatically below
+            if model.sortKey != mapped { model.sortKey = mapped }
+            if model.ascending != sd.ascending { model.ascending = sd.ascending }
+        }
+
+        /// Column identifier that shows the sort arrow for a given SortKey (nil = none, e.g. relevance).
+        func sortColumnKey(_ k: SortKey) -> String? {
+            switch k {
+            case .name: return "name";  case .path: return "path";  case .size: return "size"
+            case .dateModified: return "date"; case .dateCreated: return "created"; case .relevance: return nil
+            }
         }
 
         // MARK: - Actions

@@ -18,7 +18,7 @@ public enum Volumes {
     /// drives". Skips network mounts, devfs/autofs, and tiny system-internal
     /// nobrowse volumes (VM/Preboot/Update/…). Cloud storage is excluded via
     /// `defaultExclusions`, not here (it lives *inside* a local volume).
-    public static func localCrawlRoots(includeRemovable: Bool = true) -> [CrawlRoot] {
+    public static func localCrawlRoots() -> [CrawlRoot] {
         var roots: [CrawlRoot] = []
         var seen = Set<String>()
 
@@ -78,7 +78,11 @@ public enum Volumes {
         public let isRemovableOrBrowsable: Bool
     }
 
+    private static let mntLock = NSLock()
     public static func mounted() -> [MountInfo] {
+        // getmntinfo(3) returns a shared static buffer — serialize to avoid the
+        // main-thread crawl vs background reindex racing on it.
+        mntLock.lock(); defer { mntLock.unlock() }
         var mntbuf: UnsafeMutablePointer<statfs>?
         let n = getmntinfo(&mntbuf, MNT_NOWAIT)
         guard n > 0, let buf = mntbuf else { return [] }

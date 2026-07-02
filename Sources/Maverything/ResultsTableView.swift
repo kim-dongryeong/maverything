@@ -191,7 +191,9 @@ struct ResultsTableView: NSViewRepresentable {
                 tv?.scrollRowToVisible(0)
             } else if !keep.isEmpty {
                 var rows = IndexSet()
-                for (i, id) in coord.renderedIDs.enumerated() where keep.contains(id) { rows.insert(i) }
+                for (i, id) in coord.renderedIDs.enumerated() {
+                    if keep.contains(id) { rows.insert(i); if rows.count == keep.count { break } }
+                }
                 if !rows.isEmpty { tv?.selectRowIndexes(rows, byExtendingSelection: false) }
             }
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {

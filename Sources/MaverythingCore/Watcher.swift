@@ -10,7 +10,13 @@ public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "maverything.fsevents")
     fileprivate var onBatch: (([String], Bool) -> Void)?
-    public private(set) var lastEventId: UInt64 = 0
+    // written on the fsevents queue, read on main → guard it
+    private let eventIdLock = NSLock()
+    private var _lastEventId: UInt64 = 0
+    public var lastEventId: UInt64 {
+        get { eventIdLock.lock(); defer { eventIdLock.unlock() }; return _lastEventId }
+        set { eventIdLock.lock(); _lastEventId = newValue; eventIdLock.unlock() }
+    }
 
     public init() {}
 

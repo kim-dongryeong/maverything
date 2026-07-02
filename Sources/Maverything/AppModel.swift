@@ -109,6 +109,13 @@ final class AppModel: ObservableObject {
     @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
         didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
     }
+    /// Minutes between scheduled rescans of the custom index roots (0 = off).
+    /// Network shares deliver no reliable FSEvents, so — like Everything's folder
+    /// "Update" schedule — a periodic re-crawl is the only way to keep them fresh.
+    @Published var customRootRescanMinutes: Int =
+        (UserDefaults.standard.object(forKey: "mv.customRootRescan") as? Int) ?? 60 {
+        didSet { UserDefaults.standard.set(customRootRescanMinutes, forKey: "mv.customRootRescan") }
+    }
     @Published var showHidden = true            // Everything-style: show everything
     @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
         didSet { UserDefaults.standard.set(enterRenames, forKey: "mv.enterRenames") }
@@ -258,6 +265,7 @@ final class AppModel: ObservableObject {
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess
         startPeriodicSave()
+        startCustomRootRescanTimer()
         if !loadFromSnapshot() { beginIndexing() }
     }
 
@@ -564,6 +572,104 @@ final class AppModel: ObservableObject {
                 if needsAnotherPass || self.pendingVolumeRefresh {
                     self.pendingVolumeRefresh = false
                     self.refreshMountedVolumes(reason: "pending after volume sync")
+                }
+            }
+        }
+    }
+
+    // MARK: - scheduled custom-root rescan (Everything's folder "Update")
+
+    private var rescanTimer: Timer?
+    /// Wall-clock time of the last completed custom-root rescan. Initialized to
+    /// launch time so the first rescan lands one full interval after startup.
+    private var lastCustomRootRescan: TimeInterval = Date().timeIntervalSince1970
+
+    /// Cheap 5-minute heartbeat; the real cadence is `customRootRescanMinutes`.
+    /// Same pattern as `startPeriodicSave` — the closure re-reads the live settings
+    /// each tick, so changing the interval needs no timer restart.
+    private func startCustomRootRescanTimer() {
+        rescanTimer?.invalidate()
+        rescanTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let minutes = self.customRootRescanMinutes
+            guard minutes > 0, !self.customRoots.isEmpty, !self.isIndexing,
+                  Date().timeIntervalSince1970 - self.lastCustomRootRescan >= Double(minutes) * 60
+            else { return }
+            self.rescanCustomRoots()
+        }
+    }
+
+    /// Re-crawl every custom index root in place: tombstone its subtree, append-crawl
+    /// it fresh, then restart the watcher over the SAME roots. Custom roots are above
+    /// all network shares (non-MNT_LOCAL), which get no reliable FSEvents — without
+    /// this they silently drift from reality.
+    private func rescanCustomRoots() {
+        guard started else { return }
+        // Shares refreshMountedVolumes' guards so the two flows can never overlap:
+        // while a volume sync is in flight (or a reindex is running) we simply skip —
+        // the 5-minute heartbeat retries soon. Conversely, while the rescan holds
+        // volumeRefreshInFlight, a concurrent mount/unmount defers itself via
+        // pendingVolumeRefresh, which we drain below exactly like the volume sync does.
+        guard !isIndexing, !volumeRefreshInFlight else { return }
+
+        // Only roots that are custom (not local volumes) AND currently watched AND
+        // still reachable — desiredCrawlRoots() drops vanished shares via its
+        // FileManager.fileExists guard, routing their cleanup to the volume sync.
+        let localPaths = Set(Volumes.localCrawlRoots().map(\.displayPath))
+        let watchedByPath = rootsByDisplayPath(watchedRoots)
+        let roots = desiredCrawlRoots().filter {
+            !localPaths.contains($0.displayPath) && watchedByPath[$0.displayPath] != nil
+        }
+        guard !roots.isEmpty else { return }   // e.g. share offline — retry next tick
+
+        volumeRefreshInFlight = true
+        let gen = indexGen
+        let exclude = currentExclusions()
+        let en = FileEnumerator(index: index)
+        currentEnumerator = en
+        Diag.log("custom-root rescan starting: [\(roots.map(\.displayPath).joined(separator: ", "))] (every \(customRootRescanMinutes) min)")
+
+        indexQueue.async { [weak self] in
+            guard let self else { return }
+            // Same invariant as refreshMountedVolumes: capture the FSEvents cursor
+            // BEFORE the re-crawl. The old stream keeps applying events during the
+            // (possibly long) NAS crawl and advances appliedEventId past them, so
+            // resuming from appliedEventId alone could silently drop changes that
+            // landed on these roots mid-crawl.
+            let preCrawlId = FSEventsGetCurrentEventId()
+            var removedRows = 0
+            for r in roots {
+                removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+            }
+            let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
+                                 mountPoints: Volumes.allMountPoints())
+            if !en.isCancelled { self.index.buildLiveIndexes() }
+            let cancelled = en.isCancelled
+
+            DispatchQueue.main.async {
+                if self.currentEnumerator === en { self.currentEnumerator = nil }
+                self.volumeRefreshInFlight = false
+                guard !cancelled, gen == self.indexGen else {
+                    if self.pendingVolumeRefresh, !self.isIndexing {
+                        self.pendingVolumeRefresh = false
+                        self.refreshMountedVolumes(reason: "pending after cancelled custom-root rescan")
+                    }
+                    return
+                }
+                // Resume from BEFORE the rescan (replay is idempotent; resuming earlier
+                // is always safe) with the SAME watched roots — a rescan adds/removes
+                // no roots, so the watch set is unchanged.
+                let resumeId = min(preCrawlId, self.watcher.appliedEventId)
+                self.startWatching(roots: self.watchedRoots, exclude: self.currentExclusions(),
+                                   sinceWhen: resumeId)
+                self.lastCustomRootRescan = Date().timeIntervalSince1970
+                self.indexedCount = self.index.safeCount()
+                self.scheduleLiveRefresh()
+                self.saveSnapshot()
+                Diag.log("custom-root rescan: \(roots.map(\.displayPath).joined(separator: ", ")) → \(stats.total) rows crawled, \(removedRows) tombstoned, \(stats.openErrors) open-errors in \(String(format: "%.2f", stats.seconds))s")
+                if self.pendingVolumeRefresh {
+                    self.pendingVolumeRefresh = false
+                    self.refreshMountedVolumes(reason: "pending after custom-root rescan")
                 }
             }
         }

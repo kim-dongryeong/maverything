@@ -270,6 +270,15 @@ struct SettingsView: View {
                 Button("Add Folder…") { pickFolder { model.addCustomRoot($0) } }
                 Text("Local volumes are indexed automatically — add network shares (NAS/SMB) or other locations the scan doesn't cover. Live updates on network volumes are best-effort; use Reindex to refresh.")
                     .font(.caption).foregroundStyle(.secondary)
+                Picker("Rescan network folders", selection: $model.customRootRescanMinutes) {
+                    Text("Off").tag(0)
+                    Text("Every 15 min").tag(15)
+                    Text("Hourly").tag(60)
+                    Text("Every 6 hours").tag(360)
+                    Text("Daily").tag(1440)
+                }
+                Text("Network shares don't deliver reliable file events — periodic rescans keep them fresh.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Excluded folders") {

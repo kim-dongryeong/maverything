@@ -254,9 +254,54 @@ struct SettingsView: View {
             if !model.hasFullDiskAccess {
                 Button("Grant Full Disk Access…") { model.showOnboarding = true }
             }
+
+            Divider()
+            // Everything's "folder indexing" — for locations the local-volume scan
+            // doesn't reach (above all network shares / NAS mounts).
+            Text("Extra index folders").font(.headline)
+            pathList(model.customRoots, remove: { model.removeCustomRoot($0) })
+            Button("Add Folder…") { pickFolder { model.addCustomRoot($0) } }
+            Text("Local volumes are indexed automatically — add network shares (NAS/SMB) or other locations the scan doesn't cover. Live updates on network volumes are best-effort; use Reindex to refresh.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            Divider()
+            Text("Excluded folders").font(.headline)
+            pathList(model.customExcludes, remove: { model.removeCustomExclude($0) })
+            Button("Add Exclusion…") { pickFolder { model.addCustomExclude($0) } }
+            Text("Excluded folders are removed from the index immediately; removing an exclusion triggers a reindex.")
+                .font(.caption).foregroundStyle(.secondary)
+
             Divider()
             Button("Reindex Now") { model.reindex() }
         }
         .padding(20)
+    }
+
+    @ViewBuilder
+    private func pathList(_ paths: [String], remove: @escaping (String) -> Void) -> some View {
+        if paths.isEmpty {
+            Text("None").font(.caption).foregroundStyle(.tertiary)
+        } else {
+            ForEach(paths, id: \.self) { p in
+                HStack {
+                    Text(p).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        remove(p)
+                    } label: { Image(systemName: "minus.circle") }
+                    .buttonStyle(.plain)
+                    .help("Remove")
+                }
+            }
+        }
+    }
+
+    private func pickFolder(_ done: @escaping (String) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if panel.runModal() == .OK, let url = panel.url { done(url.path) }
     }
 }

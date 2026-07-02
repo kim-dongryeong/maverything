@@ -202,6 +202,45 @@ public final class SearchEngine: @unchecked Sendable {
         return ul >= needleLen && memmem(unicodeBase + uo, ul, needle, needleLen) != nil
     }
 
+    // MARK: - duplicate-name bitmap (Everything's dupe:)
+
+    private var dupeCache: [Bool] = []
+    private var dupeGen = -1
+    private let dupeLock = NSLock()
+
+    /// Bitmap of entries whose FOLDED name occurs more than once among live entries
+    /// (hash-based; a 64-bit FNV collision could rarely over-mark — acceptable for a
+    /// discovery filter). Built once per index mutation, cached. Called under rdlock.
+    private func dupeBitmap() -> [Bool] {
+        let gen = index.mutationGenLocked
+        dupeLock.lock()
+        if dupeGen == gen { let c = dupeCache; dupeLock.unlock(); return c }
+        dupeLock.unlock()
+
+        let n = index.count
+        var counts = [UInt64: Int32](minimumCapacity: n)
+        var bitmap = [Bool](repeating: false, count: n)
+        index.foldBlob.withUnsafeBufferPointer { fb in
+        index.nameOff.withUnsafeBufferPointer { offB in
+        index.nameLen.withUnsafeBufferPointer { lenB in
+        index.deleted.withUnsafeBufferPointer { delB in
+            let base = fb.baseAddress!
+            @inline(__always) func nameHash(_ i: Int) -> UInt64 {
+                var h: UInt64 = 0xcbf2_9ce4_8422_2325           // FNV-1a
+                let o = Int(offB[i]); let l = Int(lenB[i])
+                for j in 0..<l { h = (h ^ UInt64(base[o + j])) &* 0x1_0000_0000_01b3 }
+                return h
+            }
+            for i in 0..<n where !delB[i] { counts[nameHash(i), default: 0] &+= 1 }
+            for i in 0..<n where !delB[i] { if counts[nameHash(i)] ?? 0 > 1 { bitmap[i] = true } }
+        }}}}
+
+        dupeLock.lock()
+        dupeGen = gen; dupeCache = bitmap
+        dupeLock.unlock()
+        return bitmap
+    }
+
     /// One term against one haystack, honoring Everything's Match Whole Word (`ww:`)
     /// for exact mode (other modes define their own shape, so ww: applies to exact).
     @inline(__always)
@@ -428,6 +467,8 @@ public final class SearchEngine: @unchecked Sendable {
         let df = parsed.dateFrom, dt = parsed.dateTo
         let onlyDirs = parsed.onlyDirs, onlyFiles = parsed.onlyFiles
         let wholeWord = parsed.wholeWord
+        let dupeB: [Bool] = parsed.dupesOnly ? dupeBitmap() : []
+        let dupesOnly = parsed.dupesOnly
 
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
@@ -481,6 +522,8 @@ public final class SearchEngine: @unchecked Sendable {
                         // type filters (folder: / file:)
                         if onlyDirs && otB[id] != VNODE_VDIR { continue }
                         if onlyFiles && otB[id] == VNODE_VDIR { continue }
+                        // duplicate-name filter (dupe:)
+                        if dupesOnly && (id >= dupeB.count || !dupeB[id]) { continue }
                         let o = Int(offB[id]); let l = Int(lenB[id])
                         // include filters (cheap) first
                         if hasExts && !self.extMatches(fbBase, o, l, parsed.exts) { continue }

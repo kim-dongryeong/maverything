@@ -100,6 +100,7 @@ struct SyntaxHelpView: View {
         ("name:data",        "match the name even in path mode"),
         ("case:on",          "make the whole query case-sensitive"),
         ("ww:",              "match whole words only (report ≠ reporting)"),
+        ("dupe:",            "only names that exist more than once (duplicate finder)"),
     ]
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {

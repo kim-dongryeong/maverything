@@ -9,16 +9,26 @@ cd "$(dirname "$0")"
 
 CONFIG="${CONFIG:-release}"
 APP="Maverything.app"
+# Architecture: "universal" (default — ONE app runs natively on Apple Silicon AND
+# Intel Macs; no separate Intel build needed) or "native" for faster dev iteration:
+#   MV_ARCH=native ./build.sh
+ARCH="${MV_ARCH:-universal}"
 # Default to the stable dev cert if it exists (so TCC grants persist), else ad-hoc.
 DEFAULT_ID="-"
 [ -f "$HOME/Library/Keychains/maverything-signing.keychain-db" ] && DEFAULT_ID="Maverything Dev Cert"
 SIGN_ID="${MAVERYTHING_SIGN_ID:-$DEFAULT_ID}"
 
-echo "▸ swift build -c $CONFIG"
-swift build -c "$CONFIG"
-
-BIN=".build/$CONFIG/Maverything"
+if [ "$ARCH" = "universal" ]; then
+    echo "▸ swift build -c $CONFIG (universal: arm64 + x86_64)"
+    swift build -c "$CONFIG" --arch arm64 --arch x86_64
+    BIN=".build/apple/Products/$(tr '[:lower:]' '[:upper:]' <<< "${CONFIG:0:1}")${CONFIG:1}/Maverything"
+else
+    echo "▸ swift build -c $CONFIG (native)"
+    swift build -c "$CONFIG"
+    BIN=".build/$CONFIG/Maverything"
+fi
 [ -x "$BIN" ] || { echo "binary not found at $BIN"; exit 1; }
+echo "▸ slices: $(lipo -archs "$BIN" 2>/dev/null || echo native)"
 
 echo "▸ assembling $APP"
 rm -rf "$APP"

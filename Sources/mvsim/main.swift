@@ -38,6 +38,8 @@ func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
 let oldTime = now - 200 * 86_400   // ~200 days ago
 write("report.txt", bytes: 200, mtime: now)
 write("reporting_x.txt", bytes: 4)                     // whole-word (ww:) negative case
+write("dupA/twin_name.txt", bytes: 6)                 // dupe: fixture (same name, two dirs)
+write("dupB/twin_name.txt", bytes: 7)
 write("Report.PNG", bytes: 300, mtime: oldTime)        // case-insensitivity
 write("notes.md", bytes: 50)
 write("README.md", bytes: 80)
@@ -198,6 +200,14 @@ check("type: '-file:report' excludes report.txt but keeps data.json",
 check("wholeword: 'ww: report' matches report.txt", has("ww: report", "report.txt"))
 check("wholeword: 'ww: report' excludes reporting_x.txt", !has("ww: report", "reporting_x.txt"))
 check("wholeword: plain 'report' still matches reporting_x.txt", has("report", "reporting_x.txt"))
+
+// Everything's duplicate finder (dupe:)
+check("dupe: finds twin_name.txt (exists twice)", has("dupe: twin", "twin_name.txt"))
+check("dupe: excludes unique report.txt", !has("dupe: report", "report.txt"))
+check("dupe: bare filter returns only duplicated names",
+      engine.search("dupe:", limit: 100_000, now: now).ids
+          .allSatisfy { index.name(Int($0)) == "twin_name.txt" }
+      && engine.search("dupe:", limit: 100_000, now: now).total >= 2)
 
 // incremental "narrow as you type": extending a query must equal a from-scratch full scan
 _ = engine.search("re", limit: 100_000, now: now)                      // caches full set for "re"

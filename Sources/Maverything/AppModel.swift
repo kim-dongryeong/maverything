@@ -100,6 +100,15 @@ final class AppModel: ObservableObject {
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
     @Published var includeCloud = false        // index ~/Library/CloudStorage etc.
+    /// Everything's "folder indexing": user-added index roots for locations the local-
+    /// volume scan doesn't cover — above all NETWORK shares/NAS mounts (non-MNT_LOCAL).
+    @Published var customRoots: [String] = UserDefaults.standard.stringArray(forKey: "mv.customRoots") ?? [] {
+        didSet { UserDefaults.standard.set(customRoots, forKey: "mv.customRoots") }
+    }
+    /// User-added exclude folders (on top of the built-in exclusions).
+    @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
+        didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
+    }
     @Published var showHidden = true            // Everything-style: show everything
     @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
         didSet { UserDefaults.standard.set(enterRenames, forKey: "mv.enterRenames") }
@@ -205,8 +214,41 @@ final class AppModel: ObservableObject {
     /// opts in; the autofs home map is always skipped.
     private func currentExclusions() -> [String] {
         // always skip our own snapshot dir + autofs; cloud only when not opted in
-        if includeCloud { return Volumes.alwaysExclusions() }
-        return Volumes.defaultExclusions()
+        let base = includeCloud ? Volumes.alwaysExclusions() : Volumes.defaultExclusions()
+        return base + customExcludes.map {
+            ($0 as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
+        }
+    }
+
+    /// Every root we WANT indexed: the local volumes plus user-added folders that the
+    /// volume scan doesn't reach (network shares/NAS are not MNT_LOCAL, so they only
+    /// get in this way). Custom roots already covered by an indexed volume are skipped
+    /// (they'd double-index); vanished ones (unreachable share) drop out, which routes
+    /// their cleanup through the same volume-sync tombstone path as an unplug.
+    func desiredCrawlRoots() -> [CrawlRoot] {
+        var roots = Volumes.localCrawlRoots()
+        var seen = Set(roots.map(\.displayPath))
+        let excl = currentExclusions()
+        let mounts = Volumes.allMountPoints()
+        // The volume that actually CONTAINS p (crawls never descend into other mounts,
+        // so "under /" alone does not mean covered — a NAS at /Volumes/NAS is not).
+        func enclosingMount(_ p: String) -> String {
+            var best = "/"
+            for m in mounts where m != "/" && (p == m || p.hasPrefix(m + "/")) {
+                if m.count > best.count { best = m }
+            }
+            return best
+        }
+        for raw in customRoots {
+            let p = (raw as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
+            guard !seen.contains(p), FileManager.default.fileExists(atPath: p) else { continue }
+            let coveredByLocal = seen.contains(enclosingMount(p))
+            let underExclusion = excl.contains { p == $0 || p.hasPrefix($0 + "/") }
+            if coveredByLocal && !underExclusion { continue }   // already indexed via its volume
+            roots.append(CrawlRoot(fsPath: p, displayPath: p))
+            seen.insert(p)
+        }
+        return roots
     }
 
     func start() {
@@ -242,7 +284,7 @@ final class AppModel: ObservableObject {
                 self.engine.invalidate()
                 self.prewarmAndSearch()
                 Diag.log("LOADED snapshot \(self.index.count) items, resume@\(meta.lastEventId)")
-                let roots = Volumes.localCrawlRoots()
+                let roots = self.desiredCrawlRoots()
                 // Roots that were in the snapshot but are NO LONGER mounted would otherwise
                 // survive forever (the sync only diffs against currently-watched roots).
                 let mountedNow = Set(roots.map(\.displayPath))
@@ -294,7 +336,7 @@ final class AppModel: ObservableObject {
         queryNonce &+= 1
         statusText = "Indexing all local volumes…"
 
-        let roots = Volumes.localCrawlRoots()
+        let roots = self.desiredCrawlRoots()
         let exclude = currentExclusions()
         Diag.log("crawl[\(gen)] roots: \(roots.map { "\($0.fsPath)→\($0.displayPath)" }.joined(separator: ", "))  FDA=\(hasFullDiskAccess) cloud=\(includeCloud)")
 
@@ -377,7 +419,7 @@ final class AppModel: ObservableObject {
                 // reindex. Only when every watched root is still mounted (a true root rename/
                 // replace on a live volume) do we fall back to the full re-crawl.
                 DispatchQueue.main.async {
-                    let mounted = Set(Volumes.localCrawlRoots().map(\.displayPath))
+                    let mounted = Set(self.desiredCrawlRoots().map(\.displayPath))
                     let unplugged = self.watchedRoots.contains { !mounted.contains($0.displayPath) }
                     if unplugged {
                         self.refreshMountedVolumes(reason: "rootChanged (volume unplugged)")
@@ -427,7 +469,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let desiredRoots = Volumes.localCrawlRoots()
+        let desiredRoots = self.desiredCrawlRoots()
         let currentByPath = rootsByDisplayPath(watchedRoots)
         let desiredByPath = rootsByDisplayPath(desiredRoots)
         let removals = watchedRoots.filter { desiredByPath[$0.displayPath] == nil }
@@ -482,14 +524,14 @@ final class AppModel: ObservableObject {
 
             var finalRoots = expectedRoots
             if dynamicEnumerator?.isCancelled != true {
-                let stillMounted = Set(Volumes.localCrawlRoots().map { $0.displayPath })
+                let stillMounted = Set(self.desiredCrawlRoots().map { $0.displayPath })
                 for r in finalRoots where !stillMounted.contains(r.displayPath) {
                     removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
                 }
                 finalRoots.removeAll { !stillMounted.contains($0.displayPath) }
             }
             let finalRootKeys = Set(finalRoots.map { $0.displayPath })
-            let desiredKeysAfterWork = Set(Volumes.localCrawlRoots().map { $0.displayPath })
+            let desiredKeysAfterWork = Set(self.desiredCrawlRoots().map { $0.displayPath })
             let needsAnotherPass = finalRootKeys != desiredKeysAfterWork
             let cancelled = dynamicEnumerator?.isCancelled == true
 
@@ -616,6 +658,48 @@ final class AppModel: ObservableObject {
         guard on != includeCloud else { return }
         includeCloud = on
         beginIndexing()
+    }
+
+    // MARK: - user-managed index folders & exclusions (Everything's folder indexing / excludes)
+
+    func addCustomRoot(_ rawPath: String) {
+        let p = (rawPath as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
+        guard !customRoots.contains(p) else { return }
+        customRoots.append(p)
+        // The volume sync diffs desired vs watched roots → append-crawls just the new
+        // root (no full reindex) and restarts the watcher to cover it.
+        refreshMountedVolumes(reason: "custom root added: \(p)")
+    }
+
+    func removeCustomRoot(_ rawPath: String) {
+        customRoots.removeAll { $0 == rawPath }
+        refreshMountedVolumes(reason: "custom root removed: \(rawPath)")   // sync tombstones it
+    }
+
+    func addCustomExclude(_ rawPath: String) {
+        let p = (rawPath as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
+        guard !customExcludes.contains(p) else { return }
+        customExcludes.append(p)
+        // No full reindex needed for ADDING an exclusion: tombstone the subtree and
+        // restart the watcher so the reconciler's exclude list includes it.
+        let excludes = currentExclusions()
+        indexQueue.async { [weak self] in
+            guard let self else { return }
+            let n = self.index.markDeletedSubtree(displayPath: p)
+            DispatchQueue.main.async {
+                self.indexedCount = self.index.safeCount()
+                self.startWatching(roots: self.watchedRoots, exclude: excludes,
+                                   sinceWhen: self.watcher.appliedEventId)
+                self.scheduleLiveRefresh()
+                self.saveSnapshot()
+                Diag.log("exclude added: \(p) (-\(n) rows)")
+            }
+        }
+    }
+
+    func removeCustomExclude(_ rawPath: String) {
+        customExcludes.removeAll { $0 == rawPath }
+        beginIndexing()   // re-including a subtree needs a crawl; full reindex is the simple correct path
     }
 
     func toggleScope() { scope = (scope == .nameOnly) ? .fullPath : .nameOnly }

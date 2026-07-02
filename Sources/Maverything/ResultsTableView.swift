@@ -461,19 +461,34 @@ struct ResultsTableView: NSViewRepresentable {
 
         private var pendingBytesWork: DispatchWorkItem?
         private var selectionToken = 0
+        private var selectionPublishPending = false
 
         func tableViewSelectionDidChange(_ notification: Notification) {
-            guard let tv = tableView else { return }
+            // AppKit calls this SYNCHRONOUSLY inside keyDown, on every arrow auto-repeat.
+            // Publishing the @Published mirrors (which drives a SwiftUI transaction) here
+            // would run on every keyDown and starve the native selection movement → the
+            // held-arrow "jumps". Coalesce to ONE publish per runloop tick so keyDown
+            // returns immediately and the native row-by-row movement stays smooth.
+            if selectionPublishPending { return }
+            selectionPublishPending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let tv = self.tableView else { return }
+                self.selectionPublishPending = false
+                self.publishSelection(tv)
+            }
+        }
+
+        /// Mirror the table's current selection into the model (coalesced — reads the
+        /// LATEST selection when it runs, so a burst of arrow repeats collapses to one).
+        private func publishSelection(_ tv: NSTableView) {
             let row = tv.selectedRow
             model.selectedID = (row >= 0 && row < ids.count) ? ids[row] : nil
             let rows = tv.selectedRowIndexes
             model.selectionCount = rows.count
-            // The byte total is only shown for multi-selection. Computing it takes the
-            // index lock (which the reconciler can hold), so NEVER do it on the main
-            // thread during arrow nav — single selection skips it entirely; multi-select
-            // sums off-thread, debounced, so held ⇧↓ doesn't stutter.
+            // Byte total (shown only for multi-selection) is summed off the main thread,
+            // token-guarded so a slower older sum can't overwrite a newer selection.
             pendingBytesWork?.cancel()
-            selectionToken &+= 1               // stamp this selection; drop late/out-of-order results
+            selectionToken &+= 1
             let token = selectionToken
             if rows.count > 1 {
                 let idSnapshot = rows.compactMap { $0 < ids.count ? ids[$0] : nil }
@@ -481,7 +496,7 @@ struct ResultsTableView: NSViewRepresentable {
                 let work = DispatchWorkItem { [weak self] in
                     let bytes = index.totalSize(of: idSnapshot)
                     DispatchQueue.main.async {
-                        guard let self, self.selectionToken == token else { return }  // a newer selection won
+                        guard let self, self.selectionToken == token else { return }
                         self.model.selectionBytes = bytes
                     }
                 }
@@ -490,7 +505,6 @@ struct ResultsTableView: NSViewRepresentable {
             } else {
                 model.selectionBytes = 0
             }
-            // keep an open Quick Look in sync as the selection moves (Finder-style)
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()
             }

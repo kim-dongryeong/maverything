@@ -11,7 +11,9 @@ final class MVTableView: NSTableView {
     weak var coordinator: ResultsTableView.Coordinator?
 
     override func keyDown(with event: NSEvent) {
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Only the real chord modifiers — NOT capsLock/function/numericPad, which are in
+        // deviceIndependentFlagsMask and would break the exact `== [.command]` checks below.
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         // remember active list navigation so live refreshes don't reload under a held key
         switch event.keyCode {
         case 125, 126, 116, 121, 115, 119:   // ↓ ↑ pgDn pgUp home end
@@ -219,7 +221,15 @@ struct ResultsTableView: NSViewRepresentable {
                 for (i, id) in coord.renderedIDs.enumerated() {
                     if keep.contains(id) { rows.insert(i); if rows.count == keep.count { break } }
                 }
-                if !rows.isEmpty { tv?.selectRowIndexes(rows, byExtendingSelection: false) }
+                if rows.isEmpty {
+                    // every previously-selected row vanished — reloadData would otherwise
+                    // keep the OLD indices highlighted (now pointing at different files),
+                    // and no selectionDidChange fires to refresh the model. Clear both.
+                    tv?.deselectAll(nil)
+                    model.selectedID = nil; model.selectionCount = 0; model.selectionBytes = 0
+                } else {
+                    tv?.selectRowIndexes(rows, byExtendingSelection: false)
+                }
             }
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()
@@ -413,6 +423,7 @@ struct ResultsTableView: NSViewRepresentable {
         }
 
         private var pendingBytesWork: DispatchWorkItem?
+        private var selectionToken = 0
 
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard let tv = tableView else { return }
@@ -425,12 +436,17 @@ struct ResultsTableView: NSViewRepresentable {
             // thread during arrow nav — single selection skips it entirely; multi-select
             // sums off-thread, debounced, so held ⇧↓ doesn't stutter.
             pendingBytesWork?.cancel()
+            selectionToken &+= 1               // stamp this selection; drop late/out-of-order results
+            let token = selectionToken
             if rows.count > 1 {
                 let idSnapshot = rows.compactMap { $0 < ids.count ? ids[$0] : nil }
                 let index = model.index
                 let work = DispatchWorkItem { [weak self] in
                     let bytes = index.totalSize(of: idSnapshot)
-                    DispatchQueue.main.async { self?.model.selectionBytes = bytes }
+                    DispatchQueue.main.async {
+                        guard let self, self.selectionToken == token else { return }  // a newer selection won
+                        self.model.selectionBytes = bytes
+                    }
                 }
                 pendingBytesWork = work
                 DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.1, execute: work)

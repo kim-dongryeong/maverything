@@ -48,8 +48,10 @@ struct FilterBar: View {
     private func chip(_ f: TypeFilter) -> some View {
         let active = model.typeFilter == f
         return Button {
-            // click the active chip (other than All) to clear back to All
-            model.typeFilter = (active && f != .all) ? .all : f
+            // click the active chip (other than All) to clear back to All; assigning the
+            // SAME value would still fire the (dedupe-less) pipeline and reset scroll/selection.
+            let target: TypeFilter = (active && f != .all) ? .all : f
+            if target != model.typeFilter { model.typeFilter = target }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: f.symbol).font(.system(size: 11))

@@ -132,6 +132,12 @@ check("folder: excludes a plain file", !has("folder:", "report.txt"))
 check("file: matches report.txt", has("file:report", "report.txt"))
 check("file: excludes the 'data' directory", !has("file:", "data"))
 check("-folder: (files only) excludes the 'data' directory", !has("-folder:", "data"))
+// review#2: negated type filter with a value must not be always-empty or a positive term
+let folderExclData = Set(engine.search("folder: -folder:data", limit: 10_000, now: now).ids.map { index.name(Int($0)) })
+check("type: 'folder: -folder:data' → dirs excluding 'data' (not empty, keeps 'src')",
+      !folderExclData.isEmpty && !folderExclData.contains("data") && folderExclData.contains("src"))
+check("type: '-file:report' excludes report.txt but keeps data.json",
+      !has("-file:report", "report.txt") && has("-file:report", "data.json"))
 
 // folder scope ("Search in This Folder") — restrict to a subtree via parent walk
 if let dataDir = index.dirIndex(forPath: root + "/data") {

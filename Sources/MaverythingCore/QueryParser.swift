@@ -106,24 +106,41 @@ public enum QueryParser {
             else { if let f = from { q.dateFrom = f }; if let t = to { q.dateTo = t } }
             return true
         case "folder", "folders", "dir":       // restrict to directories (Everything's folder:)
-            if negated { q.onlyFiles = true } else { q.onlyDirs = true }
-            appendNameTerm(val, into: &q)       // `folder:report` = folders whose name has "report"
+            applyTypeFilter(dir: true, val: val, negated: negated, into: &q)
             return true
         case "file", "files":                  // restrict to non-directories
-            if negated { q.onlyDirs = true } else { q.onlyFiles = true }
-            appendNameTerm(val, into: &q)
+            applyTypeFilter(dir: false, val: val, negated: negated, into: &q)
             return true
         default:
             return false
         }
     }
 
-    /// Append an optional name-scope term carried by a type filter (`folder:foo`).
-    private static func appendNameTerm(_ val: String, into q: inout ParsedQuery) {
+    /// `folder:`/`file:` handling. Without a value it's a pure type restriction (and
+    /// its negation flips to the other type). With a value the type restriction stays
+    /// positive and the value becomes a name term whose sign follows `negated` — so
+    /// `-folder:cache` means "directories, name NOT containing cache", never the
+    /// contradictory onlyDirs+onlyFiles (which would match nothing).
+    private static func applyTypeFilter(dir: Bool, val: String, negated: Bool, into q: inout ParsedQuery) {
+        if val.isEmpty {
+            if negated { if dir { q.onlyFiles = true } else { q.onlyDirs = true } }
+            else       { if dir { q.onlyDirs  = true } else { q.onlyFiles = true } }
+        } else if negated {
+            // `-folder:cache` = "not named cache" — don't impose a type restriction (its true
+            // negation isn't an AND-of-terms); the value just becomes an excluded name term.
+            appendNameTerm(val, negated: true, into: &q)
+        } else {
+            if dir { q.onlyDirs = true } else { q.onlyFiles = true }
+            appendNameTerm(val, negated: false, into: &q)
+        }
+    }
+
+    /// Append a name-scope term carried by a type filter (`folder:foo`, `-file:bar`).
+    private static func appendNameTerm(_ val: String, negated: Bool, into q: inout ParsedQuery) {
         let body = val.precomposedStringWithCanonicalMapping
         guard !body.isEmpty else { return }
         let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
-        q.terms.append(QueryTerm(bytes: bytes, negated: false, scope: .name))
+        q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: .name))
     }
 
     static func parseSize(_ v: String) -> (SizeOp, Int64)? {

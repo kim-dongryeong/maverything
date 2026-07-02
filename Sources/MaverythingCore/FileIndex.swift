@@ -175,14 +175,19 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     func _path(_ i: Int) -> String {
+        guard i >= 0, i < parent.count else { return "" }   // defensive: stale id → no crash
         var comps: [String] = []
         var cur = i
         var rootName = ""
+        var hops = 0
         while true {
+            guard cur >= 0, cur < parent.count else { break }   // broken/stale parent chain
             let p = parent[cur]
             if p < 0 { rootName = _name(cur); break }
             comps.append(_name(cur))
             cur = Int(p)
+            hops += 1
+            if hops > 4096 { break }                             // cycle guard
         }
         var result = (rootName == "/") ? "" : rootName
         for c in comps.reversed() { result += "/" + c }

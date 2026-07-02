@@ -102,11 +102,15 @@ struct OptionsButton: NSViewRepresentable {
             guard let repr = sender.representedObject as? String else { return }
             let parts = repr.split(separator: ":"); let cmd = String(parts[0])
             let i = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+            // Assign only on change — the search-trigger pipeline has no removeDuplicates,
+            // so re-selecting the current value would needlessly reset scroll/selection.
             switch cmd {
-            case "layout":  model.layout = UILayout.allCases[i]
-            case "mode":    model.matchMode = MatchMode.allCases[i]
-            case "sort":    model.sortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
-            case "scope":   model.scope = (i == 0) ? .nameOnly : .fullPath
+            case "layout":  if model.layout != UILayout.allCases[i] { model.layout = UILayout.allCases[i] }
+            case "mode":    if model.matchMode != MatchMode.allCases[i] { model.matchMode = MatchMode.allCases[i] }
+            case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
+                            if model.sortKey != k { model.sortKey = k }
+            case "scope":   let s: SearchScope = (i == 0) ? .nameOnly : .fullPath
+                            if model.scope != s { model.scope = s }
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
             case "asc":     model.ascending.toggle()

@@ -237,6 +237,16 @@ final class AppModel: ObservableObject {
         currentEnumerator?.cancel()     // abort any in-flight crawl fast
         isIndexing = true
         indexedCount = 0
+        // A reindex rebuilds the index from scratch, so every row id currently in the
+        // result set points at the OLD generation. Invalidate them now so nothing maps
+        // stale ids against the cleared/rebuilding arrays (Copy All Paths crash, wrong
+        // CSV rows), and bump queryNonce so the post-reindex search is treated as a NEW
+        // query — the table then drops the old (now-meaningless) selection instead of
+        // re-selecting by numeric id.
+        resultsStore.ids = []
+        resultShown = 0
+        resultTotal = 0
+        queryNonce &+= 1
         statusText = "Indexing all local volumes…"
 
         let roots = Volumes.localCrawlRoots()
@@ -502,18 +512,20 @@ final class AppModel: ObservableObject {
 
     /// All current result paths, newline-joined (for "Copy All Paths").
     func allResultPaths() -> String {
-        resultsStore.ids.map { index.path(Int($0)) }.joined(separator: "\n")
+        guard !isIndexing else { return "" }   // ids belong to the old generation during a reindex
+        return resultsStore.ids.map { index.path(Int($0)) }.joined(separator: "\n")
     }
 
     /// The current result set as CSV (Name, Path, Size, Date Modified, Date Created).
     func buildResultsCSV() -> String {
+        guard !isIndexing else { return "Name,Path,Size,Date Modified,Date Created\n" }
         let ids = resultsStore.ids
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
         func date(_ ns: Int64) -> String { ns == 0 ? "" : df.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9)) }
         func esc(_ s: String) -> String {
-            (s.contains(",") || s.contains("\"") || s.contains("\n"))
+            (s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r"))
                 ? "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" : s
         }
         var out = "Name,Path,Size,Date Modified,Date Created\n"
@@ -538,6 +550,17 @@ final class AppModel: ObservableObject {
         searchQueue.async { [weak self] in
             guard let self else { return }
             let rootIdx = root.flatMap { idx.dirIndex(forPath: $0) }
+            // A folder scope that can't be resolved (deleted/renamed folder, or the
+            // index mid-reindex) must NOT silently degrade into a whole-disk search —
+            // return nothing, since the scope chip still says "in <folder>".
+            if root != nil, rootIdx == nil {
+                DispatchQueue.main.async {
+                    guard seq == self.searchSeq else { return }
+                    self.resultsStore.ids = []; self.resultTotal = 0; self.resultShown = 0
+                    self.resultsVersion &+= 1
+                }
+                return
+            }
             let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc,
                                     now: now, scopeRoot: rootIdx)
             DispatchQueue.main.async {

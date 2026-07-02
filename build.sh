@@ -35,6 +35,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Maverything"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/" || true
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "▸ codesign (identity: $SIGN_ID)"

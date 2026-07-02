@@ -18,20 +18,25 @@ struct PreviewPane: View {
                         thumbnail
                         if let info {
                             Text(info.name).font(.headline).textSelection(.enabled)
-                            metaRow("Kind", info.kind)
-                            metaRow("Size", info.size)
-                            metaRow("Modified", info.modified)
-                            metaRow("Created", info.created)
+                            Grid(alignment: .leadingFirstTextBaseline,
+                                 horizontalSpacing: 10, verticalSpacing: 5) {
+                                metaRow("Kind", info.kind)
+                                metaRow("Size", info.size)
+                                metaRow("Modified", info.modified)
+                                metaRow("Created", info.created)
+                            }
                             Divider()
                             Text("Path").font(.caption).foregroundStyle(.secondary)
                             Text(info.path).font(.system(.caption, design: .monospaced))
                                 .textSelection(.enabled).foregroundStyle(.secondary)
-                            HStack {
+                            HStack(spacing: 8) {
                                 Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: info.path)) }
                                 Button("Reveal") {
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: info.path)])
                                 }
-                            }.padding(.top, 4)
+                            }
+                            .controlSize(.regular)
+                            .padding(.top, 4)
                         }
                         Spacer()
                     }
@@ -42,30 +47,39 @@ struct PreviewPane: View {
                 .onAppear { load(id) }
                 .onChange(of: model.selectedID) { if let s = model.selectedID { load(s) } }
             } else {
-                VStack { Image(systemName: "doc.text.magnifyingglass").font(.largeTitle)
-                    Text("Select a result").foregroundStyle(.secondary) }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 34, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("Select a result").font(.callout).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
     @ViewBuilder private var thumbnail: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor))
-            if let thumb { Image(nsImage: thumb).resizable().scaledToFit().padding(8) }
-            else if let info {
+            RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5))
+            if let thumb {
+                Image(nsImage: thumb).resizable().scaledToFit().padding(8)
+                    .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+            } else if let info {
                 Image(nsImage: IconCache.icon(for: info.path, isDir: info.kind == "Folder"))
                     .resizable().scaledToFit().frame(width: 64, height: 64)
+                    .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
             }
         }
         .frame(height: 180)
     }
 
     private func metaRow(_ k: String, _ v: String) -> some View {
-        HStack(alignment: .top) {
-            Text(k).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
+        GridRow {
+            Text(k).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
             Text(v).textSelection(.enabled)
-        }.font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.callout)
     }
 
     private func load(_ id: Int32) {

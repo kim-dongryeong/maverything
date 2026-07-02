@@ -37,12 +37,8 @@ struct CompactResults: View {
             }
         }
         .id(model.queryNonce)   // only rebuild identity on a NEW query, not on every live refresh
-        .overlay {
-            if ids.isEmpty {
-                Text(model.query.isEmpty ? "Type to search" : "No results")
-                    .foregroundStyle(.secondary)
-            }
-        }
+        // (empty / no-results / indexing states are drawn by ContentView's stateOverlay,
+        // shared across all three layouts — no local overlay here or they'd double up)
     }
 
     private func move(_ delta: Int, _ ids: [Int32], _ proxy: ScrollViewProxy) {

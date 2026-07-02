@@ -175,106 +175,115 @@ struct SettingsView: View {
             general.tabItem { Label("General", systemImage: "gearshape") }
             indexing.tabItem { Label("Indexing", systemImage: "externaldrive") }
         }
-        .frame(width: 460, height: 300)
+        .frame(width: 500, height: 480)
         .environmentObject(model)
     }
 
     private var general: some View {
         Form {
-            LabeledContent("Global hotkey") {
-                HStack {
-                    HotkeyRecorder(display: $hotkeyDisplay) { cfg in
-                        let previous = HotkeyConfig.current
-                        cfg.save()
-                        Diag.log("recorder captured \(cfg.display) (keyCode=\(cfg.keyCode) mods=\(cfg.carbonMods))")
-                        let ok = HotkeyController.shared.reregister()
-                        if !ok {                       // OS refused the combo → restore + tell the user
-                            previous.save()
-                            hotkeyDisplay = previous.display
-                            _ = HotkeyController.shared.reregister()   // put the working one back
-                            let a = NSAlert()
-                            a.messageText = "Couldn't set “\(cfg.display)”"
-                            a.informativeText = "That shortcut is reserved or already in use. Try another — combos with ⌘, ⌥, or ⌃ work best."
-                            a.runModal()
+            Section("Hotkey") {
+                LabeledContent("Global hotkey") {
+                    HStack {
+                        HotkeyRecorder(display: $hotkeyDisplay) { cfg in
+                            let previous = HotkeyConfig.current
+                            cfg.save()
+                            Diag.log("recorder captured \(cfg.display) (keyCode=\(cfg.keyCode) mods=\(cfg.carbonMods))")
+                            let ok = HotkeyController.shared.reregister()
+                            if !ok {                       // OS refused the combo → restore + tell the user
+                                previous.save()
+                                hotkeyDisplay = previous.display
+                                _ = HotkeyController.shared.reregister()   // put the working one back
+                                let a = NSAlert()
+                                a.messageText = "Couldn't set “\(cfg.display)”"
+                                a.informativeText = "That shortcut is reserved or already in use. Try another — combos with ⌘, ⌥, or ⌃ work best."
+                                a.runModal()
+                            }
+                        }
+                        .frame(width: 170, height: 26)
+                        Button("Reset") {
+                            HotkeyConfig.default.save()
+                            hotkeyDisplay = HotkeyConfig.default.display
+                            HotkeyController.shared.reregister()
                         }
                     }
-                    .frame(width: 170, height: 26)
-                    Button("Reset") {
-                        HotkeyConfig.default.save()
-                        hotkeyDisplay = HotkeyConfig.default.display
-                        HotkeyController.shared.reregister()
+                }
+                Text("Click the field, then press the key combination to summon Maverything from anywhere.")
+                    .font(.caption).foregroundStyle(.secondary)
+                LabeledContent("Any-combo hotkeys") {
+                    if Accessibility.isTrusted {
+                        Label("Enabled (Accessibility)", systemImage: "checkmark.seal")
+                            .foregroundStyle(.green)
+                    } else {
+                        Button("Enable…") {
+                            Accessibility.requestTrust()
+                            Accessibility.openSettings()
+                        }
                     }
                 }
+                Text("Enable to use shortcuts other apps also grab — like ⇧Space, ⌃Space (works like BetterTouchTool/Karabiner). Without it, prefer a ⌘/⌥/⌃ combo.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Text("Click the field, then press the key combination to summon Maverything from anywhere.")
-                .font(.caption).foregroundStyle(.secondary)
-            LabeledContent("Any-combo hotkeys") {
-                if Accessibility.isTrusted {
-                    Label("Enabled (Accessibility)", systemImage: "checkmark.seal")
-                        .foregroundStyle(.green)
-                } else {
-                    Button("Enable…") {
-                        Accessibility.requestTrust()
-                        Accessibility.openSettings()
-                    }
+            Section("Search & Appearance") {
+                Picker("Match mode", selection: $model.matchMode) {
+                    ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                Picker("Layout", selection: $model.layout) {
+                    ForEach(UILayout.allCases) { Text($0.label).tag($0) }
+                }
+                Picker("Appearance", selection: $model.appearance) {
+                    ForEach(Appearance.allCases) { Text($0.label).tag($0) }
+                }
+                Picker("Row density", selection: $model.density) {
+                    ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
                 }
             }
-            Text("Enable to use shortcuts other apps also grab — like ⇧Space, ⌃Space (works like BetterTouchTool/Karabiner). Without it, prefer a ⌘/⌥/⌃ combo.")
-                .font(.caption).foregroundStyle(.secondary)
-            Divider()
-            Picker("Match mode", selection: $model.matchMode) {
-                ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            Section("Keyboard") {
+                Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)
+                Toggle("Page Up/Down · Home/End move the selection", isOn: $model.navKeysMoveSelection)
+                Text("On (Everything-style): the cursor jumps by a page / to the first-last row. Off: macOS default — only the scroll moves.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("F2 always renames. Space = Quick Look · ⌘⌫ = Move to Trash · drag rows to Finder to copy/move.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Picker("Layout", selection: $model.layout) {
-                ForEach(UILayout.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Appearance", selection: $model.appearance) {
-                ForEach(Appearance.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Row density", selection: $model.density) {
-                ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
-            }
-            Divider()
-            Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)
-            Toggle("Page Up/Down · Home/End move the selection", isOn: $model.navKeysMoveSelection)
-            Text("On (Everything-style): the cursor jumps by a page / to the first-last row. Off: macOS default — only the scroll moves.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("F2 always renames. Space = Quick Look · ⌘⌫ = Move to Trash · drag rows to Finder to copy/move.")
-                .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(20)
+        .formStyle(.grouped)
     }
 
     private var indexing: some View {
         Form {
-            Toggle("Include cloud storage (Google Drive, iCloud…)", isOn: Binding(
-                get: { model.includeCloud }, set: { model.setIncludeCloud($0) }))
-            LabeledContent("Indexed items", value: model.indexedCount.formatted())
-            LabeledContent("Full Disk Access", value: model.hasFullDiskAccess ? "Granted ✓" : "Not granted")
-            if !model.hasFullDiskAccess {
-                Button("Grant Full Disk Access…") { model.showOnboarding = true }
+            Section("Index") {
+                Toggle("Include cloud storage (Google Drive, iCloud…)", isOn: Binding(
+                    get: { model.includeCloud }, set: { model.setIncludeCloud($0) }))
+                LabeledContent("Indexed items") {
+                    Text(model.indexedCount.formatted()).monospacedDigit()
+                }
+                LabeledContent("Full Disk Access", value: model.hasFullDiskAccess ? "Granted ✓" : "Not granted")
+                if !model.hasFullDiskAccess {
+                    Button("Grant Full Disk Access…") { model.showOnboarding = true }
+                }
             }
 
-            Divider()
             // Everything's "folder indexing" — for locations the local-volume scan
             // doesn't reach (above all network shares / NAS mounts).
-            Text("Extra index folders").font(.headline)
-            pathList(model.customRoots, remove: { model.removeCustomRoot($0) })
-            Button("Add Folder…") { pickFolder { model.addCustomRoot($0) } }
-            Text("Local volumes are indexed automatically — add network shares (NAS/SMB) or other locations the scan doesn't cover. Live updates on network volumes are best-effort; use Reindex to refresh.")
-                .font(.caption).foregroundStyle(.secondary)
+            Section("Extra index folders") {
+                pathList(model.customRoots, remove: { model.removeCustomRoot($0) })
+                Button("Add Folder…") { pickFolder { model.addCustomRoot($0) } }
+                Text("Local volumes are indexed automatically — add network shares (NAS/SMB) or other locations the scan doesn't cover. Live updates on network volumes are best-effort; use Reindex to refresh.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
-            Divider()
-            Text("Excluded folders").font(.headline)
-            pathList(model.customExcludes, remove: { model.removeCustomExclude($0) })
-            Button("Add Exclusion…") { pickFolder { model.addCustomExclude($0) } }
-            Text("Excluded folders are removed from the index immediately; removing an exclusion triggers a reindex.")
-                .font(.caption).foregroundStyle(.secondary)
+            Section("Excluded folders") {
+                pathList(model.customExcludes, remove: { model.removeCustomExclude($0) })
+                Button("Add Exclusion…") { pickFolder { model.addCustomExclude($0) } }
+                Text("Excluded folders are removed from the index immediately; removing an exclusion triggers a reindex.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
-            Divider()
-            Button("Reindex Now") { model.reindex() }
+            Section {
+                Button("Reindex Now") { model.reindex() }
+            }
         }
-        .padding(20)
+        .formStyle(.grouped)
     }
 
     @ViewBuilder

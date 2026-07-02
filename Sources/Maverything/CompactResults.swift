@@ -61,12 +61,13 @@ struct CompactResults: View {
         let id: Int32
         let selected: Bool
         var body: some View {
-            HStack(spacing: 8) {
-                Image(nsImage: IconCache.icon(for: model.path(id)))
+            let r = model.index.row(Int(id))
+            return HStack(spacing: 8) {
+                Image(nsImage: IconCache.icon(for: r.path, isDir: r.isDir))
                     .resizable().frame(width: 16, height: 16)
-                Text(model.name(id)).lineLimit(1)
+                Text(r.name).lineLimit(1)
                 Spacer(minLength: 12)
-                Text(model.directory(id))
+                Text(r.directory)
                     .foregroundStyle(.secondary).lineLimit(1)
                     .truncationMode(.middle).font(.caption)
             }
@@ -80,11 +81,13 @@ struct CompactResults: View {
 
 /// Tiny icon cache so list/preview rows don't re-fetch NSWorkspace icons.
 enum IconCache {
-    private static var cache: [String: NSImage] = [:]
+    private static var cache: [String: NSImage] = [:]   // keyed by extension / "dir" / "file"
     private static let lock = NSLock()
-    static func icon(for path: String) -> NSImage {
+    static func icon(for path: String, isDir: Bool) -> NSImage {
         let ext = (path as NSString).pathExtension.lowercased()
-        let key = ext.isEmpty ? path : ext   // by extension when available (cheap + shared)
+        // Bounded key set: folders + extensionless files share one icon each, so
+        // the cache can't grow per-path.
+        let key = isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext)
         lock.lock(); defer { lock.unlock() }
         if let c = cache[key] { return c }
         let img = NSWorkspace.shared.icon(forFile: path)

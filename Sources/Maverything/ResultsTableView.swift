@@ -247,36 +247,33 @@ struct ResultsTableView: NSViewRepresentable {
             let id = ids[row]
             let colID = tableColumn.identifier.rawValue
             let cell = makeCell(tableView, colID: colID)
+            let r = model.index.row(Int(id))   // one locked snapshot; never subscript arrays off-lock
+            func date(_ ns: Int64) -> String {
+                ns == 0 ? "--" : dateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
+            }
             switch colID {
             case "name":
-                if let attr = highlightedName(id) { cell.textField?.attributedStringValue = attr }
-                else { cell.textField?.stringValue = model.name(id) }
-                cell.imageView?.image = IconCache.icon(for: model.path(id))
+                if let attr = highlightedName(name: r.name) { cell.textField?.attributedStringValue = attr }
+                else { cell.textField?.stringValue = r.name }
+                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir)
             case "kind":
-                cell.textField?.stringValue = KindCache.kind(for: model.path(id),
-                                                              isDir: model.index.isDir(Int(id)))
+                cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir)
                 cell.textField?.textColor = .secondaryLabelColor
             case "ext":
-                cell.textField?.stringValue = (model.name(id) as NSString).pathExtension
+                cell.textField?.stringValue = r.ext
                 cell.textField?.textColor = .secondaryLabelColor
             case "created":
-                let ns = model.index.crtime[Int(id)]
-                cell.textField?.stringValue = ns == 0 ? "--"
-                    : dateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
+                cell.textField?.stringValue = date(r.crtime)
                 cell.textField?.textColor = .secondaryLabelColor
             case "path":
-                cell.textField?.stringValue = model.directory(id)
+                cell.textField?.stringValue = r.directory
                 cell.textField?.textColor = .secondaryLabelColor
             case "size":
-                let i = Int(id)
-                cell.textField?.stringValue = model.index.isDir(i)
-                    ? "--" : byteFormatter.string(fromByteCount: model.index.size[i])
+                cell.textField?.stringValue = r.isDir ? "--" : byteFormatter.string(fromByteCount: r.size)
                 cell.textField?.alignment = .right
                 cell.textField?.textColor = .secondaryLabelColor
             case "date":
-                let ns = model.index.mtime[Int(id)]
-                cell.textField?.stringValue = ns == 0 ? "--"
-                    : dateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
+                cell.textField?.stringValue = date(r.mtime)
                 cell.textField?.textColor = .secondaryLabelColor
             default:
                 cell.textField?.stringValue = ""
@@ -286,10 +283,9 @@ struct ResultsTableView: NSViewRepresentable {
 
         /// Highlight the matched part of the filename (exact substring or fuzzy
         /// subsequence). Returns nil to render plain text.
-        private func highlightedName(_ id: Int32) -> NSAttributedString? {
+        private func highlightedName(name: String) -> NSAttributedString? {
             let q = model.query.trimmingCharacters(in: .whitespaces)
             guard !q.isEmpty else { return nil }
-            let name = model.name(id)
             let attr = NSMutableAttributedString(string: name)
             let hl: [NSAttributedString.Key: Any] = [
                 .foregroundColor: NSColor.controlAccentColor,
@@ -371,11 +367,7 @@ struct ResultsTableView: NSViewRepresentable {
             // Finder-style selection summary
             let rows = tv.selectedRowIndexes
             model.selectionCount = rows.count
-            var bytes: Int64 = 0
-            for r in rows where r < ids.count {
-                let i = Int(ids[r]); if !model.index.isDir(i) { bytes += model.index.size[i] }
-            }
-            model.selectionBytes = bytes
+            model.selectionBytes = model.index.totalSize(of: rows.compactMap { $0 < ids.count ? ids[$0] : nil })
             // keep an open Quick Look in sync as the selection moves (Finder-style)
             if QLPreviewPanel.sharedPreviewPanelExists(), let p = QLPreviewPanel.shared(), p.isVisible {
                 p.reloadData()

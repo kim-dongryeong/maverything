@@ -53,9 +53,9 @@ struct PreviewPane: View {
         ZStack {
             RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor))
             if let thumb { Image(nsImage: thumb).resizable().scaledToFit().padding(8) }
-            else if let id = model.selectedID {
-                Image(nsImage: IconCache.icon(for: model.path(id))).resizable().scaledToFit()
-                    .frame(width: 64, height: 64)
+            else if let info {
+                Image(nsImage: IconCache.icon(for: info.path, isDir: info.kind == "Folder"))
+                    .resizable().scaledToFit().frame(width: 64, height: 64)
             }
         }
         .frame(height: 180)
@@ -69,8 +69,9 @@ struct PreviewPane: View {
     }
 
     private func load(_ id: Int32) {
-        let path = model.path(id)
-        info = FileInfo(path: path, index: model.index, id: Int(id))
+        let r = model.index.row(Int(id))
+        let path = r.path
+        info = FileInfo(r)
         thumb = nil
         let url = URL(fileURLWithPath: path)
         let scale = NSScreen.main?.backingScaleFactor ?? 2
@@ -87,16 +88,16 @@ struct PreviewPane: View {
 
 struct FileInfo {
     let name: String, path: String, kind: String, size: String, modified: String, created: String
-    init(path: String, index: FileIndex, id: Int) {
-        name = (path as NSString).lastPathComponent
-        self.path = path
-        let isDir = index.isDir(id)
-        size = isDir ? "Folder" : ByteCountFormatter.string(fromByteCount: index.size[id], countStyle: .file)
-        let ut = UTType(filenameExtension: (path as NSString).pathExtension)
-        kind = ut?.localizedDescription ?? (isDir ? "Folder" : "Document")
+    init(_ r: FileIndex.RowInfo) {
+        name = r.name
+        path = r.path
+        size = r.isDir ? "Folder" : ByteCountFormatter.string(fromByteCount: r.size, countStyle: .file)
+        kind = UTType(filenameExtension: r.ext)?.localizedDescription ?? (r.isDir ? "Folder" : "Document")
         let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
-        let mt = index.mtime[id]
-        modified = mt == 0 ? "—" : df.string(from: Date(timeIntervalSince1970: Double(mt) / 1e9))
-        created = "—"
+        func fmt(_ ns: Int64) -> String {
+            ns == 0 ? "—" : df.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
+        }
+        modified = fmt(r.mtime)
+        created = fmt(r.crtime)   // was hardcoded "—"
     }
 }

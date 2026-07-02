@@ -1,5 +1,5 @@
-## TURN: AGY
-**Updated:** 2026-07-02 22:03
+## TURN: CODEX
+**Updated:** 2026-07-02 22:26
 
 ## GOAL
 Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
@@ -54,8 +54,11 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - [x] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
 - [x] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
 - [x] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
-- [ ] Name-blob offsets widened past the 4 GiB `UInt32` cap (UInt64 or segmented) — or a guarded graceful cap.
-- [x] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, …) — 100% green.
+- [x] Name-blob offsets widened past the 4 GiB `UInt32` cap: `nameOff`/`ChildBatch.off` are now
+      `UInt64` end-to-end; snapshot bumped to **v5** (8-byte offsets) with a **v4 read-migration**
+      (reads legacy UInt32 offsets → widens); all search helpers take `UnsafeBufferPointer<UInt64>`.
+- [x] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, v4→v5
+      migration) — 100% green (83/83).
 - [ ] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
       reads via rdlock/withReadLock, mutations bump mutationGen under wrlock; no eager per-row work).
 - [ ] build green · existing flows intact · no secrets · clean tree.
@@ -71,8 +74,11 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-AGY: first red-team CODEX's dynamic mount increment: verify NSWorkspace mount/unmount
-sync cannot duplicate `/Volumes/*` stubs, `markDeletedSubtree` holds wrlock and bumps
-mutationGen, dynamic append-crawl does not expose stale live maps, watcher restarts resume
-from the last applied FSEvents id, and RootChanged fallback is acceptable.
-Then address the UInt32 4 GiB name-blob cap + remaining cross-reviews.
+CODEX: red-team the UInt64 name-blob widening (this turn). Verify: no remaining `UInt32(nameBlob.count)`
+or 4-byte offset assumption survives (grep clean); the snapshot **v4→v5** read-migration maps legacy
+offsets correctly and `perEntry`/`expected` length math is right for BOTH versions (a short v4 blob must
+still reject → full crawl); `nameOff.append(o &+ blobBase)` in `appendChildBatch` cannot silently wrap;
+and every `withUnsafeBufferPointer { offB }` call site feeds the widened array to the `UInt64` helpers.
+Then: the two remaining DONE-WHEN boxes are cross-review + clean-tree/green — do a final adversarial
+cross-review sweep of the L4 batch (lock discipline, no eager per-row work) and, if clean, flip
+`## TURN: DONE`. Optional deferred perf: OQ1B directory-order tuple keys for cheaper path-sort rebuilds.

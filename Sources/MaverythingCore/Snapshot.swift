@@ -6,7 +6,7 @@ import Foundation
 /// lets us replay changes that happened while the app was closed.
 public enum Snapshot {
     static let magic: UInt32 = 0x4D56_4931   // "MVI1"
-    static let version: UInt32 = 4           // v4 adds Unicode search-fold offsets/blob
+    static let version: UInt32 = 5           // v5 widens nameOff to UInt64
 
     public static func defaultURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -31,7 +31,7 @@ extension FileIndex {
         var live = 0
         for i in 0..<n where !deleted[i] { remap[i] = Int32(live); live += 1 }
 
-        var oNameOff = [UInt32](); oNameOff.reserveCapacity(live)
+        var oNameOff = [UInt64](); oNameOff.reserveCapacity(live)
         var oNameLen = [UInt16](); oNameLen.reserveCapacity(live)
         var oParent = [Int32](); oParent.reserveCapacity(live)
         var oSize = [Int64](); oSize.reserveCapacity(live)
@@ -48,7 +48,7 @@ extension FileIndex {
 
         for i in 0..<n where !deleted[i] {
             let o = Int(nameOff[i]); let l = Int(nameLen[i])
-            oNameOff.append(UInt32(oBlob.count)); oNameLen.append(UInt16(l))
+            oNameOff.append(UInt64(oBlob.count)); oNameLen.append(UInt16(l))
             oBlob.append(contentsOf: nameBlob[o..<o+l])
             oFold.append(contentsOf: foldBlob[o..<o+l])
             if unicodeFoldOff[i] == noUnicodeFoldOffset {
@@ -99,7 +99,7 @@ extension FileIndex {
             guard raw.count >= 48 else { return nil }
             let m: UInt32 = readScalar(raw, &off)
             let v: UInt32 = readScalar(raw, &off)
-            guard m == Snapshot.magic, v == Snapshot.version else { return nil }
+            guard m == Snapshot.magic, (v == 4 || v == 5) else { return nil }
             let lastEventId: UInt64 = readScalar(raw, &off)
             let savedBits: UInt64 = readScalar(raw, &off)
             let countU: UInt64 = readScalar(raw, &off)
@@ -110,7 +110,8 @@ extension FileIndex {
                   blobLenU <= 8_000_000_000,
                   unicodeBlobLenU <= 8_000_000_000 else { return nil }
             let count = Int(countU), blobLen = Int(blobLenU), unicodeBlobLen = Int(unicodeBlobLenU)
-            let perEntry = 4 + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 1   // arrays below, bytes/entry
+            let nameOffSize = (v == 4) ? 4 : 8
+            let perEntry = nameOffSize + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 1   // arrays below, bytes/entry
             let expected = 48 + blobLen * 2 + unicodeBlobLen + count * perEntry
             guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
@@ -119,7 +120,12 @@ extension FileIndex {
             nameBlob = readArray(raw, &off, blobLen, UInt8.self)
             foldBlob = readArray(raw, &off, blobLen, UInt8.self)
             unicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
-            nameOff = readArray(raw, &off, count, UInt32.self)
+            if v == 4 {
+                let tempOff = readArray(raw, &off, count, UInt32.self)
+                nameOff = tempOff.map { UInt64($0) }
+            } else {
+                nameOff = readArray(raw, &off, count, UInt64.self)
+            }
             nameLen = readArray(raw, &off, count, UInt16.self)
             unicodeFoldOff = readArray(raw, &off, count, UInt64.self)
             unicodeFoldLen = readArray(raw, &off, count, UInt32.self)

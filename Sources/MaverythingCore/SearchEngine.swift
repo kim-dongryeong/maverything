@@ -113,7 +113,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func foldedPathBytes(_ id: Int,
                                  blob: UnsafePointer<UInt8>,
-                                 offB: UnsafeBufferPointer<UInt32>,
+                                 offB: UnsafeBufferPointer<UInt64>,
                                  lenB: UnsafeBufferPointer<UInt16>,
                                  parB: UnsafeBufferPointer<Int32>,
                                  stack: UnsafeMutableBufferPointer<Int32>,
@@ -148,7 +148,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func searchFoldedPathBytes(_ id: Int,
                                        asciiBlob: UnsafePointer<UInt8>,
-                                       offB: UnsafeBufferPointer<UInt32>,
+                                       offB: UnsafeBufferPointer<UInt64>,
                                        lenB: UnsafeBufferPointer<UInt16>,
                                        unicodeBlob: UnsafePointer<UInt8>?,
                                        unicodeOffB: UnsafeBufferPointer<UInt64>,
@@ -188,7 +188,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func foldedNameContains(id: Int,
                                     asciiBase: UnsafePointer<UInt8>,
-                                    offB: UnsafeBufferPointer<UInt32>,
+                                    offB: UnsafeBufferPointer<UInt64>,
                                     lenB: UnsafeBufferPointer<UInt16>,
                                     unicodeBase: UnsafePointer<UInt8>?,
                                     unicodeOffB: UnsafeBufferPointer<UInt64>,
@@ -205,7 +205,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func matchFoldedName(id: Int,
                                  asciiBase: UnsafePointer<UInt8>,
-                                 offB: UnsafeBufferPointer<UInt32>,
+                                 offB: UnsafeBufferPointer<UInt64>,
                                  lenB: UnsafeBufferPointer<UInt16>,
                                  unicodeBase: UnsafePointer<UInt8>?,
                                  unicodeOffB: UnsafeBufferPointer<UInt64>,

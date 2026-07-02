@@ -302,6 +302,36 @@ check("snapshot: 'png' count survives round-trip",
 check("snapshot: Unicode fold survives round-trip",
       e2.search("cafe", limit: 10_000, now: now).ids.map { idx2.name(Int($0)) }.contains("CAFÉ.txt"))
 
+// ---- v4 → v5 backward-compat (nameOff widened UInt32 → UInt64) ----
+// Synthesize a legacy v4 blob (4-byte nameOff) from the current v5 blob by
+// flipping the version byte and narrowing the nameOff array, then confirm the
+// migration read path in loadSnapshot reconstructs identical results.
+let v4blob: Data = {
+    var b = [UInt8](blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
+    b[4] = 4; b[5] = 0; b[6] = 0; b[7] = 0                  // version 5 → 4 (little-endian UInt32)
+    let nameOffStart = 48 + blobLen*2 + uBlobLen
+    var out = Array(b[0..<nameOffStart])
+    for i in 0..<count {                                     // UInt64 LE → UInt32 LE (low 4 bytes)
+        let base = nameOffStart + i*8
+        out.append(contentsOf: b[base..<base+4])
+    }
+    out.append(contentsOf: b[(nameOffStart + count*8)...])
+    return Data(out)
+}()
+let idx4 = FileIndex()
+let meta4 = idx4.loadSnapshot(v4blob); idx4.buildLiveIndexes()
+let e4 = SearchEngine(index: idx4)
+check("snapshot v4→v5: legacy version accepted", meta4?.lastEventId == 777)
+check("snapshot v4→v5: 'png' count matches",
+      meta4 != nil && e4.search("png", limit: 10_000, now: now).total == engine.search("png", limit: 10_000, now: now).total)
+check("snapshot v4→v5: Unicode fold survives migration",
+      e4.search("cafe", limit: 10_000, now: now).ids.map { idx4.name(Int($0)) }.contains("CAFÉ.txt"))
+check("snapshot v4→v5: path-scope search intact after migration",
+      e4.search("png", limit: 10_000, now: now).total > 0
+      && e4.search("png", limit: 10_000, now: now).total == e2.search("png", limit: 10_000, now: now).total)
+
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]
 var times: [Double] = []

@@ -18,7 +18,7 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var nameBlob: [UInt8] = []   // original UTF-8 bytes
     public internal(set) var foldBlob: [UInt8] = []   // ASCII-lowercased shadow (same offsets)
     public internal(set) var unicodeFoldBlob: [UInt8] = []
-    public internal(set) var nameOff: [UInt32] = []
+    public internal(set) var nameOff: [UInt64] = []
     public internal(set) var nameLen: [UInt16] = []
     public internal(set) var unicodeFoldOff: [UInt64] = []
     public internal(set) var unicodeFoldLen: [UInt32] = []
@@ -132,7 +132,7 @@ public final class FileIndex: @unchecked Sendable {
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt32(nameBlob.count))
+        nameOff.append(UInt64(nameBlob.count))
         nameLen.append(UInt16(bytes.count))
         nameBlob.append(contentsOf: bytes)
         foldBlob.append(contentsOf: bytes.map(asciiLower))
@@ -153,7 +153,7 @@ public final class FileIndex: @unchecked Sendable {
         wrlock(); defer { unlock() }
         bumpMut()
         let base = Int32(nameOff.count)
-        let blobBase = UInt32(nameBlob.count)
+        let blobBase = UInt64(nameBlob.count)
         let unicodeBlobBase = UInt64(unicodeFoldBlob.count)
         nameBlob.append(contentsOf: batch.blob)
         foldBlob.append(contentsOf: batch.fold)
@@ -383,7 +383,7 @@ public final class FileIndex: @unchecked Sendable {
     private func _appendOne(parent p: Int32, name: [UInt8], size s: Int64, mtime mt: Int64,
                             crtime ct: Int64, objType t: UInt8, flags f: UInt32) -> Int32 {
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt32(nameBlob.count)); nameLen.append(UInt16(name.count))
+        nameOff.append(UInt64(nameBlob.count)); nameLen.append(UInt16(name.count))
         nameBlob.append(contentsOf: name)
         for b in name { foldBlob.append(asciiLower(b)) }
         appendUnicodeFoldStorage(for: name, blob: &unicodeFoldBlob,
@@ -509,7 +509,7 @@ struct ChildBatch {
     var blob: [UInt8] = []
     var fold: [UInt8] = []
     var unicodeFoldBlob: [UInt8] = []
-    var off: [UInt32] = []
+    var off: [UInt64] = []
     var len: [UInt16] = []
     var unicodeFoldOff: [UInt64] = []
     var unicodeFoldLen: [UInt32] = []
@@ -538,7 +538,7 @@ struct ChildBatch {
     private mutating func appendName(_ nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
                                      crtime ct: Int64, objType t: UInt8, flags f: UInt32) {
         let localIdx = Int32(len.count)
-        off.append(UInt32(blob.count))
+        off.append(UInt64(blob.count))
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
         for b in nameBytes { fold.append(asciiLower(b)) }

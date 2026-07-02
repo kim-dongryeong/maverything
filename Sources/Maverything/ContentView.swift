@@ -91,6 +91,14 @@ struct ContentView: View {
             .fixedSize()                              // size to its 4 segments; no overlap
             .help("Matching mode: Exact / Fuzzy / Wildcard / Regex")
 
+            // ⌃U scope — always-visible state (lit = matching the FULL PATH, not just names)
+            Toggle(isOn: Binding(get: { model.scope == .fullPath },
+                                 set: { model.scope = $0 ? .fullPath : .nameOnly })) {
+                Text("Path")
+            }
+            .toggleStyle(.button)
+            .help("Match against the full path instead of just the file name (⌃U)")
+
             OptionsButton(model: model)
                 .frame(width: 22, height: 22)
                 .help("Options")

@@ -283,17 +283,20 @@ public final class FileIndex: @unchecked Sendable {
         public let name, path, directory, ext: String
         public let size, mtime, crtime: Int64
         public let isDir: Bool
+        public let isLink: Bool
     }
     public func row(_ i: Int) -> RowInfo {
         rdlock(); defer { unlock() }
         guard i >= 0, i < nameOff.count else {
-            return RowInfo(name: "", path: "", directory: "", ext: "", size: 0, mtime: 0, crtime: 0, isDir: false)
+            return RowInfo(name: "", path: "", directory: "", ext: "", size: 0, mtime: 0, crtime: 0,
+                           isDir: false, isLink: false)
         }
         let nm = _name(i)
         let p = _path(i)
         let dir = parent[i] < 0 ? p : _path(Int(parent[i]))
         return RowInfo(name: nm, path: p, directory: dir, ext: (nm as NSString).pathExtension,
-                       size: size[i], mtime: mtime[i], crtime: crtime[i], isDir: objType[i] == VNODE_VDIR)
+                       size: size[i], mtime: mtime[i], crtime: crtime[i],
+                       isDir: objType[i] == VNODE_VDIR, isLink: objType[i] == VNODE_VLNK)
     }
 
     /// Locked sum of file sizes for the given entries (directories excluded).
@@ -477,7 +480,7 @@ public struct ReconcileResult: Sendable {
 // VNODE type constants (sys/vnode.h fsobj_type_t)
 public let VNODE_VREG: UInt8 = 1
 public let VNODE_VDIR: UInt8 = 2
-public let VNODE_VLNK: UInt8 = 5
+public let VNODE_VLNK: UInt8 = 5   // symbolic link (crawled with NOFOLLOW)
 
 let noUnicodeFoldOffset = UInt64.max
 private let searchFoldLocale = Locale(identifier: "en_US_POSIX")

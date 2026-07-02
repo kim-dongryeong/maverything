@@ -181,12 +181,15 @@ enum IconCache {
     private static var inflight: Set<String> = []
     private static let lock = NSLock()
 
-    static func icon(for path: String, isDir: Bool, onReady: (() -> Void)? = nil) -> NSImage {
+    static func icon(for path: String, isDir: Bool, isLink: Bool = false,
+                     onReady: (() -> Void)? = nil) -> NSImage {
         let ext = (path as NSString).pathExtension.lowercased()
         // A directory WITH an extension is a bundle/package (.app, .framework, .bundle…)
         // and carries its OWN icon — key it by path so it doesn't collapse onto the shared
-        // generic-folder icon. Plain folders + files share a bounded key set (per extension).
-        let isBundle = isDir && !ext.isEmpty
+        // generic-folder icon. Symlinks are also per-path: NSWorkspace returns the target's
+        // icon WITH the alias-arrow badge (matching Finder), which is unique per link.
+        // Plain folders + files share a bounded key set (per extension).
+        let isBundle = (isDir && !ext.isEmpty) || isLink
         let key = isBundle ? ("\u{1}pkg\u{1}" + path)
                            : (isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext))
         lock.lock()

@@ -56,13 +56,44 @@ final class MVTableView: NSTableView {
                 if !event.isARepeat { coordinator?.focusSearch() }
             } else {
                 super.keyDown(with: event)
+                if event.isARepeat { alignSelection(toBottom: false) }
             }
         case 125:           // down arrow — at the last row a held key would jump/over-scroll
             if selectedRow >= 0, selectedRow == numberOfRows - 1, event.isARepeat { return }
             super.keyDown(with: event)
+            if event.isARepeat { alignSelection(toBottom: true) }
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }
+    }
+
+    /// Snap-scroll (NO smooth animation) so the row lands EXACTLY flush with the
+    /// viewport edge. AppKit's keyboard nav uses an animated scroll that can't keep
+    /// up with fast auto-repeat — successive animations overlap, so the selection
+    /// drifts off the bottom edge and leaves flicker/ghosting during a held key.
+    override func scrollRowToVisible(_ row: Int) {
+        guard row >= 0, row < numberOfRows, let sv = enclosingScrollView else {
+            super.scrollRowToVisible(row); return
+        }
+        let clip = sv.contentView
+        let rowRect = rect(ofRow: row)
+        let visible = clip.documentVisibleRect
+        var y = visible.origin.y
+        if rowRect.minY < visible.minY { y = rowRect.minY }                       // pin to top edge
+        else if rowRect.maxY > visible.maxY { y = rowRect.maxY - visible.height } // pin to bottom edge
+        else { return }                                                            // already fully visible
+        y = max(0, min(y, max(0, bounds.height - visible.height)))
+        clip.setBoundsOrigin(NSPoint(x: visible.origin.x, y: y))                   // direct = no animation
+        sv.reflectScrolledClipView(clip)
+    }
+
+    /// After a repeat step, re-assert the exact edge alignment (an in-flight smooth
+    /// scroll from a previous step may have shifted the frame mid-animation).
+    private func alignSelection(toBottom: Bool) {
+        let row = selectedRow
+        guard row >= 0 else { return }
+        scrollRowToVisible(row)
+        _ = toBottom   // both edges handled inside scrollRowToVisible
     }
 
     override func keyUp(with event: NSEvent) {
@@ -91,7 +122,8 @@ final class MVTableView: NSTableView {
 enum KindCache {
     private static var cache: [String: String] = [:]
     private static let lock = NSLock()
-    static func kind(for path: String, isDir: Bool) -> String {
+    static func kind(for path: String, isDir: Bool, isLink: Bool = false) -> String {
+        if isLink { return "Alias" }
         if isDir { return "Folder" }
         let ext = (path as NSString).pathExtension.lowercased()
         if ext.isEmpty { return "Document" }
@@ -340,16 +372,11 @@ struct ResultsTableView: NSViewRepresentable {
             switch colID {
             case "name":
                 let hl = highlightedName(name: r.name)
-                // Tag dots + bundle icons resolve off-thread on cache miss (no getxattr /
-                // icon-services XPC on the main thread while arrow-hold scrolls new rows);
-                // when they land, just re-render this row's name cell from the cache.
-                let refreshName: () -> Void = { [weak tableView] in
-                    guard let tv = tableView else { return }
-                    let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
-                    if col >= 0, row < tv.numberOfRows {
-                        tv.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: col))
-                    }
-                }
+                // Tag dots + bundle/symlink icons resolve off-thread on cache miss (no
+                // getxattr / icon-services XPC on the main thread while arrow-hold scrolls
+                // new rows); when they land, the coordinator re-renders the row — deferred
+                // while a nav key is held so it can't flicker under the moving selection.
+                let refreshName: () -> Void = { [weak self] in self?.requestNameRefresh(row: row) }
                 let dots = TagCache.dots(forPath: r.path, onReady: refreshName)   // Finder color tags
                 if hl == nil, dots == nil {
                     cell.textField?.stringValue = r.name
@@ -358,9 +385,10 @@ struct ResultsTableView: NSViewRepresentable {
                     if let dots { base.append(dots) }
                     cell.textField?.attributedStringValue = base
                 }
-                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir, onReady: refreshName)
+                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir,
+                                                       isLink: r.isLink, onReady: refreshName)
             case "kind":
-                cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir)
+                cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir, isLink: r.isLink)
                 cell.textField?.textColor = .secondaryLabelColor
             case "ext":
                 cell.textField?.stringValue = r.ext
@@ -416,13 +444,21 @@ struct ResultsTableView: NSViewRepresentable {
             ]
             switch model.matchMode {
             case .exact:
-                if q.contains(" ") || q.contains("*") || q.contains("?") || q.contains(":") { return nil }
-                var range = name.startIndex..<name.endIndex
+                // Highlight EVERY plain term of a multi-term query (skip filters like ext:,
+                // negations, and glob chars) — previously any space/filter disabled it.
+                let terms = q.replacingOccurrences(of: "\"", with: "")
+                    .split(separator: " ").map(String.init)
+                    .filter { !$0.contains(":") && !$0.hasPrefix("-") && !$0.hasPrefix("!")
+                              && !$0.contains("*") && !$0.contains("?") && !$0.isEmpty }
+                guard !terms.isEmpty else { return nil }
                 var found = false
-                while let r = name.range(of: q, options: .caseInsensitive, range: range) {
-                    found = true
-                    attr.addAttributes(hl, range: NSRange(r, in: name))
-                    range = r.upperBound..<name.endIndex
+                for term in terms {
+                    var range = name.startIndex..<name.endIndex
+                    while let r = name.range(of: term, options: .caseInsensitive, range: range) {
+                        found = true
+                        attr.addAttributes(hl, range: NSRange(r, in: name))
+                        range = r.upperBound..<name.endIndex
+                    }
                 }
                 return found ? attr : nil
             case .fuzzy:
@@ -488,6 +524,7 @@ struct ResultsTableView: NSViewRepresentable {
         private var selectionPublishPending = false
         private var navRepeatActive = false
         private var navRepeatFallback: DispatchWorkItem?
+        private var deferredNameRefreshRows = IndexSet()
 
         /// A nav key is auto-repeating: stop mirroring selection into the model entirely
         /// (each publish is a SwiftUI transaction between native selection steps — the
@@ -505,7 +542,33 @@ struct ResultsTableView: NSViewRepresentable {
             navRepeatFallback?.cancel(); navRepeatFallback = nil
             guard navRepeatActive else { return }
             navRepeatActive = false
-            if let tv = tableView { publishSelection(tv) }
+            if let tv = tableView {
+                flushDeferredNameRefreshes(tv)
+                publishSelection(tv)
+            }
+        }
+
+        /// Async cell payloads (tag dots, bundle/symlink icons) request a row re-render
+        /// when they land. Mid-hold, those single-row reloads read as flicker under the
+        /// moving selection — so during a repeat run they're queued and flushed once the
+        /// key is released.
+        func requestNameRefresh(row: Int) {
+            if navRepeatActive { deferredNameRefreshRows.insert(row); return }
+            guard let tv = tableView else { return }
+            reloadNameColumn(tv, rows: IndexSet(integer: row))
+        }
+
+        private func flushDeferredNameRefreshes(_ tv: NSTableView) {
+            guard !deferredNameRefreshRows.isEmpty else { return }
+            let valid = IndexSet(deferredNameRefreshRows.filter { $0 < tv.numberOfRows })
+            deferredNameRefreshRows.removeAll()
+            reloadNameColumn(tv, rows: valid)
+        }
+
+        private func reloadNameColumn(_ tv: NSTableView, rows: IndexSet) {
+            guard !rows.isEmpty else { return }
+            let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+            if col >= 0 { tv.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: col)) }
         }
 
         func tableViewSelectionDidChange(_ notification: Notification) {

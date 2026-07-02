@@ -38,4 +38,11 @@ final class HotkeyController {
     }
 
     var usingEventTap: Bool { tapHotKey != nil }
+
+    /// Temporarily release the hotkey (e.g. while the Settings recorder is capturing,
+    /// so pressing the current combo records instead of triggering the app).
+    func suspend() {
+        hotKey = nil; tapHotKey = nil
+        Diag.log("HotkeyController.suspend")
+    }
 }

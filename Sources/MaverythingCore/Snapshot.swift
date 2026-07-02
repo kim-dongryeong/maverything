@@ -96,6 +96,7 @@ extension FileIndex {
             guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
             wrlock(); defer { unlock() }   // replaces all arrays
+            bumpMutationLocked()           // new generation → search caches rebuild
             nameBlob = readArray(raw, &off, blobLen, UInt8.self)
             foldBlob = readArray(raw, &off, blobLen, UInt8.self)
             nameOff = readArray(raw, &off, count, UInt32.self)

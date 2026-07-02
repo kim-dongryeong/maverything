@@ -49,6 +49,16 @@ public final class FileIndex: @unchecked Sendable {
     @inline(__always) func unlock() { pthread_rwlock_unlock(rwlock) }
     deinit { pthread_rwlock_destroy(rwlock); rwlock.deallocate() }
 
+    /// Bumped under the write lock on EVERY content mutation (append/delete/attr/clear/
+    /// load). SearchEngine keys its order/narrowing caches off this, so a mutation can
+    /// never leave a stale cache even if the engine's `invalidate()` is forgotten — the
+    /// caches self-heal on the next search. Read only while holding the lock.
+    private var _mutationGen = 0
+    var mutationGenLocked: Int { _mutationGen }                       // caller already holds the lock
+    @inline(__always) private func bumpMut() { _mutationGen &+= 1 }   // caller holds wrlock
+    func bumpMutationLocked() { _mutationGen &+= 1 }                  // internal: Snapshot.swift, caller holds wrlock
+    public func bumpMutation() { wrlock(); _mutationGen &+= 1; unlock() }   // external "refresh now"
+
     /// Bumped on every clear() so an in-flight reconcile from a previous crawl
     /// generation can detect it's stale and no-op instead of corrupting the fresh index.
     private var epochValue = 0
@@ -80,6 +90,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Empties the index (for a full re-crawl).
     public func clear() {
         wrlock(); defer { unlock() }
+        bumpMut()
         epochValue &+= 1   // invalidate any in-flight reconcile captured before this
         nameBlob.removeAll(keepingCapacity: false)
         foldBlob.removeAll(keepingCapacity: false)
@@ -107,6 +118,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Appends a crawl root (absolute path stored as the name). Returns its index.
     public func appendRoot(path: String) -> Int32 {
         wrlock(); defer { unlock() }
+        bumpMut()
         // NFC-normalize like every other stored name, so a non-ASCII volume root is
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
@@ -128,6 +140,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Live-update maps are built afterwards by `buildLiveIndexes()`.
     func appendChildren(parent parentIdx: Int32, displayParent: String, _ batch: ChildBatch) -> Int32 {
         wrlock(); defer { unlock() }
+        bumpMut()
         let base = Int32(nameOff.count)
         let blobBase = UInt32(nameBlob.count)
         nameBlob.append(contentsOf: batch.blob)
@@ -334,6 +347,7 @@ public final class FileIndex: @unchecked Sendable {
         }
         for (_, oi) in oldByName { _markDeletedSubtree(oi); res.removed += 1 }
         childrenOf[dirIdx] = newList
+        if res.added + res.removed + res.changed > 0 { bumpMut() }   // auto-invalidate search caches
         return res
     }
 

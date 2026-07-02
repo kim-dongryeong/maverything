@@ -213,6 +213,15 @@ let nfdDir = (root + "/한글폴더").decomposedStringWithCanonicalMapping   // 
 _ = rec.reconcile(eventPaths: [nfdDir]); engine.invalidate()
 check("nfc: NFD event path resolves the NFC-indexed Korean dir", has("한글파일", "한글파일.txt"))
 
+// codex: search caches key off FileIndex.mutationGen, so a mutation self-heals the cache
+// even WITHOUT an explicit engine.invalidate() (impossible-to-miss invalidation).
+write("selfheal_x.txt", bytes: 11)
+_ = rec.reconcile(eventPaths: [root])          // deliberately NO engine.invalidate()
+check("mutationGen: new file found w/o explicit invalidate()", has("selfheal_x", "selfheal_x.txt"))
+try? fm.removeItem(atPath: root + "/selfheal_x.txt")
+_ = rec.reconcile(eventPaths: [root])          // again NO invalidate()
+check("mutationGen: deleted file gone w/o explicit invalidate()", !has("selfheal_x", "selfheal_x.txt"))
+
 // ---- snapshot round-trip ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
 let idx2 = FileIndex()

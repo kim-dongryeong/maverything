@@ -20,8 +20,7 @@ public final class SearchEngine: @unchecked Sendable {
     private let workerCount: Int
 
     private var orderCache: [SortKey: [Int32]] = [:]
-    private var cacheGen: Int = -1
-    public internal(set) var generation: Int = 0
+    private var cacheGen: Int = -1     // the FileIndex.mutationGen the orderCache was built at
     private let cacheLock = NSLock()
 
     // Incremental "narrow as you type": remember the FULL match set of the last simple
@@ -41,8 +40,10 @@ public final class SearchEngine: @unchecked Sendable {
         self.workerCount = max(1, workers)
     }
 
-    public func invalidate() { cacheLock.lock(); generation &+= 1; cacheLock.unlock() }
-    private func currentGen() -> Int { cacheLock.lock(); defer { cacheLock.unlock() }; return generation }
+    // Caches now key off FileIndex.mutationGen (bumped under the index lock on every
+    // mutation), so any change auto-invalidates them. This remains as an explicit
+    // "refresh now" that simply advances that counter.
+    public func invalidate() { index.bumpMutation() }
 
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
@@ -145,7 +146,7 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func fastExact(needle: [UInt8], sortKey: SortKey, ascending: Bool,
                            limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
-        let gen = currentGen()
+        let gen = index.mutationGenLocked   // safe: called inside the index read lock
         // Incremental narrowing: if this needle extends the cached one (same order + index
         // generation), rescan ONLY the cached full match set — O(prev matches), not O(index).
         var base: [Int32]? = nil
@@ -476,13 +477,14 @@ public final class SearchEngine: @unchecked Sendable {
     // MARK: - sort order (argsort) with caching
 
     private func orderArray(for key: SortKey) -> [Int32] {
+        let gen = index.mutationGenLocked   // safe: called inside the index read lock
         cacheLock.lock()
-        if cacheGen != generation { orderCache.removeAll(); cacheGen = generation }
+        if cacheGen != gen { orderCache.removeAll(); cacheGen = gen }
         if let cached = orderCache[key] { cacheLock.unlock(); return cached }
         cacheLock.unlock()
         let order = computeOrder(key)
         cacheLock.lock()
-        if cacheGen == generation { orderCache[key] = order }
+        if cacheGen == gen { orderCache[key] = order }
         cacheLock.unlock()
         return order
     }

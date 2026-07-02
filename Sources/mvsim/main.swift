@@ -41,6 +41,10 @@ write("intl/한글파일.txt", bytes: 30)                   // unicode
 write("intl/café.md", bytes: 30)
 write("src/a/b/c/d/leaf.txt", bytes: 5)                // deep nesting
 write(".hidden/.secret.txt", bytes: 5)                 // hidden
+// path-column sort fixture (OQ1A): basename order and full-path order DISAGREE here —
+// by name apple<zebra, but by path adir/…<zdir/…, so the two files swap order.
+write("zdir/marker_apple.txt", bytes: 8)
+write("adir/marker_zebra.txt", bytes: 8)
 
 // ---- index ----
 let index = FileIndex()
@@ -115,6 +119,19 @@ check("unicode: '한글' finds 한글파일.txt", has("한글", "한글파일.tx
 let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now: now).ids.map { index.name(Int($0)) }
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
+
+// path-column sort (OQ1A): the "Path" header must sort by true folded full path,
+// NOT by basename. The fixture is built so the two orders provably disagree.
+let byName = names("marker", sort: .name)
+let byPath = names("marker", sort: .path)              // exact single-term → fastExact + orderArray(.path)
+check("path-sort: name order is [apple, zebra]",
+      byName == ["marker_apple.txt", "marker_zebra.txt"], byName.joined(separator: ","))
+check("path-sort: path order is [zebra, apple] (adir < zdir)",
+      byPath == ["marker_zebra.txt", "marker_apple.txt"], byPath.joined(separator: ","))
+check("path-sort: path order differs from name order", byName != byPath)
+let byPathGeneral = names("marker ext:txt", sort: .path)   // filter present → general evaluator path
+check("path-sort: general evaluator honors path order too",
+      byPathGeneral == ["marker_zebra.txt", "marker_apple.txt"], byPathGeneral.joined(separator: ","))
 
 // negated filters (review #2)
 check("NOT-filter: '-ext:png' excludes images", !has("image -ext:png", "image_001.png"))

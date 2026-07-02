@@ -490,6 +490,7 @@ public final class SearchEngine: @unchecked Sendable {
     }
 
     private func computeOrder(_ key: SortKey) -> [Int32] {
+        if key == .path { return computePathOrder() }   // true full-path order (folded), not basename
         let n = index.count
         let del = index.deleted
         var ids = [Int32](); ids.reserveCapacity(n)
@@ -504,7 +505,9 @@ public final class SearchEngine: @unchecked Sendable {
         case .dateCreated:
             let ct = index.crtime
             ids.sort { ct[Int($0)] != ct[Int($1)] ? ct[Int($0)] < ct[Int($1)] : $0 < $1 }
-        case .name, .path, .relevance:   // path/relevance use name order as the scan base
+        case .path:
+            break   // handled above by computePathOrder (unreachable; kept exhaustive)
+        case .name, .relevance:   // relevance uses name order as the scan base
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
@@ -534,6 +537,72 @@ public final class SearchEngine: @unchecked Sendable {
             }}}
         }
         return ids
+    }
+
+    /// True full-path sort order (OQ1A): reconstruct each LIVE entry's folded
+    /// absolute path ONCE into a packed blob, then argsort by those path bytes so
+    /// clicking the "Path" column sorts by directory/path — not by basename. Runs
+    /// under the index read lock (via `orderArray` → `computeOrder`), and the result
+    /// is cached in `orderCache[.path]` like every other order, so the O(n) path
+    /// reconstruction happens once per index generation, not per keystroke. The
+    /// transient path blob (~40 MB / 1M files) is freed when this returns; only the
+    /// `[Int32]` order is retained. Mirrors the fold used by `foldedPathBytes` and the
+    /// name sort so path order and name matching stay case-folded-consistent.
+    private func computePathOrder() -> [Int32] {
+        let n = index.count
+        if n == 0 { return [] }
+        return index.foldBlob.withUnsafeBufferPointer { fb -> [Int32] in
+        index.nameOff.withUnsafeBufferPointer { offB -> [Int32] in
+        index.nameLen.withUnsafeBufferPointer { lenB -> [Int32] in
+        index.parent.withUnsafeBufferPointer { parB -> [Int32] in
+        index.deleted.withUnsafeBufferPointer { delB -> [Int32] in
+            let base = fb.baseAddress!
+            var pathBlob = [UInt8](); pathBlob.reserveCapacity(n * 24)   // ~avg folded path length
+            var offs = [Int]();   offs.reserveCapacity(n)                // start of each path in pathBlob
+            var lens = [Int32](); lens.reserveCapacity(n)                // path byte length
+            var ids  = [Int32](); ids.reserveCapacity(n)                 // parallel entry ids (live only)
+            var scratch = [UInt8](repeating: 0, count: 8192)             // reused per-entry path buffer
+            var stack   = [Int32](repeating: 0, count: 4096)             // reused ancestor stack
+            scratch.withUnsafeMutableBufferPointer { sb in
+            stack.withUnsafeMutableBufferPointer { stk in
+                for i in 0..<n where !delB[i] {
+                    let w = foldedPathBytes(i, blob: base, offB: offB, lenB: lenB,
+                                            parB: parB, stack: stk, out: sb)
+                    offs.append(pathBlob.count)
+                    lens.append(Int32(w))
+                    ids.append(Int32(i))
+                    pathBlob.append(contentsOf: UnsafeBufferPointer(start: sb.baseAddress!, count: w))
+                }
+            }}
+            let m = ids.count
+            if m == 0 { return [] }
+            return pathBlob.withUnsafeBufferPointer { pb -> [Int32] in
+                let pbase = pb.baseAddress!
+                // First 8 path bytes packed into a UInt64 → most comparisons are one integer
+                // compare; memcmp fallback only on an 8-byte tie (same trick as the name sort).
+                @inline(__always) func key64(_ p: Int) -> UInt64 {
+                    let o = offs[p]; let l = min(Int(lens[p]), 8)
+                    var k: UInt64 = 0; var j = 0
+                    while j < l { k |= UInt64(pbase[o + j]) << (56 - 8 * j); j += 1 }
+                    return k
+                }
+                var pairs = (0..<m).map { (key64($0), Int32($0)) }   // (key, position-in-ids)
+                pairs.sort { a, b in
+                    if a.0 != b.0 { return a.0 < b.0 }
+                    let pa = Int(a.1), pbp = Int(b.1)
+                    let oa = offs[pa], la = Int(lens[pa])
+                    let ob = offs[pbp], lb = Int(lens[pbp])
+                    let mm = min(la, lb)
+                    let r = mm > 0 ? memcmp(pbase + oa, pbase + ob, mm) : 0
+                    if r != 0 { return r < 0 }
+                    if la != lb { return la < lb }
+                    return ids[pa] < ids[pbp]   // stable tiebreak by entry id
+                }
+                var result = [Int32](); result.reserveCapacity(m)
+                for pr in pairs { result.append(ids[Int(pr.1)]) }
+                return result
+            }
+        }}}}}
     }
 }
 

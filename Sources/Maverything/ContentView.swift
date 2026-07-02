@@ -9,6 +9,8 @@ struct ContentView: View {
         VStack(spacing: 0) {
             searchBar
             Divider()
+            FilterBar(model: model)
+            Divider()
             layoutBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()

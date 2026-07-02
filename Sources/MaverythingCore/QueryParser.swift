@@ -21,11 +21,14 @@ public struct ParsedQuery: Sendable {
     public var notExts: [[UInt8]] = []
     public var notSizes: [(SizeOp, Int64)] = []
     public var notDateRanges: [(Int64?, Int64?)] = []
+    public var onlyDirs = false                     // `folder:` — match directories only
+    public var onlyFiles = false                    // `file:`   — match non-directories only
     public var caseSensitive = false
 
     public var hasFilters: Bool {
         !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
             || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
+            || onlyDirs || onlyFiles
     }
     public var isEmpty: Bool { terms.isEmpty && !hasFilters }
 
@@ -102,9 +105,25 @@ public enum QueryParser {
             if negated { q.notDateRanges.append((from, to)) }
             else { if let f = from { q.dateFrom = f }; if let t = to { q.dateTo = t } }
             return true
+        case "folder", "folders", "dir":       // restrict to directories (Everything's folder:)
+            if negated { q.onlyFiles = true } else { q.onlyDirs = true }
+            appendNameTerm(val, into: &q)       // `folder:report` = folders whose name has "report"
+            return true
+        case "file", "files":                  // restrict to non-directories
+            if negated { q.onlyDirs = true } else { q.onlyFiles = true }
+            appendNameTerm(val, into: &q)
+            return true
         default:
             return false
         }
+    }
+
+    /// Append an optional name-scope term carried by a type filter (`folder:foo`).
+    private static func appendNameTerm(_ val: String, into q: inout ParsedQuery) {
+        let body = val.precomposedStringWithCanonicalMapping
+        guard !body.isEmpty else { return }
+        let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
+        q.terms.append(QueryTerm(bytes: bytes, negated: false, scope: .name))
     }
 
     static func parseSize(_ v: String) -> (SizeOp, Int64)? {

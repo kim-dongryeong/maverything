@@ -184,6 +184,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.size.withUnsafeBufferPointer { szB in
         index.mtime.withUnsafeBufferPointer { mtB in
         index.deleted.withUnsafeBufferPointer { delB in
+        index.objType.withUnsafeBufferPointer { otB in
         order.withUnsafeBufferPointer { ordB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
@@ -196,6 +197,9 @@ public final class SearchEngine: @unchecked Sendable {
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
+                        // type filters (folder: / file:)
+                        if parsed.onlyDirs && otB[id] != VNODE_VDIR { continue }
+                        if parsed.onlyFiles && otB[id] == VNODE_VDIR { continue }
                         let o = Int(offB[id]); let l = Int(lenB[id])
                         // include filters (cheap) first
                         if !parsed.exts.isEmpty && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
@@ -244,7 +248,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
                 }
             }}}
-        }}}}}}}}
+        }}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]

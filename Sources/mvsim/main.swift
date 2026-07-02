@@ -126,6 +126,13 @@ check("ext '.png' (leading dot) still matches", has("ext:.png", "image_001.png")
 // name: forces name scope even conceptually (review #3) — name:data shouldn't match by path
 check("name: term matches filename", has("name:data", "data.json"))
 
+// type filters (folder: / file:) — power the quick type chips
+check("folder: matches the 'data' directory", has("folder:data", "data"))
+check("folder: excludes a plain file", !has("folder:", "report.txt"))
+check("file: matches report.txt", has("file:report", "report.txt"))
+check("file: excludes the 'data' directory", !has("file:", "data"))
+check("-folder: (files only) excludes the 'data' directory", !has("-folder:", "data"))
+
 // regex mode
 check("regex: '^report\\.' matches report.txt", has("^report\\.", "report.txt", mode: .regex))
 check("regex: '\\.png$' matches image_001.png", has("\\.png$", "image_001.png", mode: .regex))

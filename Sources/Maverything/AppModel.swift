@@ -27,6 +27,45 @@ final class ResultsStore {
     var index: FileIndex!
 }
 
+/// Everything-style quick type filters. Each maps to a query clause that is
+/// AND-ed with whatever the user has typed (see `AppModel.effectiveQuery`).
+enum TypeFilter: String, CaseIterable, Identifiable {
+    case all, folders, documents, images, audio, video, archives, apps
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return "All";             case .folders: return "Folders"
+        case .documents: return "Documents"; case .images: return "Images"
+        case .audio: return "Audio";         case .video: return "Video"
+        case .archives: return "Archives";   case .apps: return "Apps"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .all: return "square.grid.2x2";  case .folders: return "folder"
+        case .documents: return "doc.text";   case .images: return "photo"
+        case .audio: return "music.note";     case .video: return "film"
+        case .archives: return "archivebox";  case .apps: return "app.badge"
+        }
+    }
+
+    /// The query fragment this filter contributes (empty for `.all`).
+    var clause: String {
+        switch self {
+        case .all:       return ""
+        case .folders:   return "folder:"
+        case .documents: return "ext:pdf,doc,docx,txt,rtf,pages,md,markdown,odt,tex,epub,xls,xlsx,csv,ppt,pptx,key,numbers"
+        case .images:    return "ext:jpg,jpeg,png,gif,bmp,tiff,tif,heic,heif,webp,svg,raw,cr2,nef,arw,dng,psd,ico"
+        case .audio:     return "ext:mp3,wav,flac,aac,m4a,ogg,oga,aiff,aif,wma,alac,opus"
+        case .video:     return "ext:mp4,mov,avi,mkv,wmv,flv,webm,m4v,mpg,mpeg,3gp,m2ts,mts"
+        case .archives:  return "ext:zip,rar,7z,tar,gz,tgz,bz2,xz,dmg,iso,pkg,cab"
+        case .apps:      return "ext:app,pkg,dmg,exe"
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var query = ""
@@ -40,6 +79,7 @@ final class AppModel: ObservableObject {
     @Published var ascending = true
     @Published var scope: SearchScope = .nameOnly
     @Published var matchMode: MatchMode = .exact
+    @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
     @Published var isIndexing = true
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
@@ -93,11 +133,12 @@ final class AppModel: ObservableObject {
             .sink { [weak self] _ in self?.queryNonce &+= 1; self?.runSearch() }
             .store(in: &cancellables)
 
-        Publishers.Merge4(
+        Publishers.Merge5(
             $sortKey.map { _ in () },
             $ascending.map { _ in () },
             $scope.map { _ in () },
-            $matchMode.map { _ in () }
+            $matchMode.map { _ in () },
+            $typeFilter.map { _ in () }
         )
         .dropFirst()
         .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
@@ -346,11 +387,19 @@ final class AppModel: ObservableObject {
 
     func toggleScope() { scope = (scope == .nameOnly) ? .fullPath : .nameOnly }
 
+    /// The user's typed query combined with the active type-filter chip.
+    var effectiveQuery: String {
+        let c = typeFilter.clause
+        if c.isEmpty { return query }
+        let q = query.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty ? c : c + " " + q
+    }
+
     func runSearch() {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
         searchSeq &+= 1
         let seq = searchSeq
-        let q = query, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
+        let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
         let now = Date().timeIntervalSince1970
         let engine = self.engine
         searchQueue.async { [weak self] in

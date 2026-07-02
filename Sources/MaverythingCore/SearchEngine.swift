@@ -89,6 +89,42 @@ public final class SearchEngine: @unchecked Sendable {
         return false
     }
 
+    /// Reconstruct an entry's absolute-path bytes into `out` using ONLY the raw name
+    /// blob + parent links — no String, no allocation — for fast path-scope matching.
+    /// `blob` is the folded blob (or cased name blob) that the offsets index into.
+    /// Returns the number of bytes written (clamped to out.count). Mirrors _path().
+    @inline(__always)
+    private func foldedPathBytes(_ id: Int,
+                                 blob: UnsafePointer<UInt8>,
+                                 offB: UnsafeBufferPointer<UInt32>,
+                                 lenB: UnsafeBufferPointer<UInt16>,
+                                 parB: UnsafeBufferPointer<Int32>,
+                                 stack: UnsafeMutableBufferPointer<Int32>,
+                                 out: UnsafeMutableBufferPointer<UInt8>) -> Int {
+        let cap = out.count
+        let slash = UInt8(ascii: "/")
+        var depth = 0, cur = id
+        while parB[cur] >= 0 && depth < stack.count {
+            stack[depth] = Int32(cur); depth += 1; cur = Int(parB[cur])
+        }
+        var w = 0
+        @inline(__always) func emit(_ e: Int) {
+            let o = Int(offB[e]); let l = Int(lenB[e])
+            var j = 0
+            while j < l && w < cap { out[w] = blob[o + j]; w += 1; j += 1 }
+        }
+        // root name — matches _path: a root literally named "/" contributes no prefix
+        let ro = Int(offB[cur]); let rl = Int(lenB[cur])
+        if !(rl == 1 && blob[ro] == slash) { emit(cur) }
+        var s = depth - 1
+        while s >= 0 {
+            if w < cap { out[w] = slash; w += 1 }
+            emit(Int(stack[s])); s -= 1
+        }
+        if w == 0 && cap > 0 { out[0] = slash; w = 1 }
+        return w
+    }
+
     // MARK: - fast exact substring path (unchanged tuned scan)
 
     private func fastExact(needle: [UInt8], sortKey: SortKey, ascending: Bool,
@@ -234,6 +270,14 @@ public final class SearchEngine: @unchecked Sendable {
                     let lo = c * chunkSize, hi = min(n, lo + chunkSize)
                     if lo >= hi { return }
                     var ids = [Int32](); var scores = [Int32](); var total = 0
+                    let hayBase = caseSensitive ? nbBase : fbBase
+                    let pathBlob = caseSensitive ? nbBase : fbBase
+                    // Per-chunk scratch for on-the-fly path reconstruction (path-scope terms).
+                    // Reused across every candidate in the chunk → no per-candidate allocation.
+                    var pathScratch = [UInt8](repeating: 0, count: 8192)
+                    var idxStack = [Int32](repeating: 0, count: 1024)
+                    pathScratch.withUnsafeMutableBufferPointer { psb in
+                    idxStack.withUnsafeMutableBufferPointer { isb in
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
@@ -253,23 +297,20 @@ public final class SearchEngine: @unchecked Sendable {
                         if hasNotSizes && self.excludedBySize(szB[id], parsed.notSizes) { continue }
                         if hasNotDates && self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
                         // terms — raw pointers into the flattened term blob (no per-candidate ARC)
-                        let hayBase = caseSensitive ? nbBase : fbBase
                         var score = 0; var ok = true
-                        var pathBytes: [UInt8]? = nil
+                        var pathLen = -1   // built lazily once per candidate, reused across path terms
                         var ti = 0
                         while ti < termCount {
                             let tr = trefsB[ti]
                             let needlePtr = tblobBase! + tr.off
                             let out: MatchOutcome
                             if tr.isPath {
-                                if pathBytes == nil {
-                                    let p = self.index._path(id)
-                                    pathBytes = caseSensitive ? Array(p.utf8) : Array(p.utf8).map(asciiLower)
+                                if pathLen < 0 {
+                                    pathLen = self.foldedPathBytes(id, blob: pathBlob, offB: offB,
+                                                                   lenB: lenB, parB: parB, stack: isb, out: psb)
                                 }
-                                out = pathBytes!.withUnsafeBufferPointer { pb in
-                                    Matcher.match(hay: pb.baseAddress!, hayLen: pb.count,
-                                                  needle: needlePtr, needleLen: tr.len, mode: mode)
-                                }
+                                out = Matcher.match(hay: psb.baseAddress!, hayLen: pathLen,
+                                                    needle: needlePtr, needleLen: tr.len, mode: mode)
                             } else {
                                 out = Matcher.match(hay: hayBase + o, hayLen: l,
                                                     needle: needlePtr, needleLen: tr.len, mode: mode)
@@ -288,6 +329,7 @@ public final class SearchEngine: @unchecked Sendable {
                         }
                     }
                     outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
+                    }}
                 }
             }}}
         }}}}}}}}}}}}

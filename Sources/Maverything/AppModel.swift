@@ -226,10 +226,23 @@ final class AppModel: ObservableObject {
                 self.startWatching(roots: Volumes.localCrawlRoots(),
                                    exclude: self.currentExclusions(),
                                    sinceWhen: meta.lastEventId)
+                // Correctness guard: FSEvents only retains a few days of history, so if we
+                // were offline longer than that, the resume above may have missed changes.
+                // Rather than blindly re-index on a timer (like some rivals), re-index ONLY
+                // when the snapshot is old enough that the resume can't be trusted.
+                let offline = Date().timeIntervalSince1970 - meta.savedAt
+                if offline > Self.staleResumeSeconds {
+                    Diag.log("snapshot stale by \(Int(offline))s (> trust window) → reindex for correctness")
+                    self.beginIndexing()
+                }
             }
         }
         return true
     }
+
+    /// Offline gap beyond which a snapshot resume is considered unsafe (FSEvents history
+    /// is finite) and we do a fresh crawl on launch to guarantee the index is correct.
+    private static let staleResumeSeconds: Double = 3 * 24 * 3600   // 3 days
 
     /// (Re)start a whole-disk crawl across all local volumes. Safe to call while
     /// a crawl is running: the previous crawl is cancelled and superseded.

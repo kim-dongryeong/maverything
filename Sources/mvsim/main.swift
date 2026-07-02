@@ -122,6 +122,20 @@ check("NOT: 'report -png' finds report.txt", has("report -png", "report.txt"))
 check("NOT: 'report -png' excludes Report.PNG", !has("report -png", "Report.PNG"))
 check("phrase: '\"image_0\"' matches images", has("\"image_0\"", "image_001.png"))
 
+// OR (`|`) — a token splits into an OR-group; space is still AND
+check("OR: 'report|notes' matches report.txt AND notes.md",
+      has("report|notes", "report.txt") && has("report|notes", "notes.md"))
+check("OR: dead alternative 'app|nonexistentzz' still finds app.swift",
+      has("app|nonexistentzz", "app.swift"))
+check("OR+filter: 'report|notes ext:md' → notes.md only",
+      has("report|notes ext:md", "notes.md") && !has("report|notes ext:md", "report.txt"))
+check("OR-negated: '-md|txt' excludes notes.md and report.txt, keeps image_001.png",
+      !has("-md|txt", "notes.md") && !has("-md|txt", "report.txt") && has("-md|txt", "image_001.png"))
+check("OR+AND: 'swift app|model' finds AppModel.swift",
+      has("swift app|model", "AppModel.swift"))
+check("OR: scope prefix applies to whole group — 'path:img|data' finds both via path",
+      has("path:img|data", "image_001.png") && has("path:img|data", "data.json"))
+
 // scope
 check("path: 'path:data' finds data.json via path", has("data", "data.json", scope: .fullPath))
 check("name: plain term ignores parent dir name", !has("data", "leaf.txt"))

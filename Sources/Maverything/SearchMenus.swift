@@ -90,6 +90,7 @@ struct SyntaxHelpView: View {
     private let rows: [(String, String)] = [
         ("report",           "substring match on the name"),
         ("app swift",        "AND — both terms must match"),
+        ("jpg|png",          "OR — either alternative matches (space is still AND)"),
         ("report -png",      "exclude terms with - (or !)"),
         ("\"exact phrase\"", "quote to keep spaces together"),
         ("ext:png,jpg",      "one of these extensions"),

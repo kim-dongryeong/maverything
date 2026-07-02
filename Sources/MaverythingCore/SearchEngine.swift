@@ -583,12 +583,16 @@ public final class SearchEngine: @unchecked Sendable {
         // Flatten term bytes into one contiguous buffer + trivial refs so the hot loop
         // uses raw pointers only. Touching each term's [UInt8] array (ARC retain/release)
         // per candidate made multi-term scans ~10x slower than single-term.
+        // Refs are laid out group-by-group; `group` marks OR-group membership (all refs
+        // of a group share the same negated/isPath, matching the parser's guarantee).
         var termBlob: [UInt8] = []
-        var termRefs: [(off: Int, len: Int, negated: Bool, isPath: Bool)] = []
-        termRefs.reserveCapacity(parsed.terms.count)
-        for t in parsed.terms {
-            termRefs.append((termBlob.count, t.bytes.count, t.negated, t.scope == .path))
-            termBlob.append(contentsOf: t.bytes)
+        var termRefs: [(off: Int, len: Int, group: Int, negated: Bool, isPath: Bool)] = []
+        termRefs.reserveCapacity(parsed.termGroups.reduce(0) { $0 + $1.count })
+        for (gi, g) in parsed.termGroups.enumerated() {
+            for t in g {
+                termRefs.append((termBlob.count, t.bytes.count, gi, t.negated, t.scope == .path))
+                termBlob.append(contentsOf: t.bytes)
+            }
         }
         let termCount = termRefs.count
         // Hoist filter presence out of the loop (avoid per-candidate array access + ARC).
@@ -665,7 +669,10 @@ public final class SearchEngine: @unchecked Sendable {
                         if hasNotExts && self.extMatches(fbBase, o, l, parsed.notExts) { continue }
                         if hasNotSizes && self.excludedBySize(szB[id], parsed.notSizes) { continue }
                         if hasNotDates && self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
-                        // terms — raw pointers into the flattened term blob (no per-candidate ARC)
+                        // terms — raw pointers into the flattened term blob (no per-candidate ARC).
+                        // Refs walk group-by-group: a POSITIVE OR-group needs ≥1 alternative to
+                        // match (first hit scores and skips the group's remaining refs); a NEGATED
+                        // group needs ALL alternatives to miss (each ref checked like a plain NOT).
                         var score = 0; var ok = true
                         var pathLen = -1   // built lazily once per candidate, reused across path terms
                         var ti = 0
@@ -702,10 +709,20 @@ public final class SearchEngine: @unchecked Sendable {
                                                            needle: needlePtr, needleLen: tr.len,
                                                            mode: mode, wholeWord: wholeWord)
                             }
-                            let pass = tr.negated ? !out.matched : out.matched
-                            if !pass { ok = false; break }
-                            if !tr.negated { score += out.score }
-                            ti += 1
+                            if tr.negated {
+                                // negated group: NO alternative may match
+                                if out.matched { ok = false; break }
+                                ti += 1
+                            } else if out.matched {
+                                // positive group satisfied: score it, skip its remaining alternatives
+                                score += out.score
+                                ti += 1
+                                while ti < termCount && trefsB[ti].group == tr.group { ti += 1 }
+                            } else {
+                                // alternative missed: fail only if it was the group's last one
+                                ti += 1
+                                if ti >= termCount || trefsB[ti].group != tr.group { ok = false; break }
+                            }
                         }
                         if !ok { continue }
                         total += 1

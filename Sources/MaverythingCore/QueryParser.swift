@@ -9,10 +9,15 @@ public struct QueryTerm: Sendable {
     public var scope: TermScope
 }
 
-/// An Everything-style parsed query: AND-ed terms + structured filters. Anything
-/// it doesn't recognize falls back to a plain substring term (never errors).
+/// An Everything-style parsed query: AND-ed OR-groups of terms + structured
+/// filters. Anything it doesn't recognize falls back to a plain substring term
+/// (never errors).
 public struct ParsedQuery: Sendable {
-    public var terms: [QueryTerm] = []
+    /// AND-list of OR-groups: each inner array holds the alternatives of one token
+    /// (`foo` → one group of one; `jpg|png` → one group of two). All alternatives
+    /// in a group share the same negated flag and scope (`-a|b` negates the WHOLE
+    /// group; `path:a|b` scopes the whole group).
+    public var termGroups: [[QueryTerm]] = []
     public var exts: [[UInt8]] = []                 // folded, no leading dot (include)
     public var sizes: [(SizeOp, Int64)] = []
     public var dateFrom: Int64? = nil               // mtime ns >=
@@ -35,12 +40,14 @@ public struct ParsedQuery: Sendable {
             || onlyDirs || onlyFiles || wholeWord || dupesOnly
             || contentNeedle != nil || !tagGroups.isEmpty
     }
-    public var isEmpty: Bool { terms.isEmpty && !hasFilters }
+    public var isEmpty: Bool { termGroups.isEmpty && !hasFilters }
 
-    /// Fast-path eligibility: one positive name-scope term, no filters → the
-    /// engine can use its tuned parallel memmem scan unchanged.
+    /// Fast-path eligibility: one positive name-scope term (a single group with a
+    /// single alternative), no filters → the engine can use its tuned parallel
+    /// memmem scan unchanged.
     public var simpleName: [UInt8]? {
-        guard !hasFilters, terms.count == 1, let t = terms.first,
+        guard !hasFilters, termGroups.count == 1, let g = termGroups.first,
+              g.count == 1, let t = g.first,
               !t.negated, t.scope == .name else { return nil }
         return t.bytes
     }
@@ -73,10 +80,19 @@ public enum QueryParser {
             // The prefix is authoritative BOTH ways (name: forces name scope even in ⌃U path mode)
             let low = tok.lowercased()
             let scope: TermScope = low.hasPrefix("name:") ? .name : (low.hasPrefix("path:") ? .path : defaultScope)
-            let body = stripScopePrefix(tok).precomposedStringWithCanonicalMapping  // NFC to match index
+            let body = stripScopePrefix(tok)
             if body.isEmpty { continue }
-            let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
-            q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: scope))
+            // `|` splits the token into an OR-group (Everything's a|b). The leading -/!
+            // and any name:/path: prefix apply to the WHOLE group; empty alternatives
+            // are dropped. A plain token is simply a group of one (behavior unchanged).
+            var group: [QueryTerm] = []
+            for part in body.split(separator: "|") {
+                let alt = String(part).precomposedStringWithCanonicalMapping  // NFC to match index
+                if alt.isEmpty { continue }
+                let bytes = q.caseSensitive ? Array(alt.utf8) : searchFoldedBytes(alt)
+                group.append(QueryTerm(bytes: bytes, negated: negated, scope: scope))
+            }
+            if !group.isEmpty { q.termGroups.append(group) }
         }
         return q
     }
@@ -155,12 +171,13 @@ public enum QueryParser {
         }
     }
 
-    /// Append a name-scope term carried by a type filter (`folder:foo`, `-file:bar`).
+    /// Append a name-scope term carried by a type filter (`folder:foo`, `-file:bar`)
+    /// as a single-alternative group (type-filter values do not OR-split).
     private static func appendNameTerm(_ val: String, negated: Bool, into q: inout ParsedQuery) {
         let body = val.precomposedStringWithCanonicalMapping
         guard !body.isEmpty else { return }
         let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
-        q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: .name))
+        q.termGroups.append([QueryTerm(bytes: bytes, negated: negated, scope: .name)])
     }
 
     static func parseSize(_ v: String) -> (SizeOp, Int64)? {

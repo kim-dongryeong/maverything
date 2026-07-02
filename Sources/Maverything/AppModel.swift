@@ -90,7 +90,8 @@ final class AppModel: ObservableObject {
     @Published var ascending = true
     @Published var scope: SearchScope = .nameOnly
     @Published var matchMode: MatchMode = .exact
-    @Published var wholeWord = false               // Everything's Match Whole Word (ww:)
+    @Published var wholeWord = false               // Everything's Match Whole Word (ww:, ⌃B)
+    @Published var matchCase = false               // Everything's Match Case (case:on, ⌃I)
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
     @Published var recentQueries: [String] = AppModel.loadRecents()
     @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
@@ -168,14 +169,15 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        Publishers.Merge7(
+        Publishers.Merge8(
             $sortKey.map { _ in () },
             $ascending.map { _ in () },
             $scope.map { _ in () },
             $matchMode.map { _ in () },
             $typeFilter.map { _ in () },
             $scopeRoot.map { _ in () },
-            $wholeWord.map { _ in () }
+            $wholeWord.map { _ in () },
+            $matchCase.map { _ in () }
         )
         .dropFirst()
         .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
@@ -626,7 +628,8 @@ final class AppModel: ObservableObject {
         if !c.isEmpty { parts.append(c) }
         if !q.isEmpty { parts.append(q) }
         guard !parts.isEmpty else { return "" }
-        if wholeWord { parts.insert("ww:", at: 0) }   // gear-menu toggle = the ww: filter
+        if matchCase { parts.insert("case:on", at: 0) }   // ⌃I toggle = the case:on filter
+        if wholeWord { parts.insert("ww:", at: 0) }       // ⌃B toggle = the ww: filter
         return parts.joined(separator: " ")
     }
 

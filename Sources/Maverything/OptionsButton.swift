@@ -37,11 +37,12 @@ struct OptionsButton: NSViewRepresentable {
                   selected: UILayout.allCases.firstIndex(of: model.layout) ?? 0, cmd: "layout")
             group(m, "Match mode", MatchMode.allCases.map(\.label),
                   selected: MatchMode.allCases.firstIndex(of: model.matchMode) ?? 0, cmd: "mode")
-            check(m, "Match whole word (ww:)", model.wholeWord, cmd: "ww")
+            // Everything's search-toggle set (same shortcuts as the original)
+            check(m, "Match Path", model.scope == .fullPath, cmd: "scope", key: "u", mask: [.control])
+            check(m, "Match Case", model.matchCase, cmd: "case", key: "i", mask: [.control])
+            check(m, "Match Whole Word", model.wholeWord, cmd: "ww", key: "b", mask: [.control])
             group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
                   selected: sortIndex(model.sortKey), cmd: "sort")
-            group(m, "Scope", ["Name only", "Full path  (⌃U)"],
-                  selected: model.scope == .nameOnly ? 0 : 1, cmd: "scope")
             group(m, "Appearance", Appearance.allCases.map(\.label),
                   selected: Appearance.allCases.firstIndex(of: model.appearance) ?? 0, cmd: "appear")
             group(m, "Density", RowDensity.allCases.map(\.label),
@@ -88,8 +89,10 @@ struct OptionsButton: NSViewRepresentable {
             parent.submenu = sub
             menu.addItem(parent)
         }
-        private func check(_ menu: NSMenu, _ title: String, _ on: Bool, cmd: String) {
-            let it = NSMenuItem(title: title, action: #selector(pick(_:)), keyEquivalent: "")
+        private func check(_ menu: NSMenu, _ title: String, _ on: Bool, cmd: String,
+                           key: String = "", mask: NSEvent.ModifierFlags = []) {
+            let it = NSMenuItem(title: title, action: #selector(pick(_:)), keyEquivalent: key)
+            it.keyEquivalentModifierMask = mask   // displayed natively (e.g. ⌃U) at the right edge
             it.target = self; it.representedObject = "\(cmd):0"; it.state = on ? .on : .off
             menu.addItem(it)
         }
@@ -110,8 +113,8 @@ struct OptionsButton: NSViewRepresentable {
             case "mode":    if model.matchMode != MatchMode.allCases[i] { model.matchMode = MatchMode.allCases[i] }
             case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
                             if model.sortKey != k { model.sortKey = k }
-            case "scope":   let s: SearchScope = (i == 0) ? .nameOnly : .fullPath
-                            if model.scope != s { model.scope = s }
+            case "scope":   model.toggleScope()          // Match Path check toggle (⌃U)
+            case "case":    model.matchCase.toggle()     // Match Case (⌃I)
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
             case "asc":     model.ascending.toggle()

@@ -94,7 +94,9 @@ public final class FileIndex: @unchecked Sendable {
     /// Appends a crawl root (absolute path stored as the name). Returns its index.
     public func appendRoot(path: String) -> Int32 {
         lock.lock(); defer { lock.unlock() }
-        let bytes = Array(path.utf8)
+        // NFC-normalize like every other stored name, so a non-ASCII volume root is
+        // findable by an NFC query / full-path match (APFS may store names as NFD).
+        let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
         let idx = Int32(nameOff.count)
         nameOff.append(UInt32(nameBlob.count))
         nameLen.append(UInt16(bytes.count))
@@ -282,27 +284,39 @@ public final class FileIndex: @unchecked Sendable {
         var oldByName = [String: Int32](minimumCapacity: oldIdxs.count)
         for ci in oldIdxs where !deleted[Int(ci)] { oldByName[_name(Int(ci))] = ci }
 
+        // Append a fresh child entry, registering it as a dir (map + recurse) if applicable.
+        func appendChild(_ c: DirEntry, _ nameStr: String) -> Int32 {
+            let ni = _appendOne(parent: dirIdx, name: c.name, size: c.size,
+                                mtime: c.mtime, crtime: c.crtime, objType: c.objType, flags: c.flags)
+            if c.objType == VNODE_VDIR {
+                let cp = displayPath == "/" ? "/" + nameStr : displayPath + "/" + nameStr
+                dirIndexByPath[cp] = ni
+                res.newDirs.append(LiveDir(idx: ni, path: cp))  // recurse into it
+            }
+            return ni
+        }
+
         var newList = [Int32](); newList.reserveCapacity(current.count)
         for c in current {
             let nameStr = String(decoding: c.name, as: UTF8.self)
             if let oi = oldByName.removeValue(forKey: nameStr) {
                 let o = Int(oi)
-                if size[o] != c.size || mtime[o] != c.mtime || flags[o] != c.flags {
-                    size[o] = c.size; mtime[o] = c.mtime; flags[o] = c.flags
-                    hidden[o] = (c.name.first == UInt8(ascii: ".")) || (c.flags & UInt32(UF_HIDDEN)) != 0
-                    res.changed += 1
+                if objType[o] != c.objType {
+                    // Same name, but file<->dir flipped: an in-place attr update would leave a
+                    // ghost dir (or an un-indexed new dir). Tombstone the old subtree and
+                    // re-add so a new directory gets registered + recursed into.
+                    _markDeletedSubtree(oi); res.removed += 1
+                    newList.append(appendChild(c, nameStr)); res.added += 1
+                } else {
+                    if size[o] != c.size || mtime[o] != c.mtime || crtime[o] != c.crtime || flags[o] != c.flags {
+                        size[o] = c.size; mtime[o] = c.mtime; crtime[o] = c.crtime; flags[o] = c.flags
+                        hidden[o] = (c.name.first == UInt8(ascii: ".")) || (c.flags & UInt32(UF_HIDDEN)) != 0
+                        res.changed += 1
+                    }
+                    newList.append(oi)
                 }
-                newList.append(oi)
             } else {
-                let ni = _appendOne(parent: dirIdx, name: c.name, size: c.size,
-                                    mtime: c.mtime, crtime: c.crtime, objType: c.objType, flags: c.flags)
-                newList.append(ni)
-                if c.objType == VNODE_VDIR {
-                    let cp = displayPath == "/" ? "/" + nameStr : displayPath + "/" + nameStr
-                    dirIndexByPath[cp] = ni
-                    res.newDirs.append(LiveDir(idx: ni, path: cp))  // recurse into it
-                }
-                res.added += 1
+                newList.append(appendChild(c, nameStr)); res.added += 1
             }
         }
         for (_, oi) in oldByName { _markDeletedSubtree(oi); res.removed += 1 }

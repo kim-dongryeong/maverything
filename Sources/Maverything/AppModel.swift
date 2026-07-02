@@ -328,16 +328,20 @@ final class AppModel: ObservableObject {
         let rec = Reconciler(index: index, exclude: exclude)
         reconciler = rec
         let q = reconcileQueue
-        watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll in
+        watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, batchMax in
+            guard let self else { return }
             if mustScanAll {
                 // FSEvents history gap / dropped events → safest is a full re-crawl.
-                DispatchQueue.main.async { self?.beginIndexing() }
+                DispatchQueue.main.async { self.beginIndexing() }
                 return
             }
             q.async {
                 let r = rec.reconcile(eventPaths: paths)
+                // Advance the persisted resume cursor ONLY now that this batch is applied,
+                // so a crash/quit can never persist an id ahead of the index.
+                self.watcher.markApplied(batchMax)
                 guard r.didMutate else { return }
-                DispatchQueue.main.async { self?.scheduleLiveRefresh() }
+                DispatchQueue.main.async { self.scheduleLiveRefresh() }
             }
         }
         Diag.log("watching: \(watchPaths.joined(separator: ", ")) since=\(sinceWhen)")
@@ -405,7 +409,7 @@ final class AppModel: ObservableObject {
         guard !isIndexing else { return }
         snapshotDirty = false
         let idx = index
-        let lastEventId = watcher.lastEventId
+        let lastEventId = watcher.appliedEventId   // resume cursor = last APPLIED event, never ahead of the index
         let savedAt = Date().timeIntervalSince1970
         let url = Snapshot.defaultURL()
         let work = {

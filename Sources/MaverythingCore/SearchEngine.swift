@@ -59,7 +59,10 @@ public final class SearchEngine: @unchecked Sendable {
         let start = clock.now
         // Regex mode treats the whole query as one pattern (no term-splitting).
         if mode == .regex, !query.trimmingCharacters(in: .whitespaces).isEmpty {
-            return regexSearch(pattern: query, scope: scope, sortKey: sortKey,
+            // NFC-normalize the pattern like the other modes, so a decomposed (NFD) literal
+            // pasted into regex still matches the NFC names stored in the index.
+            return regexSearch(pattern: query.precomposedStringWithCanonicalMapping,
+                               scope: scope, sortKey: sortKey,
                                ascending: ascending, limit: limit, start: start, clock: clock,
                                scopeRoot: scopeRoot)
         }

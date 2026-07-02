@@ -9,22 +9,29 @@ import Foundation
 public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "maverything.fsevents")
-    fileprivate var onBatch: (([String], Bool) -> Void)?
-    // written on the fsevents queue, read on main → guard it
+    // onBatch(dirtyPaths, mustScanAll, batchMaxEventId)
+    fileprivate var onBatch: (([String], Bool, UInt64) -> Void)?
     private let eventIdLock = NSLock()
-    private var _lastEventId: UInt64 = 0
-    public var lastEventId: UInt64 {
-        get { eventIdLock.lock(); defer { eventIdLock.unlock() }; return _lastEventId }
-        set { eventIdLock.lock(); _lastEventId = newValue; eventIdLock.unlock() }
+    // The resume cursor we PERSIST. Critically it advances only when a batch's changes
+    // have actually been APPLIED to the index (via markApplied), never merely on delivery —
+    // otherwise a quit right after a burst would persist an id ahead of the index and
+    // silently skip those events on the next launch.
+    private var _appliedEventId: UInt64 = 0
+    public var appliedEventId: UInt64 {
+        eventIdLock.lock(); defer { eventIdLock.unlock() }; return _appliedEventId
+    }
+    /// Advance the persisted resume cursor after a reconcile batch has committed.
+    public func markApplied(_ id: UInt64) {
+        eventIdLock.lock(); if id > _appliedEventId { _appliedEventId = id }; eventIdLock.unlock()
     }
 
     public init() {}
 
-    /// Start watching. `onBatch(dirtyPaths, mustScanAll)` is called on a private
-    /// queue. `sinceWhen` lets us resume from a persisted event id (M5).
+    /// Start watching. `onBatch(dirtyPaths, mustScanAll, batchMaxId)` runs on a private
+    /// queue. `sinceWhen` resumes from a persisted (already-applied) event id.
     public func start(paths: [String], latency: Double = 0.3,
                       sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow),
-                      onBatch: @escaping ([String], Bool) -> Void) {
+                      onBatch: @escaping ([String], Bool, UInt64) -> Void) {
         stop()
         self.onBatch = onBatch
         var ctx = FSEventStreamContext(version: 0,
@@ -39,9 +46,14 @@ public final class FSWatcher: @unchecked Sendable {
                                           FSEventStreamEventId(sinceWhen),
                                           latency, flags) else { return }
         stream = s
-        // Seed with the current global event id so a snapshot saved before any
-        // event still records a valid, recent resume point (not 0 = replay-all).
-        lastEventId = max(lastEventId, FSEventsGetCurrentEventId())
+        // Resume cursor starts AT the resume point (everything up to it is already applied).
+        // Only a brand-new watch (no persisted id) seeds from the current global id. We must
+        // NOT fast-forward past `sinceWhen`, or the offline backlog being replayed would be
+        // marked "seen" before it is reconciled.
+        let isNew = sinceWhen == UInt64(kFSEventStreamEventIdSinceNow)
+        eventIdLock.lock()
+        _appliedEventId = isNew ? FSEventsGetCurrentEventId() : sinceWhen
+        eventIdLock.unlock()
         FSEventStreamSetDispatchQueue(s, queue)
         FSEventStreamStart(s)
     }
@@ -55,6 +67,7 @@ public final class FSWatcher: @unchecked Sendable {
     fileprivate func deliver(paths: [String], flags: UnsafePointer<FSEventStreamEventFlags>,
                              ids: UnsafePointer<FSEventStreamEventId>, count: Int) {
         var mustScanAll = false
+        var batchMax: UInt64 = 0
         for i in 0..<count {
             let f = Int(flags[i])
             if f & (kFSEventStreamEventFlagMustScanSubDirs
@@ -62,9 +75,9 @@ public final class FSWatcher: @unchecked Sendable {
                     | kFSEventStreamEventFlagKernelDropped) != 0 {
                 mustScanAll = true
             }
-            if ids[i] > lastEventId { lastEventId = ids[i] }
+            if ids[i] > batchMax { batchMax = ids[i] }
         }
-        onBatch?(paths, mustScanAll)
+        onBatch?(paths, mustScanAll, batchMax)
     }
 }
 

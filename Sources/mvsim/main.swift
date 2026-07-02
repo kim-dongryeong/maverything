@@ -190,6 +190,20 @@ write("newdir/nested_alpha.txt", bytes: 7)
 _ = rec.reconcile(eventPaths: [root]); engine.invalidate()
 check("live: new subdir contents indexed", has("nested_alpha", "nested_alpha.txt"))
 
+// review#1: file <-> dir type flip must re-index correctly (not corrupt the index)
+write("flipme", bytes: 10)
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+check("flip: 'flipme' starts as a file", has("flipme", "flipme"))
+try? fm.removeItem(atPath: root + "/flipme")     // file -> dir with contents
+mkdir(root + "/flipme")
+write("flipme/inside_flip.txt", bytes: 5)
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+check("flip: file->dir now indexes its contents", has("inside_flip", "inside_flip.txt"))
+try? fm.removeItem(atPath: root + "/flipme")     // dir -> file again
+write("flipme", bytes: 3)
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+check("flip: dir->file drops the stale contents", !has("inside_flip", "inside_flip.txt"))
+
 // ---- snapshot round-trip ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
 let idx2 = FileIndex()

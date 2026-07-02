@@ -233,6 +233,13 @@ final class AppModel: ObservableObject {
                 self.prewarmAndSearch()
                 Diag.log("LOADED snapshot \(self.index.count) items, resume@\(meta.lastEventId)")
                 let roots = Volumes.localCrawlRoots()
+                // Roots that were in the snapshot but are NO LONGER mounted would otherwise
+                // survive forever (the sync only diffs against currently-watched roots).
+                let mountedNow = Set(roots.map(\.displayPath))
+                for rp in self.index.liveRootPaths() where !mountedNow.contains(rp) {
+                    let n = self.index.markDeletedSubtree(displayPath: rp)
+                    Diag.log("snapshot root '\(rp)' no longer mounted → tombstoned \(n) rows")
+                }
                 let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
                 self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
@@ -345,12 +352,30 @@ final class AppModel: ObservableObject {
         let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints())
         reconciler = rec
         let q = reconcileQueue
-        watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, batchMax in
+        watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, rootChanged, batchMax in
             guard let self else { return }
             if mustScanAll {
-                // FSEvents history gap, dropped events, or watched-root changed → safest is a full re-crawl.
+                // FSEvents history gap / dropped events → safest is a full re-crawl.
                 Diag.log("FSEvents requested full reindex for roots: \(paths.joined(separator: ", "))")
                 DispatchQueue.main.async { self.beginIndexing() }
+                return
+            }
+            if rootChanged {
+                // A watched ROOT vanished/moved. The overwhelmingly common cause is a volume
+                // unplug (WatchRoot fires when the mount dir disappears) — handle that via the
+                // graceful volume sync (tombstone + watcher restart), NOT a multi-minute full
+                // reindex. Only when every watched root is still mounted (a true root rename/
+                // replace on a live volume) do we fall back to the full re-crawl.
+                DispatchQueue.main.async {
+                    let mounted = Set(Volumes.localCrawlRoots().map(\.displayPath))
+                    let unplugged = self.watchedRoots.contains { !mounted.contains($0.displayPath) }
+                    if unplugged {
+                        self.refreshMountedVolumes(reason: "rootChanged (volume unplugged)")
+                    } else {
+                        Diag.log("rootChanged with all roots still mounted → full reindex")
+                        self.beginIndexing()
+                    }
+                }
                 return
             }
             q.async {
@@ -409,6 +434,12 @@ final class AppModel: ObservableObject {
 
         indexQueue.async { [weak self] in
             guard let self else { return }
+            // Same invariant as beginIndexing: capture the FSEvents cursor BEFORE crawling,
+            // so events landing on the NEW volume during the (possibly long) append-crawl
+            // are replayed after the watcher restarts. The old stream keeps reconciling old
+            // volumes during the crawl and advances appliedEventId past them otherwise —
+            // silently and permanently dropping those files.
+            let preCrawlId: UInt64? = additions.isEmpty ? nil : FSEventsGetCurrentEventId()
             var removedRows = 0
             for r in removals {
                 removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
@@ -427,6 +458,12 @@ final class AppModel: ObservableObject {
                                      mountPoints: Volumes.allMountPoints())
                 if !en.isCancelled {
                     self.index.buildLiveIndexes()
+                    // A stale reconciler racing the mount may have indexed the volume AGAIN
+                    // as a child subtree of /Volumes (its mount filter predated the mount).
+                    // Tombstone any such duplicate stub copy, keeping the appended root.
+                    for r in additions {
+                        removedRows += self.index.tombstoneChildStubCopies(ofRootPath: r.displayPath)
+                    }
                     addedRows = stats.total
                     openErrors = stats.openErrors
                     seconds = stats.seconds
@@ -459,8 +496,13 @@ final class AppModel: ObservableObject {
                     return
                 }
 
+                // Resume from BEFORE the append-crawl when we added a volume (replay is
+                // idempotent; resuming earlier is always safe) — appliedEventId alone can
+                // have advanced past new-volume events that fired during the crawl.
+                let resumeId = preCrawlId.map { min($0, self.watcher.appliedEventId) }
+                    ?? self.watcher.appliedEventId
                 self.startWatching(roots: finalRoots, exclude: self.currentExclusions(),
-                                   sinceWhen: self.watcher.appliedEventId)
+                                   sinceWhen: resumeId)
                 if removedRows > 0 || addedRows > 0 {
                     self.indexedCount = self.index.safeCount()
                     self.scheduleLiveRefresh()

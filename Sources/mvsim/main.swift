@@ -356,6 +356,28 @@ check("snapshot v4→v5: corrupt offsets reject without replacing index",
       && corruptV4Idx.count == corruptBefore
       && corruptV4Idx.name(0) == "/sentinel")
 
+// v5-NATIVE rejection (regression guards for the Int-conversion trap fixed in f4ab553):
+// (a) truncated v5 must reject via the expected-length math, index untouched
+let shortV5 = Data(blob.dropLast())
+let shortV5Idx = FileIndex()
+check("snapshot v5: truncated blob rejects without touching index",
+      shortV5Idx.loadSnapshot(shortV5) == nil && shortV5Idx.count == 0)
+// (b) corrupt v5 with a huge 8-byte nameOff (>= 2^63) must reject, NOT trap on Int()
+let corruptV5: Data = {
+    var b = [UInt8](blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let blobLen = rdU64(32), uBlobLen = rdU64(40)
+    let nameOffStart = 48 + blobLen*2 + uBlobLen
+    for j in 0..<8 { b[nameOffStart + j] = 0xff }            // nameOff[0] = UInt64.max
+    return Data(b)
+}()
+let corruptV5Idx = FileIndex()
+_ = corruptV5Idx.appendRoot(path: "/sentinel5")
+check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
+      corruptV5Idx.loadSnapshot(corruptV5) == nil
+      && corruptV5Idx.count == 1
+      && corruptV5Idx.name(0) == "/sentinel5")
+
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]
 var times: [Double] = []

@@ -325,6 +325,43 @@ public final class FileIndex: @unchecked Sendable {
         return removed
     }
 
+    /// Tombstone any CHILD-STUB copy of a mounted volume's path — an entry for the same
+    /// display path indexed as a child of its parent dir (e.g. /Volumes) by a reconciler
+    /// racing the mount — while keeping the appended ROOT copy (parent == -1). Re-points
+    /// dirIndexByPath at the root copy. Returns rows tombstoned.
+    @discardableResult
+    public func tombstoneChildStubCopies(ofRootPath rawPath: String) -> Int {
+        wrlock(); defer { unlock() }
+        let p = rawPath.precomposedStringWithCanonicalMapping
+        let parentPath = p.contains("/") && p != "/"
+            ? (String(p[..<(p.lastIndex(of: "/")!)]).isEmpty ? "/" : String(p[..<(p.lastIndex(of: "/")!)]))
+            : "/"
+        let lastName = (p as NSString).lastPathComponent
+        var removed = 0
+        // The stub lives under the parent dir's children; the root copy has parent == -1.
+        if let pi = dirIndexByPath[parentPath], !deleted[Int(pi)], let kids = childrenOf[pi] {
+            for k in kids where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
+                removed += _markDeletedSubtree(k)
+            }
+        }
+        // Ensure the path resolves to the surviving root copy for future reconciles.
+        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] && _name(i) == p {
+            dirIndexByPath[p] = Int32(i)
+            break
+        }
+        if removed > 0 { bumpMut() }
+        return removed
+    }
+
+    /// Display paths of all live crawl roots (`parent == -1`, not tombstoned) — used to
+    /// detect roots that vanished while the app was not running.
+    public func liveRootPaths() -> [String] {
+        rdlock(); defer { unlock() }
+        var out: [String] = []
+        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] { out.append(_name(i)) }
+        return out
+    }
+
     /// Diffs a directory's freshly-listed children against the index and applies
     /// adds / removes / attribute updates atomically. Returns what changed.
     func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry],

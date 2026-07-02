@@ -204,6 +204,15 @@ write("flipme", bytes: 3)
 _ = rec.reconcile(eventPaths: [root]); engine.invalidate()
 check("flip: dir->file drops the stale contents", !has("inside_flip", "inside_flip.txt"))
 
+// codex+agy consensus: FSEvents may deliver decomposed (NFD) paths; reconcile must NFC-normalize
+// them to resolve the NFC-keyed index (else Korean/accented dirs silently never reconcile).
+mkdir(root + "/한글폴더")
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()          // dir indexed under NFC key
+write("한글폴더/한글파일.txt", bytes: 5)
+let nfdDir = (root + "/한글폴더").decomposedStringWithCanonicalMapping   // event arrives as NFD
+_ = rec.reconcile(eventPaths: [nfdDir]); engine.invalidate()
+check("nfc: NFD event path resolves the NFC-indexed Korean dir", has("한글파일", "한글파일.txt"))
+
 // ---- snapshot round-trip ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
 let idx2 = FileIndex()

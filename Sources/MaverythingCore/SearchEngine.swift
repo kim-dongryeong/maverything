@@ -34,6 +34,7 @@ public final class SearchEngine: @unchecked Sendable {
     private var incSortKey: SortKey = .name
     private var incAscending = true
     private var incGen = -1
+    private static let incMaxCacheIDs = 8_000_000   // memory bound for the narrowing cache
 
     public init(index: FileIndex, workers: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.index = index
@@ -217,9 +218,12 @@ public final class SearchEngine: @unchecked Sendable {
 
         let total = full.count
         let out = total > limit ? Array(full[0..<limit]) : full
-        // Cache the full set for the next keystroke — only when it's complete (untruncated).
+        // Cache the COMPLETE match set for the next keystroke. `full` is already the whole set
+        // (we cap only the returned `out`), so cache it by a memory bound — NOT the UI display
+        // limit — so even a broad first query ("a", 1M+ hits) lets the next char narrow from it
+        // instead of rescanning the whole index. ~4 bytes/id → 8M ids ≈ 32MB worst case.
         incLock.lock()
-        if total <= limit {
+        if total <= Self.incMaxCacheIDs {
             incValid = true; incGen = gen; incNeedle = needle; incIDs = full
             incSortKey = sortKey; incAscending = ascending
         } else {
@@ -257,6 +261,7 @@ public final class SearchEngine: @unchecked Sendable {
         var chunkTotals = [Int](repeating: 0, count: nChunks)
 
         index.parent.withUnsafeBufferPointer { parB in
+        index.deleted.withUnsafeBufferPointer { delB in
         order.withUnsafeBufferPointer { ordB in
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkTotals.withUnsafeMutableBufferPointer { outTot in
@@ -266,6 +271,7 @@ public final class SearchEngine: @unchecked Sendable {
                     var ids = [Int32](); var total = 0
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        if delB[id] { continue }   // defensive: skip tombstones (parity with other paths)
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         let s = usePath ? self.index._path(id) : self.index._name(id)
                         let r = NSRange(s.startIndex..., in: s)
@@ -276,7 +282,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outTot[c] = total
                 }
             }}
-        }}
+        }}}
         let total = chunkTotals.reduce(0, +)
         var out = [Int32](); out.reserveCapacity(min(total, limit))
         outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }

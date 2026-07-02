@@ -342,6 +342,13 @@ public final class FileIndex: @unchecked Sendable {
             let c = Int(cur)
             if deleted[c] { continue }
             deleted[c] = true
+            // Drop the path→id mapping so it can't leak for the whole session on high churn
+            // (e.g. repeatedly deleted node_modules/build dirs). Guard on identity so we never
+            // remove a same-path entry that was just re-created (file→dir flip re-adds after this).
+            if objType[c] == VNODE_VDIR {
+                let pth = _path(c)
+                if dirIndexByPath[pth] == cur { dirIndexByPath.removeValue(forKey: pth) }
+            }
             if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
         }
     }

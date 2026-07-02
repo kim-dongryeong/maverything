@@ -91,7 +91,7 @@ public enum Volumes {
             var s = buf[i]
             let mp = withUnsafePointer(to: &s.f_mntonname) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
-            }
+            }.precomposedStringWithCanonicalMapping   // NFC to match the crawl's NFC child names
             let fs = withUnsafePointer(to: &s.f_fstypename) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) { String(cString: $0) }
             }

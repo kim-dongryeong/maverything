@@ -114,7 +114,11 @@ public final class Reconciler: @unchecked Sendable {
         var seen = Set<String>()
         func enqueue(_ d: String) { if seen.insert(d).inserted { work.append(d) } }
 
-        for p in eventPaths where !isExcluded(p) {
+        // FSEvents may deliver decomposed (NFD) paths, but the index stores NFC names and
+        // keys dirIndexByPath by NFC — normalize so non-ASCII (e.g. 한글) dirs actually
+        // resolve instead of silently failing the lookup (permanent drift otherwise).
+        let normalized = eventPaths.map { $0.precomposedStringWithCanonicalMapping }
+        for p in normalized where !isExcluded(p) {
             enqueue(parentDir(p))
             if index.liveDirIndex(forDisplayPath: p) != nil { enqueue(p) }
         }

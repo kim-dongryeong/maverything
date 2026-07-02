@@ -213,7 +213,9 @@ public final class FileEnumerator: @unchecked Sendable {
                 // childless stub under its parent (that duplicates the entry and, via
                 // dirIndexByPath last-write-wins, would orphan the real subtree).
                 if objType == VNODE_VDIR, !mountPoints.isEmpty {
-                    let childName = String(decoding: nameBuf, as: UTF8.self)
+                    // NFC so a non-ASCII mount name (e.g. /Volumes/외장하드) matches the NFC
+                    // mountPoints set — otherwise the crawl double-indexes the volume.
+                    let childName = String(decoding: nameBuf, as: UTF8.self).precomposedStringWithCanonicalMapping
                     let childFs = dir == "/" ? "/" + childName : dir + "/" + childName
                     if mountPoints.contains(childFs) { p = p + entryLen; continue }
                 }
@@ -250,7 +252,11 @@ public final class FileEnumerator: @unchecked Sendable {
             let count = withUnsafeMutablePointer(to: &attr) { alp in
                 getattrlistbulk(fd, alp, buf, bufSize, options)
             }
-            if count <= 0 { break }
+            if count == 0 { break }                 // 0 = end of directory
+            if count < 0 {                          // error mid-enumeration
+                if errno == EINTR { continue }      // retry interrupted call
+                return nil                          // real error → signal FAILURE, not a partial
+            }                                       // (a partial list would tombstone the un-listed real files)
             var p = UnsafeRawPointer(buf)
             for _ in 0..<count {
                 let entryLen = Int(p.loadUnaligned(fromByteOffset: 0, as: UInt32.self))

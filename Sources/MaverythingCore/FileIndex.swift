@@ -49,6 +49,14 @@ public final class FileIndex: @unchecked Sendable {
     /// Lock-safe count for live progress polling while a crawl is appending.
     public func safeCount() -> Int { lock.lock(); defer { lock.unlock() }; return nameOff.count }
 
+    /// (total slots, tombstoned) — for deciding when to compact away dead entries.
+    public func liveStats() -> (total: Int, deleted: Int) {
+        lock.lock(); defer { lock.unlock() }
+        var d = 0
+        for x in deleted where x { d += 1 }
+        return (nameOff.count, d)
+    }
+
     // Locked (safe to call from the main thread while the reconciler mutates).
     @inline(__always) public func isDir(_ i: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }; return objType[i] == VNODE_VDIR

@@ -106,7 +106,8 @@ public enum Matcher {
             }
         }
         while p < patLen && pat[p] == star { p += 1 }
-        return p == patLen ? MatchOutcome(true, 500, 0) : .no
+        // shorter names rank higher for relevance (positional score, not a constant)
+        return p == patLen ? MatchOutcome(true, max(1, 700 - hayLen), 0) : .no
     }
 
     // a byte is a "word boundary start" if the preceding byte is a separator

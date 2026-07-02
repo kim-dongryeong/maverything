@@ -288,8 +288,16 @@ final class AppModel: ObservableObject {
     private func startPeriodicSave() {
         saveTimer?.invalidate()
         saveTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
-            guard let self, self.snapshotDirty, !self.isIndexing else { return }
-            self.saveSnapshot()
+            guard let self, !self.isIndexing else { return }
+            // Compact away accumulated tombstones (long high-churn sessions) by
+            // re-indexing — reuses the well-tested crawl path and reclaims RAM.
+            let s = self.index.liveStats()
+            if s.total > 50_000, s.deleted > s.total * 2 / 5 {
+                Diag.log("compacting: \(s.deleted)/\(s.total) tombstoned → reindex")
+                self.beginIndexing()
+                return
+            }
+            if self.snapshotDirty { self.saveSnapshot() }
         }
     }
 

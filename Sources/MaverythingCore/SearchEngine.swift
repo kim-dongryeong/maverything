@@ -255,7 +255,8 @@ public final class SearchEngine: @unchecked Sendable {
                 let ids = chunkIDs[c], scs = chunkScores[c]
                 for j in 0..<ids.count { pairs.append((ids[j], scs[j])) }
             }
-            pairs.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }   // score desc, stable by id
+            // relevance is conventionally high→low, but honor the ascending flag; stable by id
+            pairs.sort { a, b in a.1 != b.1 ? (ascending ? a.1 < b.1 : a.1 > b.1) : a.0 < b.0 }
             out = pairs.prefix(limit).map { $0.0 }
         } else {
             out = []; out.reserveCapacity(min(total, limit))

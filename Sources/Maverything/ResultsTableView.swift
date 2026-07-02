@@ -12,7 +12,7 @@ final class MVTableView: NSTableView {
 
     override func keyDown(with event: NSEvent) {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if mods == [.command, .option], event.keyCode == 8 {   // ⌘⌥C → copy path
+        if event.keyCode == 8, mods == [.command] || mods == [.command, .option] {  // ⌘C / ⌘⌥C → copy path
             coordinator?.copyPath(); return
         }
         if mods == [.command], event.keyCode == 15 {           // ⌘R → reveal in Finder

@@ -148,10 +148,12 @@ struct SettingsView: View {
                     HotkeyRecorder(display: $hotkeyDisplay) { cfg in
                         let previous = HotkeyConfig.current
                         cfg.save()
-                        let ok = (NSApp.delegate as? AppDelegate)?.reregisterHotKey() ?? false
+                        Diag.log("recorder captured \(cfg.display) (keyCode=\(cfg.keyCode) mods=\(cfg.carbonMods))")
+                        let ok = HotkeyController.shared.reregister()
                         if !ok {                       // OS refused the combo → restore + tell the user
                             previous.save()
                             hotkeyDisplay = previous.display
+                            _ = HotkeyController.shared.reregister()   // put the working one back
                             let a = NSAlert()
                             a.messageText = "Couldn't set “\(cfg.display)”"
                             a.informativeText = "That shortcut is reserved or already in use. Try another — combos with ⌘, ⌥, or ⌃ work best."
@@ -162,7 +164,7 @@ struct SettingsView: View {
                     Button("Reset") {
                         HotkeyConfig.default.save()
                         hotkeyDisplay = HotkeyConfig.default.display
-                        (NSApp.delegate as? AppDelegate)?.reregisterHotKey()
+                        HotkeyController.shared.reregister()
                     }
                 }
             }

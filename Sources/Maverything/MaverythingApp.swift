@@ -45,12 +45,11 @@ struct MaverythingApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     weak var mainWindow: NSWindow?
-    private var hotKey: HotKey?
-    private var tapHotKey: EventTapHotKey?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        _ = reregisterHotKey()   // user-configurable global hotkey (default ⌥Space)
+        HotkeyController.shared.onTrigger = { [weak self] in self?.toggle() }
+        HotkeyController.shared.reregister()   // user-configurable global hotkey (default ⌥Space)
         // Re-register on activation so granting Accessibility upgrades us to the
         // event-tap mechanism (any-combo, e.g. ⇧Space) without a relaunch.
         NotificationCenter.default.addObserver(
@@ -59,36 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onActive() {
-        // switch Carbon → event tap once Accessibility is granted
-        if Accessibility.isTrusted, tapHotKey == nil { _ = reregisterHotKey() }
-    }
-
-    /// (Re)register the global hotkey. Prefers a CGEventTap when Accessibility is
-    /// granted (handles ANY combo incl. ⇧Space, like BetterTouchTool); otherwise
-    /// falls back to Carbon RegisterEventHotKey (no permission, but loses combos
-    /// another process already grabs). Returns false only if everything failed.
-    @discardableResult
-    func reregisterHotKey() -> Bool {
-        hotKey = nil; tapHotKey = nil
-        let cfg = HotkeyConfig.current
-        let act: () -> Void = { [weak self] in self?.toggle() }
-        let trusted = Accessibility.isTrusted
-        Diag.log("reregisterHotKey: \(cfg.display) keyCode=\(cfg.keyCode) carbonMods=\(cfg.carbonMods) AXtrusted=\(trusted)")
-        if trusted {
-            if let t = EventTapHotKey(keyCode: cfg.keyCode, mods: cfg.cocoaFlags, action: act) {
-                tapHotKey = t; Diag.log("  -> event tap OK")
-                return true
-            }
-            Diag.log("  -> event tap FAILED (will try Carbon)")
+        if Accessibility.isTrusted, !HotkeyController.shared.usingEventTap {
+            HotkeyController.shared.reregister()
         }
-        if let hk = HotKey(keyCode: cfg.keyCode, modifiers: cfg.carbonMods, action: act) {
-            hotKey = hk; Diag.log("  -> Carbon OK")
-            return true
-        }
-        Diag.log("  -> Carbon FAILED; restoring default ⌥Space")
-        let d = HotkeyConfig.default
-        hotKey = HotKey(keyCode: d.keyCode, modifiers: d.carbonMods, action: act)
-        return false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

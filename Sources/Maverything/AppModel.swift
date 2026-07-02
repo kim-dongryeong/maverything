@@ -81,6 +81,7 @@ final class AppModel: ObservableObject {
     @Published var query = ""
     @Published var statusText = "Starting…"
     @Published var resultTotal = 0
+    @Published var resultShown = 0          // rows actually returned (may be capped below resultTotal)
     @Published var indexedCount = 0
     @Published var queryMillis = 0.0
     @Published var resultsVersion = 0
@@ -543,6 +544,7 @@ final class AppModel: ObservableObject {
                 guard seq == self.searchSeq else { return }   // drop stale
                 self.resultsStore.ids = res.ids
                 self.resultTotal = res.total
+                self.resultShown = res.ids.count
                 self.queryMillis = res.queryMillis
                 self.resultsVersion &+= 1
             }

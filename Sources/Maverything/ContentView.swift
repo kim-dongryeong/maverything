@@ -112,9 +112,17 @@ struct ContentView: View {
                 Text("·").foregroundStyle(.tertiary)
                 Text("\(model.resultTotal.formatted()) results").foregroundStyle(.secondary)
             } else {
-                Text("\(model.resultTotal.formatted()) results")
+                if model.resultShown < model.resultTotal {
+                    Text("showing \(model.resultShown.formatted()) of \(model.resultTotal.formatted()) results")
+                } else {
+                    Text("\(model.resultTotal.formatted()) results")
+                }
                 Text("·").foregroundStyle(.tertiary)
                 Text("\(model.indexedCount.formatted()) indexed").foregroundStyle(.secondary)
+                if let root = model.scopeRoot {
+                    Text("· in \((root as NSString).lastPathComponent)")
+                        .foregroundStyle(Color.accentColor)
+                }
                 if !model.hasFullDiskAccess {
                     Text("· limited (no Full Disk Access)").foregroundStyle(.orange)
                 }

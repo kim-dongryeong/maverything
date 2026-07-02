@@ -85,14 +85,18 @@ enum IconCache {
     private static let lock = NSLock()
     static func icon(for path: String, isDir: Bool) -> NSImage {
         let ext = (path as NSString).pathExtension.lowercased()
-        // Bounded key set: folders + extensionless files share one icon each, so
-        // the cache can't grow per-path.
-        let key = isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext)
+        // A directory WITH an extension is a bundle/package (.app, .framework, .bundle…)
+        // and carries its OWN icon — key it by path so it doesn't collapse onto the shared
+        // generic-folder icon. Plain folders + files share a bounded key set (per extension).
+        let isBundle = isDir && !ext.isEmpty
+        let key = isBundle ? ("\u{1}pkg\u{1}" + path)
+                           : (isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext))
         lock.lock(); defer { lock.unlock() }
         if let c = cache[key] { return c }
         let img = NSWorkspace.shared.icon(forFile: path)
         img.size = NSSize(width: 16, height: 16)
-        cache[key] = img
+        // Per-path bundle icons could grow unbounded as the user scrolls; cap them.
+        if !isBundle || cache.count < 5_000 { cache[key] = img }
         return img
     }
 }

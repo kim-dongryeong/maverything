@@ -59,6 +59,7 @@ write(".hidden/.secret.txt", bytes: 5)                 // hidden
 // by name apple<zebra, but by path adir/…<zdir/…, so the two files swap order.
 write("zdir/marker_apple.txt", bytes: 8)
 write("adir/marker_zebra.txt", bytes: 8)
+mkdir(root + "/emptydir")                              // empty: fixture (dir with no children)
 
 // ---- index ----
 let index = FileIndex()
@@ -222,6 +223,33 @@ check("dupe: bare filter returns only duplicated names",
       engine.search("dupe:", limit: 100_000, now: now).ids
           .allSatisfy { index.name(Int($0)) == "twin_name.txt" }
       && engine.search("dupe:", limit: 100_000, now: now).total >= 2)
+
+// Everything 1.4 filters: empty: (empty folders), len: (name length), startwith:/endwith:
+check("empty: finds the empty fixture dir", has("empty:", "emptydir"))
+check("empty: excludes a non-empty dir", !has("empty:", "img"))
+check("empty: excludes plain files (implies folder:)", !has("empty: report", "report.txt"))
+check("len: exact 8 finds notes.md, excludes report.txt (10)",
+      has("len:8", "notes.md") && !has("len:8", "report.txt"))
+check("len:>10 narrows 'report' to reporting_x.txt only",
+      has("report len:>10", "reporting_x.txt") && !has("report len:>10", "report.txt"))
+check("len: range 3..8 keeps notes.md, drops report.txt",
+      has("len:3..8", "notes.md") && !has("len:3..8", "report.txt"))
+check("len:<=3 finds the img dir", has("len:<=3", "img"))
+check("startwith:rep finds report.txt AND folded Report.PNG",
+      has("startwith:rep", "report.txt") && has("startwith:rep", "Report.PNG"))
+check("startwith:app finds app.swift + AppModel.swift, not QueryParser.swift",
+      has("startwith:app", "app.swift") && has("startwith:app", "AppModel.swift")
+      && !has("startwith:app", "QueryParser.swift"))
+check("endwith:.md finds notes.md + README.md, excludes report.txt",
+      has("endwith:.md", "notes.md") && has("endwith:.md", "README.md")
+      && !has("endwith:.md", "report.txt"))
+check("-startwith:rep excludes report.txt, keeps notes.md",
+      !has("-startwith:rep", "report.txt") && has("-startwith:rep", "notes.md"))
+check("-endwith:.txt excludes report.txt, keeps notes.md",
+      !has("-endwith:.txt", "report.txt") && has("-endwith:.txt", "notes.md"))
+check("startwith: honors case:on ('Rep' → Report.PNG only)",
+      has("case:on startwith:Rep", "Report.PNG") && !has("case:on startwith:Rep", "report.txt"))
+check("alias: endswith:.png finds Report.PNG (folded)", has("endswith:.png", "Report.PNG"))
 
 // incremental "narrow as you type": extending a query must equal a from-scratch full scan
 _ = engine.search("re", limit: 100_000, now: now)                      // caches full set for "re"

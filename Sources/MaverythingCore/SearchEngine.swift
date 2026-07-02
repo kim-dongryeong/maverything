@@ -372,6 +372,40 @@ public final class SearchEngine: @unchecked Sendable {
         return bitmap
     }
 
+    // MARK: - empty-directory bitmap (Everything's empty:)
+
+    private var emptyCache: [Bool] = []
+    private var emptyGen = -1
+    private let emptyLock = NSLock()
+
+    /// Bitmap of live directories with NO live children (Everything's `empty:`).
+    /// One pass over parent/deleted/objType: mark every live dir, then clear any
+    /// entry that a live child points at. Built once per index mutation, cached.
+    /// Called under the index read lock (same pattern as dupeBitmap).
+    private func emptyDirBitmap() -> [Bool] {
+        let gen = index.mutationGenLocked
+        emptyLock.lock()
+        if emptyGen == gen { let c = emptyCache; emptyLock.unlock(); return c }
+        emptyLock.unlock()
+
+        let n = index.count
+        var bitmap = [Bool](repeating: false, count: n)
+        index.parent.withUnsafeBufferPointer { parB in
+        index.deleted.withUnsafeBufferPointer { delB in
+        index.objType.withUnsafeBufferPointer { otB in
+            for i in 0..<n where !delB[i] && otB[i] == VNODE_VDIR { bitmap[i] = true }
+            for i in 0..<n where !delB[i] {
+                let p = Int(parB[i])
+                if p >= 0 && p < n { bitmap[p] = false }   // has a live child → not empty
+            }
+        }}}
+
+        emptyLock.lock()
+        emptyGen = gen; emptyCache = bitmap
+        emptyLock.unlock()
+        return bitmap
+    }
+
     /// One term against one haystack, honoring Everything's Match Whole Word (`ww:`)
     /// for exact mode (other modes define their own shape, so ww: applies to exact).
     @inline(__always)
@@ -604,6 +638,11 @@ public final class SearchEngine: @unchecked Sendable {
         let wholeWord = parsed.wholeWord
         let dupeB: [Bool] = parsed.dupesOnly ? dupeBitmap() : []
         let dupesOnly = parsed.dupesOnly
+        let emptyB: [Bool] = parsed.emptyDirsOnly ? emptyDirBitmap() : []
+        let emptyOnly = parsed.emptyDirsOnly
+        let hasLens = !parsed.lenFilters.isEmpty
+        let hasAffixes = !parsed.prefixes.isEmpty || !parsed.suffixes.isEmpty
+        let hasNotAffixes = !parsed.notPrefixes.isEmpty || !parsed.notSuffixes.isEmpty
 
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
@@ -630,6 +669,11 @@ public final class SearchEngine: @unchecked Sendable {
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
             let unicodeBase = ufb.baseAddress
             let tblobBase = tblobB.baseAddress   // non-nil whenever termCount > 0
+            // startwith:/endwith: match the ASCII-folded blob (cased blob if case:on),
+            // mirroring how terms pick hayBase. The independent Unicode fold lives at
+            // different offsets, so non-ASCII names match affixes by their stored bytes
+            // only (v1 limitation, same spirit as extMatches).
+            let affixBase = caseSensitive ? nbBase : fbBase
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkScores.withUnsafeMutableBufferPointer { outScores in
             chunkTotals.withUnsafeMutableBufferPointer { outTot in
@@ -659,8 +703,11 @@ public final class SearchEngine: @unchecked Sendable {
                         if onlyFiles && otB[id] == VNODE_VDIR { continue }
                         // duplicate-name filter (dupe:)
                         if dupesOnly && (id >= dupeB.count || !dupeB[id]) { continue }
+                        // empty-folder filter (empty:)
+                        if emptyOnly && (id >= emptyB.count || !emptyB[id]) { continue }
                         let o = Int(offB[id]); let l = Int(lenB[id])
                         // include filters (cheap) first
+                        if hasLens && !self.lenMatches(l, parsed.lenFilters) { continue }
                         if hasExts && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
                         if hasSizes && !self.sizeMatches(szB[id], parsed.sizes) { continue }
                         if let df, mtB[id] < df { continue }
@@ -725,6 +772,13 @@ public final class SearchEngine: @unchecked Sendable {
                             }
                         }
                         if !ok { continue }
+                        // anchored name-affix filters (startwith:/endwith:)
+                        if hasAffixes && !self.affixMatches(affixBase, o, l,
+                                                            prefixes: parsed.prefixes,
+                                                            suffixes: parsed.suffixes) { continue }
+                        if hasNotAffixes && self.excludedByAffix(affixBase, o, l,
+                                                                 notPrefixes: parsed.notPrefixes,
+                                                                 notSuffixes: parsed.notSuffixes) { continue }
                         total += 1
                         if relevance {
                             pairs.append((id: Int32(id), score: Int32(clamping: score)))
@@ -809,6 +863,49 @@ public final class SearchEngine: @unchecked Sendable {
             }
         }
         return true
+    }
+
+    /// `len:` — the name's UTF-8 byte length must satisfy EVERY comparison.
+    @inline(__always)
+    private func lenMatches(_ l: Int, _ filters: [(SizeOp, Int)]) -> Bool {
+        for (op, n) in filters {
+            switch op {
+            case .gt: if !(l > n) { return false }
+            case .lt: if !(l < n) { return false }
+            case .ge: if !(l >= n) { return false }
+            case .le: if !(l <= n) { return false }
+            case .eq: if !(l == n) { return false }
+            }
+        }
+        return true
+    }
+
+    /// `startwith:`/`endwith:` — the name bytes must begin/end with EVERY affix.
+    @inline(__always)
+    private func affixMatches(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+                              prefixes: [[UInt8]], suffixes: [[UInt8]]) -> Bool {
+        for p in prefixes {
+            if p.count > l { return false }
+            if !p.withUnsafeBufferPointer({ $0.isEmpty || memcmp(base + o, $0.baseAddress!, $0.count) == 0 }) { return false }
+        }
+        for s in suffixes {
+            if s.count > l { return false }
+            if !s.withUnsafeBufferPointer({ $0.isEmpty || memcmp(base + o + l - $0.count, $0.baseAddress!, $0.count) == 0 }) { return false }
+        }
+        return true
+    }
+
+    /// Negated affixes: exclude if the name begins/ends with ANY of them.
+    @inline(__always)
+    private func excludedByAffix(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+                                 notPrefixes: [[UInt8]], notSuffixes: [[UInt8]]) -> Bool {
+        for p in notPrefixes where !p.isEmpty && p.count <= l {
+            if p.withUnsafeBufferPointer({ memcmp(base + o, $0.baseAddress!, $0.count) == 0 }) { return true }
+        }
+        for s in notSuffixes where !s.isEmpty && s.count <= l {
+            if s.withUnsafeBufferPointer({ memcmp(base + o + l - $0.count, $0.baseAddress!, $0.count) == 0 }) { return true }
+        }
+        return false
     }
 
     // negated filters exclude if the candidate matches ANY of them

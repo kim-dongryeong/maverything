@@ -30,6 +30,12 @@ public struct ParsedQuery: Sendable {
     public var onlyFiles = false                    // `file:`   — match non-directories only
     public var wholeWord = false                    // `ww:` — Everything's Match Whole Word
     public var dupesOnly = false                    // `dupe:` — names that occur more than once
+    public var emptyDirsOnly = false                // `empty:` — empty folders only (implies onlyDirs)
+    public var lenFilters: [(SizeOp, Int)] = []     // `len:` — name length in UTF-8 bytes
+    public var prefixes: [[UInt8]] = []             // `startwith:` — name must begin with (folded)
+    public var suffixes: [[UInt8]] = []             // `endwith:`  — name must end with (folded)
+    public var notPrefixes: [[UInt8]] = []          // `-startwith:` — name must NOT begin with
+    public var notSuffixes: [[UInt8]] = []          // `-endwith:`  — name must NOT end with
     public var contentNeedle: [UInt8]? = nil        // `content:` — on-demand file-content substring
     public var tagGroups: [[String]] = []           // `tag:a;b` = OR-group; multiple tag: = AND
     public var caseSensitive = false
@@ -38,6 +44,9 @@ public struct ParsedQuery: Sendable {
         !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
             || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
             || onlyDirs || onlyFiles || wholeWord || dupesOnly
+            || emptyDirsOnly || !lenFilters.isEmpty
+            || !prefixes.isEmpty || !suffixes.isEmpty
+            || !notPrefixes.isEmpty || !notSuffixes.isEmpty
             || contentNeedle != nil || !tagGroups.isEmpty
     }
     public var isEmpty: Bool { termGroups.isEmpty && !hasFilters }
@@ -132,6 +141,19 @@ public enum QueryParser {
         case "dupe", "dupes", "dup":           // Everything's duplicate finder (by name)
             if !negated { q.dupesOnly = true }
             return true
+        case "empty":                          // Everything's empty: — folders with no live children
+            if !negated { q.emptyDirsOnly = true; q.onlyDirs = true }
+            return true
+        case "len", "length":                  // name length in bytes: len:5 len:>20 len:<=3 len:3..8
+            guard let filters = parseIntCompare(val) else { return false }
+            if !negated { q.lenFilters.append(contentsOf: filters) }   // `-len:` is a no-op
+            return true
+        case "startwith", "startswith", "prefix":   // name must begin with (folded like terms)
+            appendAffix(val, negated: negated, into: &q, prefix: true)
+            return true
+        case "endwith", "endswith", "suffix":       // name must end with (folded like terms)
+            appendAffix(val, negated: negated, into: &q, prefix: false)
+            return true
         case "content":                        // on-demand content search (Everything 1.4-style)
             if !negated, !val.isEmpty { q.contentNeedle = Array(val.utf8) }
             return true
@@ -178,6 +200,38 @@ public enum QueryParser {
         guard !body.isEmpty else { return }
         let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
         q.termGroups.append([QueryTerm(bytes: bytes, negated: negated, scope: .name)])
+    }
+
+    /// `startwith:`/`endwith:` value → folded affix bytes (NFC + searchFoldedBytes
+    /// unless case:on, mirroring plain terms). Empty values are ignored.
+    private static func appendAffix(_ val: String, negated: Bool, into q: inout ParsedQuery, prefix: Bool) {
+        let body = val.precomposedStringWithCanonicalMapping
+        guard !body.isEmpty else { return }
+        let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
+        switch (prefix, negated) {
+        case (true, false):  q.prefixes.append(bytes)
+        case (true, true):   q.notPrefixes.append(bytes)
+        case (false, false): q.suffixes.append(bytes)
+        case (false, true):  q.notSuffixes.append(bytes)
+        }
+    }
+
+    /// Plain-integer comparison for `len:`: `5`, `>20`, `>=3`, `<10`, `<=8`, `=5`,
+    /// and inclusive ranges `3..8` (→ ge+le). No unit suffixes (unlike parseSize).
+    static func parseIntCompare(_ v: String) -> [(SizeOp, Int)]? {
+        var s = v.trimmingCharacters(in: .whitespaces)
+        if let r = s.range(of: "..") {
+            guard let a = Int(s[..<r.lowerBound]), let b = Int(s[r.upperBound...]) else { return nil }
+            return [(.ge, a), (.le, b)]
+        }
+        var op: SizeOp = .eq
+        if s.hasPrefix(">=") { op = .ge; s.removeFirst(2) }
+        else if s.hasPrefix("<=") { op = .le; s.removeFirst(2) }
+        else if s.hasPrefix(">") { op = .gt; s.removeFirst() }
+        else if s.hasPrefix("<") { op = .lt; s.removeFirst() }
+        else if s.hasPrefix("=") { op = .eq; s.removeFirst() }
+        guard let n = Int(s.trimmingCharacters(in: .whitespaces)) else { return nil }
+        return [(op, n)]
     }
 
     static func parseSize(_ v: String) -> (SizeOp, Int64)? {

@@ -102,6 +102,9 @@ struct SyntaxHelpView: View {
         ("case:on",          "make the whole query case-sensitive"),
         ("ww:",              "match whole words only (report ≠ reporting)"),
         ("dupe:",            "only names that exist more than once (duplicate finder)"),
+        ("empty:",           "empty folders"),
+        ("len:>20",          "name length (bytes)"),
+        ("startwith: / endwith:", "name prefix / suffix"),
         ("content:text",     "search INSIDE files (on-demand, slower — combine with ext:)"),
         ("tag:red;blue",     "Finder tags — ; = OR, repeat tag: = AND"),
     ]

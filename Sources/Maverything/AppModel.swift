@@ -92,6 +92,7 @@ final class AppModel: ObservableObject {
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
     @Published var recentQueries: [String] = AppModel.loadRecents()
     @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
+    @Published var scopeRoot: String? = nil        // "Search in This Folder" — restrict to a subtree
     @Published var isIndexing = true
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
@@ -142,15 +143,24 @@ final class AppModel: ObservableObject {
         $query
             .debounce(for: .milliseconds(35), scheduler: DispatchQueue.main)  // fires during window tracking too
             .removeDuplicates()
-            .sink { [weak self] _ in self?.queryNonce &+= 1; self?.runSearch() }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // if the user edited away from a cycled history entry, drop the cursor
+                if self.historyCursor >= 0, self.historyCursor < self.recentQueries.count,
+                   self.query != self.recentQueries[self.historyCursor] {
+                    self.historyCursor = -1
+                }
+                self.queryNonce &+= 1; self.runSearch()
+            }
             .store(in: &cancellables)
 
-        Publishers.Merge5(
+        Publishers.Merge6(
             $sortKey.map { _ in () },
             $ascending.map { _ in () },
             $scope.map { _ in () },
             $matchMode.map { _ in () },
-            $typeFilter.map { _ in () }
+            $typeFilter.map { _ in () },
+            $scopeRoot.map { _ in () }
         )
         .dropFirst()
         .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
@@ -435,10 +445,26 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.recentsKey)
     }
 
+    /// Shell-style history cycling in the search field: ⌘↑ = older, ⌘↓ = newer.
+    private var historyCursor = -1
+    func cycleHistory(older: Bool) {
+        guard !recentQueries.isEmpty else { return }
+        if older { historyCursor = min(historyCursor + 1, recentQueries.count - 1) }
+        else { historyCursor -= 1 }
+        if historyCursor < 0 { historyCursor = -1; query = "" }
+        else { query = recentQueries[historyCursor] }
+    }
+
     /// Apply a recent/saved query and run it.
     func applyQuery(_ q: String) {
         query = q
         focusNonce &+= 1   // keep focus on the search field
+    }
+
+    /// Restrict subsequent searches to a folder subtree (files use their parent dir).
+    func searchInFolder(path: String, isDir: Bool) {
+        scopeRoot = isDir ? path : (path as NSString).deletingLastPathComponent
+        focusNonce &+= 1
     }
 
     func saveCurrentSearch(name: String) {
@@ -471,16 +497,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - export current results
+
+    /// All current result paths, newline-joined (for "Copy All Paths").
+    func allResultPaths() -> String {
+        resultsStore.ids.map { index.path(Int($0)) }.joined(separator: "\n")
+    }
+
+    /// The current result set as CSV (Name, Path, Size, Date Modified, Date Created).
+    func buildResultsCSV() -> String {
+        let ids = resultsStore.ids
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        func date(_ ns: Int64) -> String { ns == 0 ? "" : df.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9)) }
+        func esc(_ s: String) -> String {
+            (s.contains(",") || s.contains("\"") || s.contains("\n"))
+                ? "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" : s
+        }
+        var out = "Name,Path,Size,Date Modified,Date Created\n"
+        out.reserveCapacity(ids.count * 96)
+        for id in ids {
+            let r = index.row(Int(id))
+            let size = r.isDir ? "" : String(r.size)
+            out += esc(r.name) + "," + esc(r.path) + "," + size + "," + date(r.mtime) + "," + date(r.crtime) + "\n"
+        }
+        return out
+    }
+
     func runSearch() {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
         searchSeq &+= 1
         let seq = searchSeq
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
+        let root = scopeRoot
         let now = Date().timeIntervalSince1970
         let engine = self.engine
+        let idx = self.index
         searchQueue.async { [weak self] in
             guard let self else { return }
-            let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc, now: now)
+            let rootIdx = root.flatMap { idx.dirIndex(forPath: $0) }
+            let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc,
+                                    now: now, scopeRoot: rootIdx)
             DispatchQueue.main.async {
                 guard seq == self.searchSeq else { return }   // drop stale
                 self.resultsStore.ids = res.ids

@@ -1,6 +1,7 @@
 import AppKit
 import MaverythingCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The gear/options button as an AppKit NSButton + NSMenu. Built fresh on each
 /// click from current state, so live-refresh re-renders never reposition it
@@ -50,8 +51,23 @@ struct OptionsButton: NSViewRepresentable {
             item(m, "Reindex Now", cmd: "reindex")
             if !model.hasFullDiskAccess { item(m, "Grant Full Disk Access…", cmd: "fda") }
             m.addItem(.separator())
+            item(m, "Copy All Paths", cmd: "copypaths")
+            item(m, "Export Results as CSV…", cmd: "export")
+            m.addItem(.separator())
             item(m, "Settings…", cmd: "settings")
             m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+        }
+
+        private func exportCSV() {
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.commaSeparatedText]
+            panel.nameFieldStringValue = "Maverything results.csv"
+            panel.canCreateDirectories = true
+            panel.title = "Export Results"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            let csv = model.buildResultsCSV()
+            do { try csv.write(to: url, atomically: true, encoding: .utf8) }
+            catch { NSSound.beep() }
         }
 
         private func sortIndex(_ k: SortKey) -> Int {
@@ -97,6 +113,11 @@ struct OptionsButton: NSViewRepresentable {
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()
             case "fda":     model.showOnboarding = true
+            case "copypaths":
+                let s = model.allResultPaths()
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(s, forType: .string)
+            case "export":  exportCSV()
             case "settings":
                 NSApp.activate(ignoringOtherApps: true)
                 if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {

@@ -195,6 +195,13 @@ public final class FileIndex: @unchecked Sendable {
     /// Reconstructs the absolute path of entry `i` by walking parents.
     public func path(_ i: Int) -> String { lock.lock(); defer { lock.unlock() }; return _path(i) }
 
+    /// Resolve a folder's absolute path to its entry index (for folder-scoped search).
+    public func dirIndex(forPath p: String) -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        guard let i = dirIndexByPath[p], !deleted[Int(i)] else { return nil }
+        return i
+    }
+
     /// The parent directory's absolute path (for display).
     public func directory(_ i: Int) -> String {
         lock.lock(); defer { lock.unlock() }

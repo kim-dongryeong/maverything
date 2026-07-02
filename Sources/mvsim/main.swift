@@ -133,6 +133,19 @@ check("file: matches report.txt", has("file:report", "report.txt"))
 check("file: excludes the 'data' directory", !has("file:", "data"))
 check("-folder: (files only) excludes the 'data' directory", !has("-folder:", "data"))
 
+// folder scope ("Search in This Folder") — restrict to a subtree via parent walk
+if let dataDir = index.dirIndex(forPath: root + "/data") {
+    let inData = Set(engine.search("json", limit: 10_000, now: now, scopeRoot: dataDir).ids.map { index.name(Int($0)) })
+    check("scope: 'json' under data/ finds data.json", inData.contains("data.json"))
+}
+if let srcDir = index.dirIndex(forPath: root + "/src") {
+    let inSrc = Set(engine.search("json", limit: 10_000, now: now, scopeRoot: srcDir).ids.map { index.name(Int($0)) })
+    check("scope: 'json' under src/ excludes data.json", !inSrc.contains("data.json"))
+    let underSrc = Set(engine.search("", limit: 100_000, now: now, scopeRoot: srcDir).ids.map { index.name(Int($0)) })
+    check("scope: empty query lists src subtree (leaf.txt in, report.txt out)",
+          underSrc.contains("leaf.txt") && !underSrc.contains("report.txt"))
+}
+
 // regex mode
 check("regex: '^report\\.' matches report.txt", has("^report\\.", "report.txt", mode: .regex))
 check("regex: '\\.png$' matches image_001.png", has("\\.png$", "image_001.png", mode: .regex))

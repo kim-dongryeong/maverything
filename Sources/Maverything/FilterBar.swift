@@ -7,6 +7,9 @@ struct FilterBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            if let root = model.scopeRoot {
+                scopeToken(root)
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(TypeFilter.allCases) { chip($0) }
@@ -20,6 +23,26 @@ struct FilterBar: View {
                 .padding(.trailing, 12)
                 .padding(.leading, 4)
         }
+    }
+
+    /// Pinned "In: <folder> ✕" token shown when a folder scope is active.
+    private func scopeToken(_ root: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "folder.fill").font(.system(size: 10))
+            Text((root as NSString).lastPathComponent)
+                .font(.system(size: 12, weight: .medium)).lineLimit(1)
+            Button { model.scopeRoot = nil } label: {
+                Image(systemName: "xmark.circle.fill")
+            }.buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+        .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1))
+        .foregroundStyle(Color.accentColor)
+        .padding(.leading, 12)
+        .padding(.trailing, 2)
+        .help("Searching in \(root) — click ✕ to clear")
     }
 
     private func chip(_ f: TypeFilter) -> some View {

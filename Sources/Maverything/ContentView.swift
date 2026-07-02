@@ -58,8 +58,14 @@ struct ContentView: View {
                 .font(.system(size: 16))
                 .frame(maxWidth: .infinity)           // absorb slack so controls don't overlap
                 .focused($searchFocused)
-                .onKeyPress(.downArrow) {                 // ↓ moves focus into the results
-                    model.focusResultsNonce &+= 1; return .handled
+                .onKeyPress(phases: .down) { press in     // ⌘↑/⌘↓ cycle history; plain ↓ enters results
+                    if press.modifiers.contains(.command) {
+                        if press.key == .upArrow { model.cycleHistory(older: true); return .handled }
+                        if press.key == .downArrow { model.cycleHistory(older: false); return .handled }
+                        return .ignored
+                    }
+                    if press.key == .downArrow { model.focusResultsNonce &+= 1; return .handled }
+                    return .ignored
                 }
                 .onSubmit {                               // Enter: remember the query, jump to results
                     model.recordRecentQuery(model.query)

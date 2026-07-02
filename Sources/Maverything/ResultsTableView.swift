@@ -151,6 +151,7 @@ struct ResultsTableView: NSViewRepresentable {
         add("Open Enclosing Folder", #selector(Coordinator.openEnclosing))
         add("Quick Look", #selector(Coordinator.quickLook), key: " ")
         menu.addItem(.separator())
+        add("Search in This Folder", #selector(Coordinator.searchInFolder))
         add("Reveal in Finder", #selector(Coordinator.revealItem), key: "r", mask: [.command])
         menu.addItem(.separator())
         add("Copy", #selector(Coordinator.copyFile), key: "c", mask: [.command])
@@ -506,6 +507,12 @@ struct ResultsTableView: NSViewRepresentable {
         @objc func openEnclosing() {
             let dirs = Set(selectedPaths().map { ($0 as NSString).deletingLastPathComponent })
             for d in dirs { NSWorkspace.shared.open(URL(fileURLWithPath: d)) }
+        }
+
+        @objc func searchInFolder() {
+            guard let tv = tableView, tv.selectedRow >= 0, tv.selectedRow < ids.count else { return }
+            let r = model.index.row(Int(ids[tv.selectedRow]))
+            model.searchInFolder(path: r.path, isDir: r.isDir)
         }
 
         @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }

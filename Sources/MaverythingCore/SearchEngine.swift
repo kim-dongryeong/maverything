@@ -33,27 +33,29 @@ public final class SearchEngine: @unchecked Sendable {
 
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
-                       limit: Int = 100_000, now: TimeInterval = 0) -> SearchResults {
+                       limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
         index.withReadLock {
             _search(query, mode: mode, scope: scope, sortKey: sortKey,
-                    ascending: ascending, limit: limit, now: now)
+                    ascending: ascending, limit: limit, now: now, scopeRoot: scopeRoot)
         }
     }
 
     private func _search(_ query: String, mode: MatchMode, scope: SearchScope,
-                         sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval) -> SearchResults {
+                         sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval,
+                         scopeRoot: Int32?) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
         // Regex mode treats the whole query as one pattern (no term-splitting).
         if mode == .regex, !query.trimmingCharacters(in: .whitespaces).isEmpty {
             return regexSearch(pattern: query, scope: scope, sortKey: sortKey,
-                               ascending: ascending, limit: limit, start: start, clock: clock)
+                               ascending: ascending, limit: limit, start: start, clock: clock,
+                               scopeRoot: scopeRoot)
         }
 
         let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
 
-        // empty query → return the chosen order directly
-        if parsed.isEmpty {
+        // empty query → return the chosen order directly (unless scoped to a folder)
+        if parsed.isEmpty && scopeRoot == nil {
             let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
             let n = order.count
             var out = [Int32](); out.reserveCapacity(min(limit, n))
@@ -63,14 +65,28 @@ public final class SearchEngine: @unchecked Sendable {
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
 
-        // fast path: a single positive exact name term, no filters
-        if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive {
+        // fast path: a single positive exact name term, no filters, no folder scope
+        if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive, scopeRoot == nil {
             return fastExact(needle: needle, sortKey: sortKey, ascending: ascending,
                              limit: limit, start: start, clock: clock)
         }
 
         return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
-                       limit: limit, start: start, clock: clock)
+                       limit: limit, start: start, clock: clock, scopeRoot: scopeRoot)
+    }
+
+    /// Walk parent links up from `id`; true if `root` is an ancestor (or is `id`).
+    /// Integer-only (no path strings), depth-bounded so a cycle can't hang.
+    @inline(__always)
+    private func isUnder(_ id: Int, root: Int32, parentB: UnsafeBufferPointer<Int32>) -> Bool {
+        var cur = Int32(id)
+        var hops = 0
+        while cur >= 0 && hops < 4096 {
+            if cur == root { return true }
+            cur = parentB[Int(cur)]
+            hops += 1
+        }
+        return false
     }
 
     // MARK: - fast exact substring path (unchanged tuned scan)
@@ -122,7 +138,8 @@ public final class SearchEngine: @unchecked Sendable {
     // MARK: - regex mode (power mode; builds a String per candidate, so slower)
 
     private func regexSearch(pattern: String, scope: SearchScope, sortKey: SortKey, ascending: Bool,
-                             limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+                             limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
+                             scopeRoot: Int32?) -> SearchResults {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return SearchResults(ids: [], total: 0, truncated: false,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
@@ -135,6 +152,7 @@ public final class SearchEngine: @unchecked Sendable {
         var chunkIDs = [[Int32]](repeating: [], count: nChunks)
         var chunkTotals = [Int](repeating: 0, count: nChunks)
 
+        index.parent.withUnsafeBufferPointer { parB in
         order.withUnsafeBufferPointer { ordB in
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkTotals.withUnsafeMutableBufferPointer { outTot in
@@ -144,6 +162,7 @@ public final class SearchEngine: @unchecked Sendable {
                     var ids = [Int32](); var total = 0
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         let s = usePath ? self.index._path(id) : self.index._name(id)
                         let r = NSRange(s.startIndex..., in: s)
                         if re.firstMatch(in: s, options: [], range: r) != nil {
@@ -153,7 +172,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outTot[c] = total
                 }
             }}
-        }
+        }}
         let total = chunkTotals.reduce(0, +)
         var out = [Int32](); out.reserveCapacity(min(total, limit))
         outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
@@ -164,7 +183,8 @@ public final class SearchEngine: @unchecked Sendable {
     // MARK: - general evaluator (modes, filters, multi-term, NOT, path, relevance)
 
     private func general(parsed: ParsedQuery, mode: MatchMode, sortKey: SortKey, ascending: Bool,
-                         limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+                         limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
+                         scopeRoot: Int32?) -> SearchResults {
         let relevance = (sortKey == .relevance)
         let order = orderArray(for: relevance ? .name : sortKey)
         let n = order.count
@@ -185,6 +205,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.mtime.withUnsafeBufferPointer { mtB in
         index.deleted.withUnsafeBufferPointer { delB in
         index.objType.withUnsafeBufferPointer { otB in
+        index.parent.withUnsafeBufferPointer { parB in
         order.withUnsafeBufferPointer { ordB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
@@ -197,6 +218,8 @@ public final class SearchEngine: @unchecked Sendable {
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
+                        // folder scope: only entries under the chosen directory subtree
+                        if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         // type filters (folder: / file:)
                         if parsed.onlyDirs && otB[id] != VNODE_VDIR { continue }
                         if parsed.onlyFiles && otB[id] == VNODE_VDIR { continue }
@@ -248,7 +271,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
                 }
             }}}
-        }}}}}}}}}
+        }}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]

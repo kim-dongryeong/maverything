@@ -91,13 +91,17 @@ struct ContentView: View {
             .fixedSize()                              // size to its 4 segments; no overlap
             .help("Matching mode: Exact / Fuzzy / Wildcard / Regex")
 
-            // ⌃U scope — always-visible state (lit = matching the FULL PATH, not just names)
+            // ⌃U scope — always-visible state (lit = matching the FULL PATH, not just names);
+            // the shortcut is shown inline so it's discoverable without hovering.
             Toggle(isOn: Binding(get: { model.scope == .fullPath },
                                  set: { model.scope = $0 ? .fullPath : .nameOnly })) {
-                Text("Path")
+                HStack(spacing: 3) {
+                    Text("Path")
+                    Text("⌃U").font(.caption2).foregroundStyle(.secondary)
+                }
             }
             .toggleStyle(.button)
-            .help("Match against the full path instead of just the file name (⌃U)")
+            .help("Match against the full path instead of just the file name (shortcut: Control+U)")
 
             OptionsButton(model: model)
                 .frame(width: 22, height: 22)

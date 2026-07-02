@@ -236,6 +236,9 @@ struct SettingsView: View {
             }
             Divider()
             Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)
+            Toggle("Page Up/Down · Home/End move the selection", isOn: $model.navKeysMoveSelection)
+            Text("On (Everything-style): the cursor jumps by a page / to the first-last row. Off: macOS default — only the scroll moves.")
+                .font(.caption).foregroundStyle(.secondary)
             Text("F2 always renames. Space = Quick Look · ⌘⌫ = Move to Trash · drag rows to Finder to copy/move.")
                 .font(.caption).foregroundStyle(.secondary)
         }

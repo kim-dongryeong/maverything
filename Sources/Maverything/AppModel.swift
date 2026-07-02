@@ -102,6 +102,12 @@ final class AppModel: ObservableObject {
     @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
         didSet { UserDefaults.standard.set(enterRenames, forKey: "mv.enterRenames") }
     }
+    /// PgUp/PgDn/Home/End move the SELECTION (Everything-style, default) vs. macOS's
+    /// native scroll-only behavior — user-switchable per the build-all-options rule.
+    @Published var navKeysMoveSelection: Bool =
+        (UserDefaults.standard.object(forKey: "mv.navKeysMove") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(navKeysMoveSelection, forKey: "mv.navKeysMove") }
+    }
     @Published var focusNonce = 0              // bumped to refocus the search field
     @Published var focusResultsNonce = 0       // bumped to move focus into the results list
     @Published var selectedID: Int32? = nil    // current selection (for the preview pane)

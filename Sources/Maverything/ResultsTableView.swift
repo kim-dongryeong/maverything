@@ -62,28 +62,68 @@ final class MVTableView: NSTableView {
             if selectedRow >= 0, selectedRow == numberOfRows - 1, event.isARepeat { return }
             super.keyDown(with: event)
             if event.isARepeat { alignSelection(toBottom: true) }
+        case 116, 121, 115, 119:   // pgUp / pgDn / home / end
+            if coordinator?.model.navKeysMoveSelection == true {
+                moveSelectionByPage(keyCode: event.keyCode)   // Everything-style: cursor moves
+            } else {
+                super.keyDown(with: event)                    // macOS default: scroll only
+            }
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }
+    }
+
+    /// Everything-style paging: PgUp/PgDn move the SELECTION by one visible page,
+    /// Home/End jump it to the first/last row (macOS default only scrolls).
+    private func moveSelectionByPage(keyCode: UInt16) {
+        let n = numberOfRows
+        guard n > 0 else { return }
+        let cur = selectedRow
+        let target: Int
+        switch keyCode {
+        case 115: target = 0                                  // Home
+        case 119: target = n - 1                              // End
+        default:
+            guard let sv = enclosingScrollView else { return }
+            let clip = sv.contentView
+            let ins = clip.contentInsets
+            var vis = clip.documentVisibleRect                // rows actually visible (minus header)
+            vis.origin.y += ins.top
+            vis.size.height -= ins.top + ins.bottom
+            let page = max(1, rows(in: vis).length - 1)       // keep one row of overlap
+            let base = max(0, cur)
+            target = keyCode == 121 ? min(n - 1, base + page) : max(0, base - page)
+        }
+        if target != cur {
+            selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
+        }
+        scrollRowToVisible(target)                            // snap, edge-aligned
     }
 
     /// Snap-scroll (NO smooth animation) so the row lands EXACTLY flush with the
     /// viewport edge. AppKit's keyboard nav uses an animated scroll that can't keep
     /// up with fast auto-repeat — successive animations overlap, so the selection
     /// drifts off the bottom edge and leaves flicker/ghosting during a held key.
+    /// Accounts for the clip view's content insets: the column header FLOATS over
+    /// the inset region, so "top edge" is below the header (not under it).
     override func scrollRowToVisible(_ row: Int) {
         guard row >= 0, row < numberOfRows, let sv = enclosingScrollView else {
             super.scrollRowToVisible(row); return
         }
         let clip = sv.contentView
+        let ins = clip.contentInsets                     // effective (incl. floating header)
         let rowRect = rect(ofRow: row)
         let visible = clip.documentVisibleRect
+        let topEdge = visible.minY + ins.top             // first y NOT covered by the header
+        let bottomEdge = visible.maxY - ins.bottom
         var y = visible.origin.y
-        if rowRect.minY < visible.minY { y = rowRect.minY }                       // pin to top edge
-        else if rowRect.maxY > visible.maxY { y = rowRect.maxY - visible.height } // pin to bottom edge
-        else { return }                                                            // already fully visible
-        y = max(0, min(y, max(0, bounds.height - visible.height)))
-        clip.setBoundsOrigin(NSPoint(x: visible.origin.x, y: y))                   // direct = no animation
+        if rowRect.minY < topEdge { y = rowRect.minY - ins.top }                            // flush under the header
+        else if rowRect.maxY > bottomEdge { y = rowRect.maxY - visible.height + ins.bottom } // flush to the bottom
+        else { return }                                                                      // already fully visible
+        let minY = -ins.top
+        let maxY = max(minY, bounds.height - visible.height + ins.bottom)
+        y = max(minY, min(y, maxY))
+        clip.setBoundsOrigin(NSPoint(x: visible.origin.x, y: y))                             // direct = no animation
         sv.reflectScrolledClipView(clip)
     }
 
@@ -397,8 +437,12 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.textField?.stringValue = date(r.crtime)
                 cell.textField?.textColor = .secondaryLabelColor
             case "path":
-                cell.textField?.stringValue = r.directory
-                cell.textField?.textColor = .secondaryLabelColor
+                if let attr = highlightedDirectory(r.directory) {
+                    cell.textField?.attributedStringValue = attr   // path-scope matches emphasized
+                } else {
+                    cell.textField?.stringValue = r.directory
+                    cell.textField?.textColor = .secondaryLabelColor
+                }
             case "size":
                 if r.isDir {
                     if !r.ext.isEmpty {   // package/bundle (.app, .framework…) → total size, like Finder
@@ -430,6 +474,51 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.textField?.stringValue = ""
             }
             return cell
+        }
+
+        /// Terms to emphasize in the Path column: explicit `path:` tokens always, and
+        /// plain terms when the global scope is full-path (⌃U). Exact mode only.
+        private func pathHighlightTerms() -> [String] {
+            guard model.matchMode == .exact else { return [] }
+            let q = model.query.trimmingCharacters(in: .whitespaces)
+            guard !q.isEmpty else { return [] }
+            var out: [String] = []
+            for tRaw in q.replacingOccurrences(of: "\"", with: "").split(separator: " ").map(String.init) {
+                if tRaw.hasPrefix("-") || tRaw.hasPrefix("!") { continue }        // negations exclude, don't match
+                if tRaw.contains("*") || tRaw.contains("?") || tRaw.isEmpty { continue }
+                if tRaw.lowercased().hasPrefix("path:") {
+                    let b = String(tRaw.dropFirst(5))
+                    if !b.isEmpty { out.append(b) }
+                } else if model.scope == .fullPath, !tRaw.contains(":") {
+                    out.append(tRaw)
+                }
+            }
+            return out
+        }
+
+        /// Accent+bold emphasis of matched terms inside the Path column (same style as
+        /// the name highlight, over the secondary-colored path text). nil = plain render.
+        private func highlightedDirectory(_ dir: String) -> NSAttributedString? {
+            let terms = pathHighlightTerms()
+            guard !terms.isEmpty else { return nil }
+            let attr = NSMutableAttributedString(string: dir, attributes: [
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .font: NSFont.systemFont(ofSize: 12),
+            ])
+            let hl: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.controlAccentColor,
+                .font: NSFont.boldSystemFont(ofSize: 12),
+            ]
+            var found = false
+            for term in terms {
+                var range = dir.startIndex..<dir.endIndex
+                while let r = dir.range(of: term, options: .caseInsensitive, range: range) {
+                    found = true
+                    attr.addAttributes(hl, range: NSRange(r, in: dir))
+                    range = r.upperBound..<dir.endIndex
+                }
+            }
+            return found ? attr : nil
         }
 
         /// Highlight the matched part of the filename (exact substring or fuzzy

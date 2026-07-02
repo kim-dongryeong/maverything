@@ -86,8 +86,14 @@ extension FileIndex {
             guard m == Snapshot.magic, v == Snapshot.version else { return nil }
             let lastEventId: UInt64 = readScalar(raw, &off)
             let savedBits: UInt64 = readScalar(raw, &off)
-            let count = Int(readScalar(raw, &off) as UInt64)
-            let blobLen = Int(readScalar(raw, &off) as UInt64)
+            let countU: UInt64 = readScalar(raw, &off)
+            let blobLenU: UInt64 = readScalar(raw, &off)
+            // Reject corrupt/truncated snapshots BEFORE any memcpy/allocation.
+            guard countU <= 200_000_000, blobLenU <= 8_000_000_000 else { return nil }
+            let count = Int(countU), blobLen = Int(blobLenU)
+            let perEntry = 4 + 2 + 4 + 8 + 8 + 8 + 1 + 4 + 1   // arrays below, bytes/entry
+            let expected = 40 + blobLen * 2 + count * perEntry
+            guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
             lock.lock(); defer { lock.unlock() }
             nameBlob = readArray(raw, &off, blobLen, UInt8.self)

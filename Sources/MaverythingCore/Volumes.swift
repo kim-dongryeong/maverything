@@ -42,12 +42,21 @@ public enum Volumes {
 
     /// Default path prefixes to skip — cloud File Providers (online, slow to
     /// enumerate) and autofs home maps. User-overridable later.
-    public static func defaultExclusions() -> [String] {
+    /// Always-excluded paths, regardless of the cloud toggle (our own snapshot dir
+    /// must be skipped or every save triggers an FSEvents→reconcile→resave loop).
+    public static func alwaysExclusions() -> [String] {
         let home = NSHomeDirectory()
         return [
+            home + "/Library/Application Support/Maverything",  // our snapshot store
+            "/System/Volumes/Data/home",                       // autofs automount
+        ]
+    }
+
+    public static func defaultExclusions() -> [String] {
+        let home = NSHomeDirectory()
+        return alwaysExclusions() + [
             home + "/Library/CloudStorage",       // Google Drive, OneDrive, Dropbox, Box…
             home + "/Library/Mobile Documents",   // iCloud Drive
-            "/System/Volumes/Data/home",          // autofs automount
         ]
         // Note: /Volumes and cross-volume mounts are handled by the fsid guard,
         // not by path exclusion (so explicit /Volumes/* roots still crawl fully).

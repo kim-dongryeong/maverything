@@ -37,6 +37,11 @@ public final class FileIndex: @unchecked Sendable {
     /// also takes this lock around its scan so a live delta never tears a read.
     let lock = NSLock()
 
+    /// Bumped on every clear() so an in-flight reconcile from a previous crawl
+    /// generation can detect it's stale and no-op instead of corrupting the fresh index.
+    private var epochValue = 0
+    public func currentEpoch() -> Int { lock.lock(); defer { lock.unlock() }; return epochValue }
+
     public init() {}
 
     public var count: Int { nameOff.count }
@@ -55,6 +60,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Empties the index (for a full re-crawl).
     public func clear() {
         lock.lock(); defer { lock.unlock() }
+        epochValue &+= 1   // invalidate any in-flight reconcile captured before this
         nameBlob.removeAll(keepingCapacity: false)
         foldBlob.removeAll(keepingCapacity: false)
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
@@ -227,9 +233,11 @@ public final class FileIndex: @unchecked Sendable {
 
     /// Diffs a directory's freshly-listed children against the index and applies
     /// adds / removes / attribute updates atomically. Returns what changed.
-    func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry]) -> ReconcileResult {
+    func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry],
+                      expectedEpoch: Int) -> ReconcileResult {
         lock.lock(); defer { lock.unlock() }
         var res = ReconcileResult()
+        guard epochValue == expectedEpoch else { return res }   // stale reconcile from a prior crawl
         let di = Int(dirIdx)
         guard di < deleted.count, !deleted[di] else { return res }
 

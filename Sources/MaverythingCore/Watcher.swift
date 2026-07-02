@@ -88,6 +88,7 @@ public final class Reconciler: @unchecked Sendable {
     /// Reconcile the dirty directories implied by these event paths. Returns the
     /// aggregate change set; `.didMutate` tells the caller whether to refresh.
     public func reconcile(eventPaths: [String]) -> ReconcileResult {
+        let epoch = index.currentEpoch()   // if a reindex clears the index mid-reconcile, we no-op
         var work: [String] = []
         var seen = Set<String>()
         func enqueue(_ d: String) { if seen.insert(d).inserted { work.append(d) } }
@@ -107,7 +108,7 @@ public final class Reconciler: @unchecked Sendable {
             if isExcluded(d) { continue }
             guard let di = index.liveDirIndex(forDisplayPath: d) else { continue }
             guard let current = FileEnumerator.listDirectory(d) else { continue } // vanished
-            let r = index.applyDirDiff(dirIdx: di, displayPath: d, current: current)
+            let r = index.applyDirDiff(dirIdx: di, displayPath: d, current: current, expectedEpoch: epoch)
             total.added += r.added; total.removed += r.removed; total.changed += r.changed
             for nd in r.newDirs where !isExcluded(nd.path) {   // recurse into new subtrees
                 if seen.insert(nd.path).inserted { work.append(nd.path) }

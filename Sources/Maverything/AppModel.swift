@@ -118,7 +118,8 @@ final class AppModel: ObservableObject {
     /// Path prefixes to skip. Cloud File Providers are excluded unless the user
     /// opts in; the autofs home map is always skipped.
     private func currentExclusions() -> [String] {
-        if includeCloud { return ["/System/Volumes/Data/home"] }
+        // always skip our own snapshot dir + autofs; cloud only when not opted in
+        if includeCloud { return Volumes.alwaysExclusions() }
         return Volumes.defaultExclusions()
     }
 
@@ -193,12 +194,17 @@ final class AppModel: ObservableObject {
         indexQueue.async { [weak self] in
             guard let self else { return }
             let en = FileEnumerator(index: self.index)
-            DispatchQueue.main.sync {
-                guard gen == self.indexGen else { return }
+            let proceed: Bool = DispatchQueue.main.sync {
+                guard gen == self.indexGen else { return false }
                 self.index.clear()
                 self.index.reserveCapacity(3_000_000)
                 self.currentEnumerator = en
+                return true
             }
+            guard proceed else { return }   // superseded before we started — don't run the crawl
+            // Capture the FSEvents cursor BEFORE crawling so changes made during the
+            // crawl are replayed once the stream starts (not lost).
+            let sinceId = FSEventsGetCurrentEventId()
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
                                  mountPoints: Volumes.allMountPoints())
             if en.isCancelled { return }                     // superseded; skip extra work
@@ -218,7 +224,7 @@ final class AppModel: ObservableObject {
                 self.engine.invalidate()
                 Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(stats.seconds)s (\(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
-                self.startWatching(roots: roots, exclude: exclude)
+                self.startWatching(roots: roots, exclude: exclude, sinceWhen: sinceId)
                 self.saveSnapshot()   // so the next launch is instant
             }
         }

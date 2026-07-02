@@ -66,6 +66,16 @@ enum TypeFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// A user-saved search: the query plus the modes it was captured with.
+struct SavedSearch: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var query: String
+    var matchMode: Int
+    var typeFilter: String
+    var scope: Int
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var query = ""
@@ -80,6 +90,8 @@ final class AppModel: ObservableObject {
     @Published var scope: SearchScope = .nameOnly
     @Published var matchMode: MatchMode = .exact
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
+    @Published var recentQueries: [String] = AppModel.loadRecents()
+    @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
     @Published var isIndexing = true
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
@@ -393,6 +405,70 @@ final class AppModel: ObservableObject {
         if c.isEmpty { return query }
         let q = query.trimmingCharacters(in: .whitespaces)
         return q.isEmpty ? c : c + " " + q
+    }
+
+    // MARK: - recent queries & saved searches
+
+    private static let recentsKey = "mv.recentQueries"
+    private static let savedKey = "mv.savedSearches"
+    private static func loadRecents() -> [String] {
+        UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
+    }
+    private static func loadSaved() -> [SavedSearch] {
+        guard let data = UserDefaults.standard.data(forKey: savedKey),
+              let arr = try? JSONDecoder().decode([SavedSearch].self, from: data) else { return [] }
+        return arr
+    }
+
+    /// Record a query the user actually committed (Enter / opened a result).
+    func recordRecentQuery(_ raw: String) {
+        let q = raw.trimmingCharacters(in: .whitespaces)
+        guard q.count >= 2 else { return }
+        recentQueries.removeAll { $0.caseInsensitiveCompare(q) == .orderedSame }
+        recentQueries.insert(q, at: 0)
+        if recentQueries.count > 15 { recentQueries.removeLast(recentQueries.count - 15) }
+        UserDefaults.standard.set(recentQueries, forKey: Self.recentsKey)
+    }
+
+    func clearRecents() {
+        recentQueries.removeAll()
+        UserDefaults.standard.removeObject(forKey: Self.recentsKey)
+    }
+
+    /// Apply a recent/saved query and run it.
+    func applyQuery(_ q: String) {
+        query = q
+        focusNonce &+= 1   // keep focus on the search field
+    }
+
+    func saveCurrentSearch(name: String) {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        let s = SavedSearch(name: n, query: q, matchMode: matchMode.rawValue,
+                            typeFilter: typeFilter.rawValue, scope: scope.rawValue)
+        savedSearches.removeAll { $0.name.caseInsensitiveCompare(n) == .orderedSame }
+        savedSearches.append(s)
+        persistSaved()
+    }
+
+    func applySaved(_ s: SavedSearch) {
+        matchMode = MatchMode(rawValue: s.matchMode) ?? .exact
+        typeFilter = TypeFilter(rawValue: s.typeFilter) ?? .all
+        scope = SearchScope(rawValue: s.scope) ?? .nameOnly
+        query = s.query
+        focusNonce &+= 1
+    }
+
+    func deleteSaved(_ s: SavedSearch) {
+        savedSearches.removeAll { $0.id == s.id }
+        persistSaved()
+    }
+
+    private func persistSaved() {
+        if let data = try? JSONEncoder().encode(savedSearches) {
+            UserDefaults.standard.set(data, forKey: Self.savedKey)
+        }
     }
 
     func runSearch() {

@@ -61,6 +61,10 @@ struct ContentView: View {
                 .onKeyPress(.downArrow) {                 // ↓ moves focus into the results
                     model.focusResultsNonce &+= 1; return .handled
                 }
+                .onSubmit {                               // Enter: remember the query, jump to results
+                    model.recordRecentQuery(model.query)
+                    model.focusResultsNonce &+= 1
+                }
                 .onExitCommand {                         // ESC: clear, then dismiss
                     if model.query.isEmpty { model.requestHide?() } else { model.query = "" }
                 }
@@ -70,6 +74,9 @@ struct ContentView: View {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }.buttonStyle(.plain)
             }
+
+            HistoryMenu(model: model)
+            BookmarksMenu(model: model)
 
             Picker("", selection: $model.matchMode) {
                 ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }

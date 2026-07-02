@@ -6,14 +6,20 @@ struct FilterBar: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(TypeFilter.allCases) { chip($0) }
+        HStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(TypeFilter.allCases) { chip($0) }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .scrollBounceBehavior(.basedOnSize)
+
+            SyntaxHelpButton()
+                .padding(.trailing, 12)
+                .padding(.leading, 4)
         }
-        .scrollBounceBehavior(.basedOnSize)
     }
 
     private func chip(_ f: TypeFilter) -> some View {

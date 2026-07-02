@@ -18,8 +18,9 @@ final class MVTableView: NSTableView {
             coordinator?.model.lastNavAt = ProcessInfo.processInfo.systemUptime
         default: break
         }
-        if event.keyCode == 8, mods == [.command] || mods == [.command, .option] {  // ⌘C / ⌘⌥C → copy path
-            coordinator?.copyPath(); return
+        if event.keyCode == 8 {                                 // C
+            if mods == [.command] { coordinator?.copyFile(); return }          // ⌘C  → copy the file(s), Finder-style
+            if mods == [.command, .option] { coordinator?.copyPath(); return } // ⌘⌥C → copy pathname
         }
         if mods == [.command], event.keyCode == 15 {           // ⌘R → reveal in Finder
             coordinator?.revealItem(); return
@@ -152,9 +153,9 @@ struct ResultsTableView: NSViewRepresentable {
         menu.addItem(.separator())
         add("Reveal in Finder", #selector(Coordinator.revealItem), key: "r", mask: [.command])
         menu.addItem(.separator())
-        add("Copy Path", #selector(Coordinator.copyPath), key: "c", mask: [.command, .option])
+        add("Copy", #selector(Coordinator.copyFile), key: "c", mask: [.command])
+        add("Copy as Pathname", #selector(Coordinator.copyPath), key: "c", mask: [.command, .option])
         add("Copy Name", #selector(Coordinator.copyName))
-        add("Copy File", #selector(Coordinator.copyFile))
         menu.addItem(.separator())
         add("Move to Trash", #selector(Coordinator.moveToTrash),
             key: String(UnicodeScalar(NSDeleteCharacter)!), mask: [.command])
@@ -473,7 +474,9 @@ struct ResultsTableView: NSViewRepresentable {
         @objc func doubleClicked() { openItem() }
 
         @objc func openItem() {
-            for p in selectedPaths() { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
+            let paths = selectedPaths()
+            if !paths.isEmpty { model.recordRecentQuery(model.query) }
+            for p in paths { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
         }
 
         @objc func revealItem() {

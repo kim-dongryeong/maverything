@@ -10,13 +10,23 @@ import MaverythingCore
 let now = Date().timeIntervalSince1970
 let root = (CommandLine.arguments.count > 1 ? CommandLine.arguments[1]
             : NSTemporaryDirectory() + "mvsim-tree-\(getpid())")
+let dynamicRoot = NSTemporaryDirectory() + "mvsim-dynamic-volume-\(getpid())"
 let fm = FileManager.default
 try? fm.removeItem(atPath: root)
+try? fm.removeItem(atPath: dynamicRoot)
 
 // ---- tree builders ----
 func mkdir(_ p: String) { try? fm.createDirectory(atPath: p, withIntermediateDirectories: true) }
 func write(_ rel: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
     let p = root + "/" + rel
+    mkdir((p as NSString).deletingLastPathComponent)
+    FileManager.default.createFile(atPath: p, contents: Data(count: bytes))
+    if let m = mtime {
+        var tv = [timeval(tv_sec: Int(m), tv_usec: 0), timeval(tv_sec: Int(m), tv_usec: 0)]
+        _ = utimes(p, &tv)
+    }
+}
+func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
     mkdir((p as NSString).deletingLastPathComponent)
     FileManager.default.createFile(atPath: p, contents: Data(count: bytes))
     if let m = mtime {
@@ -39,8 +49,13 @@ write("data/big.bin", bytes: 5 * 1_048_576, mtime: oldTime)
 write("data/tiny.txt", bytes: 10)
 write("intl/한글파일.txt", bytes: 30)                   // unicode
 write("intl/café.md", bytes: 30)
+write("intl/CAFÉ.txt", bytes: 30)
 write("src/a/b/c/d/leaf.txt", bytes: 5)                // deep nesting
 write(".hidden/.secret.txt", bytes: 5)                 // hidden
+// path-column sort fixture (OQ1A): basename order and full-path order DISAGREE here —
+// by name apple<zebra, but by path adir/…<zdir/…, so the two files swap order.
+write("zdir/marker_apple.txt", bytes: 8)
+write("adir/marker_zebra.txt", bytes: 8)
 
 // ---- index ----
 let index = FileIndex()
@@ -110,11 +125,50 @@ check("name: plain term ignores parent dir name", !has("data", "leaf.txt"))
 
 // unicode (ASCII-fold leaves non-ASCII intact; substring still works)
 check("unicode: '한글' finds 한글파일.txt", has("한글", "한글파일.txt"))
+check("unicode-fold: 'café' finds CAFÉ.txt", has("café", "CAFÉ.txt"))
+check("unicode-fold: 'cafe' finds CAFÉ.txt", has("cafe", "CAFÉ.txt"))
+check("unicode-fold: uppercase accented query finds café.md", has("CAFÉ", "café.md"))
+check("unicode-fold: path:cafe finds CAFÉ.txt via folded path", has("path:cafe", "CAFÉ.txt"))
 
 // relevance sort sanity (fuzzy: exact-ish beats scattered)
 let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now: now).ids.map { index.name(Int($0)) }
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
+
+// relevance top-K parity checks
+let relFull = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 1000, now: now).ids
+let relLimit1 = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 1, now: now).ids
+check("relevance top-K: limit 1 matches first of full search",
+      relLimit1.first == relFull.first)
+
+let relAscending = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: true, limit: 1000, now: now).ids
+let relAscLimit2 = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: true, limit: 2, now: now).ids
+check("relevance top-K: ascending limit 2 matches prefix of ascending full",
+      Array(relAscending.prefix(2)) == relAscLimit2)
+
+let relDescFull = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 1000, now: now).ids
+let relDescLimit3 = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 3, now: now).ids
+check("relevance top-K: descending limit 3 matches prefix of descending full",
+      Array(relDescFull.prefix(3)) == relDescLimit3)
+
+let relAllLimitMatches = (1...min(5, relFull.count)).allSatisfy { lim in
+    let limIds = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: lim, now: now).ids
+    return limIds == Array(relFull.prefix(lim))
+}
+check("relevance top-K: any limit matches prefix of full search", relAllLimitMatches)
+
+// path-column sort (OQ1A): the "Path" header must sort by true folded full path,
+// NOT by basename. The fixture is built so the two orders provably disagree.
+let byName = names("marker", sort: .name)
+let byPath = names("marker", sort: .path)              // exact single-term → fastExact + orderArray(.path)
+check("path-sort: name order is [apple, zebra]",
+      byName == ["marker_apple.txt", "marker_zebra.txt"], byName.joined(separator: ","))
+check("path-sort: path order is [zebra, apple] (adir < zdir)",
+      byPath == ["marker_zebra.txt", "marker_apple.txt"], byPath.joined(separator: ","))
+check("path-sort: path order differs from name order", byName != byPath)
+let byPathGeneral = names("marker ext:txt", sort: .path)   // filter present → general evaluator path
+check("path-sort: general evaluator honors path order too",
+      byPathGeneral == ["marker_zebra.txt", "marker_apple.txt"], byPathGeneral.joined(separator: ","))
 
 // negated filters (review #2)
 check("NOT-filter: '-ext:png' excludes images", !has("image -ext:png", "image_001.png"))
@@ -222,6 +276,21 @@ try? fm.removeItem(atPath: root + "/selfheal_x.txt")
 _ = rec.reconcile(eventPaths: [root])          // again NO invalidate()
 check("mutationGen: deleted file gone w/o explicit invalidate()", !has("selfheal_x", "selfheal_x.txt"))
 
+// dynamic mount lifecycle: a new crawl root can be appended after launch, then tombstoned
+// as one subtree on unmount. Both operations must self-invalidate search caches.
+mkdir(dynamicRoot)
+writeAbs(dynamicRoot + "/mounted_alpha.txt", bytes: 13, mtime: now)
+writeAbs(dynamicRoot + "/nested/mounted_beta.txt", bytes: 17, mtime: now)
+let mountStats = FileEnumerator(index: index).crawl(roots: [dynamicRoot])
+index.buildLiveIndexes()
+check("dynamic mount: new root crawled after launch", mountStats.total >= 3 && has("mounted_alpha", "mounted_alpha.txt"))
+check("dynamic mount: nested content indexed", has("mounted_beta", "mounted_beta.txt"))
+let removedDynamic = index.markDeletedSubtree(displayPath: dynamicRoot)
+check("dynamic unmount: tombstones whole mounted root",
+      removedDynamic >= 3 && !has("mounted_alpha", "mounted_alpha.txt") && !has("mounted_beta", "mounted_beta.txt"),
+      "removed=\(removedDynamic)")
+check("dynamic unmount: root dir lookup removed", index.dirIndex(forPath: dynamicRoot) == nil)
+
 // ---- snapshot round-trip ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
 let idx2 = FileIndex()
@@ -230,6 +299,84 @@ let e2 = SearchEngine(index: idx2)
 check("snapshot: lastEventId preserved", meta?.lastEventId == 777)
 check("snapshot: 'png' count survives round-trip",
       e2.search("png", limit: 10_000, now: now).total == engine.search("png", limit: 10_000, now: now).total)
+check("snapshot: Unicode fold survives round-trip",
+      e2.search("cafe", limit: 10_000, now: now).ids.map { idx2.name(Int($0)) }.contains("CAFÉ.txt"))
+
+// ---- v4 → v5 backward-compat (nameOff widened UInt32 → UInt64) ----
+// Synthesize a legacy v4 blob (4-byte nameOff) from the current v5 blob by
+// flipping the version byte and narrowing the nameOff array, then confirm the
+// migration read path in loadSnapshot reconstructs identical results.
+let v4blob: Data = {
+    var b = [UInt8](blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
+    b[4] = 4; b[5] = 0; b[6] = 0; b[7] = 0                  // version 5 → 4 (little-endian UInt32)
+    let nameOffStart = 48 + blobLen*2 + uBlobLen
+    var out = Array(b[0..<nameOffStart])
+    for i in 0..<count {                                     // UInt64 LE → UInt32 LE (low 4 bytes)
+        let base = nameOffStart + i*8
+        out.append(contentsOf: b[base..<base+4])
+    }
+    out.append(contentsOf: b[(nameOffStart + count*8)...])
+    return Data(out)
+}()
+let idx4 = FileIndex()
+let meta4 = idx4.loadSnapshot(v4blob); idx4.buildLiveIndexes()
+let e4 = SearchEngine(index: idx4)
+check("snapshot v4→v5: legacy version accepted", meta4?.lastEventId == 777)
+check("snapshot v4→v5: 'png' count matches",
+      meta4 != nil && e4.search("png", limit: 10_000, now: now).total == engine.search("png", limit: 10_000, now: now).total)
+check("snapshot v4→v5: Unicode fold survives migration",
+      e4.search("cafe", limit: 10_000, now: now).ids.map { idx4.name(Int($0)) }.contains("CAFÉ.txt"))
+check("snapshot v4→v5: path-scope search intact after migration",
+      e4.search("png", limit: 10_000, now: now).total > 0
+      && e4.search("png", limit: 10_000, now: now).total == e2.search("png", limit: 10_000, now: now).total)
+
+let shortV4 = Data(v4blob.dropLast())
+let shortV4Idx = FileIndex()
+check("snapshot v4→v5: truncated legacy blob rejects",
+      shortV4Idx.loadSnapshot(shortV4) == nil && shortV4Idx.count == 0)
+
+let corruptV4: Data = {
+    var b = [UInt8](v4blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
+    if count > 0 {
+        let nameOffStart = 48 + blobLen*2 + uBlobLen
+        b[nameOffStart] = 0xff; b[nameOffStart + 1] = 0xff
+        b[nameOffStart + 2] = 0xff; b[nameOffStart + 3] = 0xff
+    }
+    return Data(b)
+}()
+let corruptV4Idx = FileIndex()
+_ = corruptV4Idx.appendRoot(path: "/sentinel")
+let corruptBefore = corruptV4Idx.count
+check("snapshot v4→v5: corrupt offsets reject without replacing index",
+      corruptV4Idx.loadSnapshot(corruptV4) == nil
+      && corruptV4Idx.count == corruptBefore
+      && corruptV4Idx.name(0) == "/sentinel")
+
+// v5-NATIVE rejection (regression guards for the Int-conversion trap fixed in f4ab553):
+// (a) truncated v5 must reject via the expected-length math, index untouched
+let shortV5 = Data(blob.dropLast())
+let shortV5Idx = FileIndex()
+check("snapshot v5: truncated blob rejects without touching index",
+      shortV5Idx.loadSnapshot(shortV5) == nil && shortV5Idx.count == 0)
+// (b) corrupt v5 with a huge 8-byte nameOff (>= 2^63) must reject, NOT trap on Int()
+let corruptV5: Data = {
+    var b = [UInt8](blob)
+    func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+    let blobLen = rdU64(32), uBlobLen = rdU64(40)
+    let nameOffStart = 48 + blobLen*2 + uBlobLen
+    for j in 0..<8 { b[nameOffStart + j] = 0xff }            // nameOff[0] = UInt64.max
+    return Data(b)
+}()
+let corruptV5Idx = FileIndex()
+_ = corruptV5Idx.appendRoot(path: "/sentinel5")
+check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
+      corruptV5Idx.loadSnapshot(corruptV5) == nil
+      && corruptV5Idx.count == 1
+      && corruptV5Idx.name(0) == "/sentinel5")
 
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]
@@ -259,4 +406,5 @@ try? md.write(toFile: reportPath, atomically: true, encoding: .utf8)
 print("report -> \(reportPath)")
 
 try? fm.removeItem(atPath: root)
+try? fm.removeItem(atPath: dynamicRoot)
 exit(failed == 0 ? 0 : 1)

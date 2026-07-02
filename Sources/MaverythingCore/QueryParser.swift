@@ -70,7 +70,7 @@ public enum QueryParser {
             let scope: TermScope = low.hasPrefix("name:") ? .name : (low.hasPrefix("path:") ? .path : defaultScope)
             let body = stripScopePrefix(tok).precomposedStringWithCanonicalMapping  // NFC to match index
             if body.isEmpty { continue }
-            let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
+            let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
             q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: scope))
         }
         return q
@@ -139,7 +139,7 @@ public enum QueryParser {
     private static func appendNameTerm(_ val: String, negated: Bool, into q: inout ParsedQuery) {
         let body = val.precomposedStringWithCanonicalMapping
         guard !body.isEmpty else { return }
-        let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
+        let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
         q.terms.append(QueryTerm(bytes: bytes, negated: negated, scope: .name))
     }
 

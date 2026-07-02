@@ -11,11 +11,17 @@ import Foundation
 /// Root entries (the crawl roots, e.g. "/" or "/Users/me") have `parent == -1`
 /// and store their *absolute path* as their name.
 public final class FileIndex: @unchecked Sendable {
-    // Packed name storage. `nameOff[i] ..< nameOff[i]+nameLen[i]` indexes both blobs.
+    // Packed name storage. `nameOff[i] ..< nameOff[i]+nameLen[i]` indexes the
+    // original and ASCII-folded blobs. Non-ASCII names additionally get a
+    // case/diacritic-insensitive search fold with independent offsets because
+    // Unicode folding can change the UTF-8 byte length (e.g. CAFÉ -> cafe).
     public internal(set) var nameBlob: [UInt8] = []   // original UTF-8 bytes
     public internal(set) var foldBlob: [UInt8] = []   // ASCII-lowercased shadow (same offsets)
-    public internal(set) var nameOff: [UInt32] = []
+    public internal(set) var unicodeFoldBlob: [UInt8] = []
+    public internal(set) var nameOff: [UInt64] = []
     public internal(set) var nameLen: [UInt16] = []
+    public internal(set) var unicodeFoldOff: [UInt64] = []
+    public internal(set) var unicodeFoldLen: [UInt32] = []
 
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
@@ -94,7 +100,9 @@ public final class FileIndex: @unchecked Sendable {
         epochValue &+= 1   // invalidate any in-flight reconcile captured before this
         nameBlob.removeAll(keepingCapacity: false)
         foldBlob.removeAll(keepingCapacity: false)
+        unicodeFoldBlob.removeAll(keepingCapacity: false)
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
+        unicodeFoldOff.removeAll(keepingCapacity: false); unicodeFoldLen.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
@@ -107,6 +115,7 @@ public final class FileIndex: @unchecked Sendable {
     public func reserveCapacity(_ n: Int) {
         wrlock(); defer { unlock() }   // reallocation must not race a concurrent reader
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
+        unicodeFoldOff.reserveCapacity(n); unicodeFoldLen.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
         crtime.reserveCapacity(n)
         objType.reserveCapacity(n); flags.reserveCapacity(n); hidden.reserveCapacity(n)
@@ -123,10 +132,12 @@ public final class FileIndex: @unchecked Sendable {
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt32(nameBlob.count))
+        nameOff.append(UInt64(nameBlob.count))
         nameLen.append(UInt16(bytes.count))
         nameBlob.append(contentsOf: bytes)
         foldBlob.append(contentsOf: bytes.map(asciiLower))
+        appendUnicodeFoldStorage(for: bytes, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(-1)
         size.append(0); mtime.append(0); crtime.append(0)
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
@@ -142,11 +153,17 @@ public final class FileIndex: @unchecked Sendable {
         wrlock(); defer { unlock() }
         bumpMut()
         let base = Int32(nameOff.count)
-        let blobBase = UInt32(nameBlob.count)
+        let blobBase = UInt64(nameBlob.count)
+        let unicodeBlobBase = UInt64(unicodeFoldBlob.count)
         nameBlob.append(contentsOf: batch.blob)
         foldBlob.append(contentsOf: batch.fold)
-        for o in batch.off { nameOff.append(o &+ blobBase) }
+        unicodeFoldBlob.append(contentsOf: batch.unicodeFoldBlob)
+        for o in batch.off { nameOff.append(checkedBlobOffset(o, adding: blobBase)) }
         nameLen.append(contentsOf: batch.len)
+        for o in batch.unicodeFoldOff {
+            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : checkedBlobOffset(o, adding: unicodeBlobBase))
+        }
+        unicodeFoldLen.append(contentsOf: batch.unicodeFoldLen)
         size.append(contentsOf: batch.size)
         mtime.append(contentsOf: batch.mtime)
         crtime.append(contentsOf: batch.crtime)
@@ -296,6 +313,55 @@ public final class FileIndex: @unchecked Sendable {
         return i
     }
 
+    /// Tombstone a mounted root (or any indexed directory subtree) by display path.
+    /// Used when a volume disappears after launch; returns the number of live rows removed.
+    @discardableResult
+    public func markDeletedSubtree(displayPath rawPath: String) -> Int {
+        wrlock(); defer { unlock() }
+        let p = rawPath.precomposedStringWithCanonicalMapping
+        guard let idx = dirIndexByPath[p], !deleted[Int(idx)] else { return 0 }
+        let removed = _markDeletedSubtree(idx)
+        if removed > 0 { bumpMut() }
+        return removed
+    }
+
+    /// Tombstone any CHILD-STUB copy of a mounted volume's path — an entry for the same
+    /// display path indexed as a child of its parent dir (e.g. /Volumes) by a reconciler
+    /// racing the mount — while keeping the appended ROOT copy (parent == -1). Re-points
+    /// dirIndexByPath at the root copy. Returns rows tombstoned.
+    @discardableResult
+    public func tombstoneChildStubCopies(ofRootPath rawPath: String) -> Int {
+        wrlock(); defer { unlock() }
+        let p = rawPath.precomposedStringWithCanonicalMapping
+        let parentPath = p.contains("/") && p != "/"
+            ? (String(p[..<(p.lastIndex(of: "/")!)]).isEmpty ? "/" : String(p[..<(p.lastIndex(of: "/")!)]))
+            : "/"
+        let lastName = (p as NSString).lastPathComponent
+        var removed = 0
+        // The stub lives under the parent dir's children; the root copy has parent == -1.
+        if let pi = dirIndexByPath[parentPath], !deleted[Int(pi)], let kids = childrenOf[pi] {
+            for k in kids where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
+                removed += _markDeletedSubtree(k)
+            }
+        }
+        // Ensure the path resolves to the surviving root copy for future reconciles.
+        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] && _name(i) == p {
+            dirIndexByPath[p] = Int32(i)
+            break
+        }
+        if removed > 0 { bumpMut() }
+        return removed
+    }
+
+    /// Display paths of all live crawl roots (`parent == -1`, not tombstoned) — used to
+    /// detect roots that vanished while the app was not running.
+    public func liveRootPaths() -> [String] {
+        rdlock(); defer { unlock() }
+        var out: [String] = []
+        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] { out.append(_name(i)) }
+        return out
+    }
+
     /// Diffs a directory's freshly-listed children against the index and applies
     /// adds / removes / attribute updates atomically. Returns what changed.
     func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry],
@@ -354,21 +420,26 @@ public final class FileIndex: @unchecked Sendable {
     private func _appendOne(parent p: Int32, name: [UInt8], size s: Int64, mtime mt: Int64,
                             crtime ct: Int64, objType t: UInt8, flags f: UInt32) -> Int32 {
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt32(nameBlob.count)); nameLen.append(UInt16(name.count))
+        nameOff.append(UInt64(nameBlob.count)); nameLen.append(UInt16(name.count))
         nameBlob.append(contentsOf: name)
         for b in name { foldBlob.append(asciiLower(b)) }
+        appendUnicodeFoldStorage(for: name, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(p); size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         hidden.append((name.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0)
         deleted.append(false)
         return idx
     }
 
-    private func _markDeletedSubtree(_ idx: Int32) {
+    @discardableResult
+    private func _markDeletedSubtree(_ idx: Int32) -> Int {
+        var removed = 0
         var stack = [idx]
         while let cur = stack.popLast() {
             let c = Int(cur)
             if deleted[c] { continue }
             deleted[c] = true
+            removed += 1
             // Drop the path→id mapping so it can't leak for the whole session on high churn
             // (e.g. repeatedly deleted node_modules/build dirs). Guard on identity so we never
             // remove a same-path entry that was just re-created (file→dir flip re-adds after this).
@@ -378,6 +449,7 @@ public final class FileIndex: @unchecked Sendable {
             }
             if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
         }
+        return removed
     }
 }
 
@@ -407,8 +479,58 @@ public let VNODE_VREG: UInt8 = 1
 public let VNODE_VDIR: UInt8 = 2
 public let VNODE_VLNK: UInt8 = 5
 
+let noUnicodeFoldOffset = UInt64.max
+private let searchFoldLocale = Locale(identifier: "en_US_POSIX")
+
+@inline(__always) private func checkedBlobOffset(_ local: UInt64, adding base: UInt64) -> UInt64 {
+    let (offset, overflow) = local.addingReportingOverflow(base)
+    if overflow { fatalError("Maverything name blob offset overflow") }
+    return offset
+}
+
 @inline(__always) func asciiLower(_ b: UInt8) -> UInt8 {
     (b >= 65 && b <= 90) ? b &+ 32 : b
+}
+
+@inline(__always) func containsNonASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+    for b in bytes where b >= 0x80 { return true }
+    return false
+}
+
+func searchFoldedBytes(_ s: String) -> [UInt8] {
+    let nfc = s.precomposedStringWithCanonicalMapping
+    var ascii = true
+    for b in nfc.utf8 where b >= 0x80 { ascii = false; break }
+    if ascii { return Array(nfc.utf8).map(asciiLower) }
+    let folded = nfc.folding(options: [.caseInsensitive, .diacriticInsensitive],
+                             locale: searchFoldLocale)
+        .precomposedStringWithCanonicalMapping
+    return Array(folded.utf8)
+}
+
+func unicodeSearchFoldBytes(_ bytes: UnsafeBufferPointer<UInt8>) -> [UInt8] {
+    let s = String(decoding: bytes, as: UTF8.self)
+    return searchFoldedBytes(s)
+}
+
+func appendUnicodeFoldStorage(for bytes: [UInt8], blob: inout [UInt8],
+                              off: inout [UInt64], len: inout [UInt32]) {
+    bytes.withUnsafeBufferPointer { bp in
+        appendUnicodeFoldStorage(for: bp, blob: &blob, off: &off, len: &len)
+    }
+}
+
+func appendUnicodeFoldStorage(for bytes: UnsafeBufferPointer<UInt8>, blob: inout [UInt8],
+                              off: inout [UInt64], len: inout [UInt32]) {
+    guard containsNonASCII(bytes) else {
+        off.append(noUnicodeFoldOffset)
+        len.append(0)
+        return
+    }
+    let folded = unicodeSearchFoldBytes(bytes)
+    off.append(UInt64(blob.count))
+    len.append(UInt32(folded.count))
+    blob.append(contentsOf: folded)
 }
 
 /// Canonicalize a filename to NFC. macOS/APFS often returns decomposed (NFD)
@@ -429,8 +551,11 @@ public let VNODE_VLNK: UInt8 = 5
 struct ChildBatch {
     var blob: [UInt8] = []
     var fold: [UInt8] = []
-    var off: [UInt32] = []
+    var unicodeFoldBlob: [UInt8] = []
+    var off: [UInt64] = []
     var len: [UInt16] = []
+    var unicodeFoldOff: [UInt64] = []
+    var unicodeFoldLen: [UInt32] = []
     var size: [Int64] = []
     var mtime: [Int64] = []
     var crtime: [Int64] = []
@@ -456,10 +581,12 @@ struct ChildBatch {
     private mutating func appendName(_ nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
                                      crtime ct: Int64, objType t: UInt8, flags f: UInt32) {
         let localIdx = Int32(len.count)
-        off.append(UInt32(blob.count))
+        off.append(UInt64(blob.count))
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
         for b in nameBytes { fold.append(asciiLower(b)) }
+        appendUnicodeFoldStorage(for: nameBytes, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         let isHidden = (nameBytes.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0
         hidden.append(isHidden)

@@ -9,8 +9,8 @@ import Foundation
 public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "maverything.fsevents")
-    // onBatch(dirtyPaths, mustScanAll, batchMaxEventId)
-    fileprivate var onBatch: (([String], Bool, UInt64) -> Void)?
+    // onBatch(dirtyPaths, mustReindexAll, rootChanged, batchMaxEventId)
+    fileprivate var onBatch: (([String], Bool, Bool, UInt64) -> Void)?
     private let eventIdLock = NSLock()
     // The resume cursor we PERSIST. Critically it advances only when a batch's changes
     // have actually been APPLIED to the index (via markApplied), never merely on delivery —
@@ -27,11 +27,11 @@ public final class FSWatcher: @unchecked Sendable {
 
     public init() {}
 
-    /// Start watching. `onBatch(dirtyPaths, mustScanAll, batchMaxId)` runs on a private
-    /// queue. `sinceWhen` resumes from a persisted (already-applied) event id.
+    /// Start watching. `onBatch(dirtyPaths, mustScanAll, rootChanged, batchMaxId)` runs on
+    /// a private queue. `sinceWhen` resumes from a persisted (already-applied) event id.
     public func start(paths: [String], latency: Double = 0.3,
                       sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow),
-                      onBatch: @escaping ([String], Bool, UInt64) -> Void) {
+                      onBatch: @escaping ([String], Bool, Bool, UInt64) -> Void) {
         stop()
         self.onBatch = onBatch
         var ctx = FSEventStreamContext(version: 0,
@@ -67,6 +67,7 @@ public final class FSWatcher: @unchecked Sendable {
     fileprivate func deliver(paths: [String], flags: UnsafePointer<FSEventStreamEventFlags>,
                              ids: UnsafePointer<FSEventStreamEventId>, count: Int) {
         var mustScanAll = false
+        var rootChanged = false
         var batchMax: UInt64 = 0
         for i in 0..<count {
             let f = Int(flags[i])
@@ -75,9 +76,14 @@ public final class FSWatcher: @unchecked Sendable {
                     | kFSEventStreamEventFlagKernelDropped) != 0 {
                 mustScanAll = true
             }
+            // RootChanged is delivered SEPARATELY: with WatchRoot set, every volume unplug
+            // fires it (the watched mount dir vanishes). Folding it into mustScanAll made
+            // each unplug trigger a full multi-minute reindex, defeating the graceful
+            // unmount tombstone path — the app decides how to route it instead.
+            if f & kFSEventStreamEventFlagRootChanged != 0 { rootChanged = true }
             if ids[i] > batchMax { batchMax = ids[i] }
         }
-        onBatch?(paths, mustScanAll, batchMax)
+        onBatch?(paths, mustScanAll, rootChanged, batchMax)
     }
 }
 
@@ -98,17 +104,22 @@ private func mvFSCallback(stream: ConstFSEventStreamRef,
 public final class Reconciler: @unchecked Sendable {
     private let index: FileIndex
     private let exclude: [String]
-    private let mountPoints: Set<String>   // other volumes' mounts — each is its OWN crawl root
+    private let baseMountPoints: Set<String>   // other volumes' mounts — each is its OWN crawl root
 
     public init(index: FileIndex, exclude: [String], mountPoints: Set<String> = []) {
         self.index = index
         self.exclude = exclude
-        self.mountPoints = mountPoints
+        self.baseMountPoints = mountPoints
     }
 
     /// Reconcile the dirty directories implied by these event paths. Returns the
     /// aggregate change set; `.didMutate` tells the caller whether to refresh.
     public func reconcile(eventPaths: [String]) -> ReconcileResult {
+        // Volumes can be mounted AFTER this Reconciler was built. Refresh the mount-point
+        // filter per batch so a just-mounted volume is NOT slurped in as a child subtree of
+        // /Volumes by the still-running old stream (it gets its own crawl root via the
+        // volume sync) — a frozen set double-indexed the volume and left a ghost after unmount.
+        let mountPoints = baseMountPoints.union(Volumes.allMountPoints())
         let epoch = index.currentEpoch()   // if a reindex clears the index mid-reconcile, we no-op
         var work: [String] = []
         var seen = Set<String>()

@@ -1,57 +1,72 @@
 ## TURN: CLAUDE
-**Updated:** 2026-06-30 01:30
+**Updated:** 2026-07-02 20:15
 
 ## GOAL
-Milestone **L3 — power features + performance + hardening** for Maverything. The app now
-has: 3 match modes (exact/fuzzy/wildcard), Everything-style query syntax, relevance sort,
-3 switchable layouts (table / compact bar / two-pane QuickLook preview), themes + density,
-icons + Kind column. Engine validated by `mvsim` (34/34) and the `mvfind` CLI. This batch
-adds the remaining power + speed, cross-reviews what landed, and grows the sim suite.
-Rule still in force: when a choice has options A/B/C, build them ALL, switchable.
+Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
+"Everything" clone). The engine is now hardened: read-write index lock, FSEvents
+resume-cursor correctness, NFC event paths, file↔dir flip handling, mount de-dup,
+incremental narrow-as-you-type, and a `FileIndex.mutationGen` that makes search-cache
+invalidation impossible to miss. This batch closes the remaining items surfaced by the
+Codex×agy cross-reviews, each self-contained. Rule still in force: when a choice has
+options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 
 ## CODEBASE MAP
-- Engine: `Sources/MaverythingCore/` — `SearchEngine` (fast exact path + general evaluator;
-  `orderArray` cache invalidated by `invalidate()`), `Matching.swift` (`MatchMode`),
-  `QueryParser.swift`, `FileIndex` (SoA + live deltas + NFC), `Watcher`, `Snapshot`, `Volumes`.
-- App: `ContentView` (search bar, gear menu, `layoutBody` switch, `shortcuts`),
-  `ResultsTableView` (table), `CompactResults` (bar), `PreviewPane` (QuickLook), `UILayout.swift`
-  (UILayout/Appearance/RowDensity), `AppModel` (state + query pipeline + watcher + snapshot).
-- Harness: `mvsim` (scenarios → SIMULATION-REPORT.md), `mvtest` (perf on /usr), `mvfind` (CLI).
-- Build: `swift build -c release`. Run app: `./build.sh run`. Sim: `.build/release/mvsim`.
+- Engine `Sources/MaverythingCore/`: `SearchEngine` (fastExact + general evaluator +
+  regexSearch; orderCache keyed on `index.mutationGenLocked`; incremental narrowing),
+  `FileIndex` (struct-of-arrays + rwlock rdlock()/wrlock(); `computeOrder` per SortKey;
+  `foldBlob` = asciiLower(NFC) sharing nameOff/nameLen), `FileEnumerator` (getattrlistbulk
+  crawl), `Watcher` (FSWatcher + Reconciler), `Snapshot`, `Volumes`, `Matching`, `QueryParser`.
+- App `Sources/Maverything/`: `AppModel`, `ResultsTableView`, `CompactResults`, `PreviewPane`,
+  `ContentView`, `FilterBar`, `SearchMenus`, `OptionsButton`, `Settings`.
+- Harness: `.build/release/mvsim` (62 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
+- Build: `swift build -c release`. Sim: `.build/release/mvsim`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
-1. **More match modes** — add to `MatchMode` (keep exact/fuzzy/wildcard):
-   - D) **Regex** (`NSRegularExpression`, case-insensitive by default) — match name (or path).
-     Compile once; only run on candidates surviving cheap filters; guard pathological patterns.
-   - (optional) **Word/prefix-boundary** boosted exact (rank whole-word/prefix hits higher).
-2. **Performance (the #1 user goal is "instant")** — pick the wins and implement what's safe:
-   - Prewarm ALL sort orders (name/size/date) in the background after index-ready (not just name).
-   - Reduce the per-keystroke first-build cost on ~4M: faster name argsort (e.g. radix on the
-     first 4–8 bytes then memcmp tiebreak), or incremental order maintenance so a live FS delta
-     doesn't force a full re-sort. Measure with `mvtest` before/after; quote numbers.
-   - Don't rebuild the order when the search field is empty or the window is hidden.
-3. **Keyboard UX across layouts** — ↑/↓ move selection, ⏎ opens, ⌘⏎ reveals, in the compact bar
-   and two-pane (table already handles arrows). Esc clears then hides (already in ContentView).
+1. **Real Path-column sort** — today `computeOrder(.path)` falls back to NAME order, so
+   clicking the "Path" header sorts by name (wrong). Options:
+   - A) Reconstruct each entry's folded path once, sort by it, cache in `orderCache[.path]`
+     (simple, ~1s to build once, cached like other orders). ← safe floor, implement first.
+   - B) Directory-order tuple keys (parent order, then name) for cheaper rebuilds.
+   Assert correctness in mvsim (a nested fixture where path order ≠ name order).
+2. **Non-ASCII case folding** — `foldBlob` is ASCII-only lowercased, so `CAFÉ.txt` is not
+   found by `café`/`cafe`. Options:
+   - A) Add a Unicode-lowercased fold blob with its OWN offsets (foldOff/foldLen), since
+     Unicode lowercasing can change byte length; keep the ASCII fast path for pure-ASCII
+     names. Fold the query the same way. ← implement.
+   - B) ASCII fold + a slow Unicode fallback compare only when the query has non-ASCII.
+   Korean (Hangul) is caseless so unaffected; target accented-Latin/Cyrillic. mvsim assert.
+3. **Relevance sort top-K** — `general()` relevance path stores + sorts EVERY match then
+   takes `limit`. Use per-chunk bounded top-K (or partial selection) then merge, so a broad
+   relevance query doesn't allocate/sort millions of pairs. Keep results identical.
+4. **Dynamic mount/unmount** — volumes mounted AFTER launch aren't indexed/watched; unmounts
+   leave stale entries. Observe `NSWorkspace.shared.notificationCenter` didMount/didUnmount:
+   on mount → crawl+watch the new root; on unmount → tombstone that subtree. (Also handle
+   FSEvents RootChanged.)
 
 ## DONE-WHEN
-- [ ] Regex match mode implemented + selectable; safe on big sets (filter-first, guarded).
-- [ ] All sort orders prewarmed off the main thread; empty-query/hidden-window skips rebuilds.
-- [ ] A measured name-sort or incremental-order improvement (mvtest numbers in the worklog).
-- [ ] Keyboard nav (↑/↓/⏎/⌘⏎) works in compact + two-pane layouts.
-- [ ] `mvsim` grown by ≥6 scenarios (regex, wildcard `?`, size ranges, dm ranges, NFC Korean,
-      snapshot resume, NOT+filters combo) — still 100% green.
-- [ ] Adversarially review the L2 UI + engine commits on main (red-team: lock discipline in any
-      engine edit, no eager per-row work in layouts, no regressions) — note findings in worklog.
+- [ ] Path-column sort yields true path order (not name order); mvsim asserts it.
+- [ ] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
+- [ ] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
+- [ ] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
+- [ ] Name-blob offsets widened past the 4 GiB `UInt32` cap (UInt64 or segmented) — or a guarded graceful cap.
+- [ ] mvsim grown by ≥4 scenarios (path-sort, non-ASCII fold, relevance top-K parity, …) — 100% green.
+- [ ] Adversarially cross-review each increment (the OTHER agent red-teams: lock discipline —
+      reads via rdlock/withReadLock, mutations bump mutationGen under wrlock; no eager per-row work).
 - [ ] build green · existing flows intact · no secrets · clean tree.
 
 ## CONSTRAINTS
-- Only edit files under this repo/worktree. NEVER `git push`. One focused increment per turn.
-- Respect index lock discipline (search under `withReadLock`; `_name`/`_path` when locked).
-- Keep huge-result-set performance: visible-row-only work; `reloadData()` once per batch.
+- Only edit files under this worktree. NEVER `git push`. One focused increment per turn.
+- Index lock discipline: reads via `rdlock()`/`withReadLock`; every content mutation under
+  `wrlock()` MUST `bumpMut()` (so search caches self-invalidate). Underscore `_name/_path`
+  are non-locking internals — call them only while holding the lock.
+- Keep huge-result-set performance: visible-row-only work; one `reloadData()` per batch.
+- Keep `mvsim` at 100% green; grow it with each feature. `swift build -c release` must stay green
+  (the driver auto-reverts a red turn).
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-CLAUDE: design round — decide the perf approach (prewarm-all + skip-when-idle is the safe
-floor; radix name-sort is the stretch) and land increment 1 (prewarm all orders in background +
-skip rebuild on empty/hidden). Hand to CODEX for the Regex match mode, then AGY for keyboard nav
-across layouts. Loop back for the perf stretch + the mvsim growth + the L2 cross-review.
+CLAUDE: start with **OPEN QUESTION 1A (real Path-column sort)** — self-contained, clear win.
+Add `computeOrder(.path)` that sorts by reconstructed folded path (cache it), and an mvsim
+scenario where path order ≠ name order. Then hand to CODEX for **2A (non-ASCII fold blob)**,
+then AGY for **3 (relevance top-K)**. Loop back for **4 (dynamic mounts)** + mvsim growth +
+cross-review.

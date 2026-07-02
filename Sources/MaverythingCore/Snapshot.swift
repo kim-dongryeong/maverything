@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 
 /// On-disk snapshot of the index — Everything's `Everything.db` equivalent.
@@ -7,6 +8,45 @@ import Foundation
 public enum Snapshot {
     static let magic: UInt32 = 0x4D56_4931   // "MVI1"
     static let version: UInt32 = 5           // v5 widens nameOff to UInt64
+    /// Compressed-container magic ("MVZ1"): header = magic + rawSize(UInt64), then an
+    /// LZFSE stream of the ordinary (v5) snapshot. Cardinal ships a 22 MB zstd snapshot
+    /// for a whole disk vs our 167 MB raw — this closes most of that gap natively.
+    static let zMagic: UInt32 = 0x4D56_5A31  // "MVZ1"
+
+    static func compress(_ raw: Data) -> Data {
+        var out = Data(capacity: raw.count / 3 + 64)
+        withUnsafeBytes(of: zMagic) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt64(raw.count)) { out.append(contentsOf: $0) }
+        let dst = UnsafeMutablePointer<UInt8>.allocate(capacity: raw.count + 4096)
+        defer { dst.deallocate() }
+        let n = raw.withUnsafeBytes { src in
+            compression_encode_buffer(dst, raw.count + 4096,
+                                      src.bindMemory(to: UInt8.self).baseAddress!, raw.count,
+                                      nil, COMPRESSION_LZFSE)
+        }
+        guard n > 0 else { return raw }          // encode failure → fall back to raw
+        out.append(dst, count: n)
+        return out
+    }
+
+    static func decompressIfNeeded(_ data: Data) -> Data? {
+        guard data.count >= 12 else { return data }
+        let m = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
+        guard m == zMagic else { return data }   // not compressed → pass through
+        let rawSize = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt64.self) }
+        guard rawSize > 0, rawSize <= 32_000_000_000 else { return nil }
+        var raw = Data(count: Int(rawSize))
+        let ok: Bool = raw.withUnsafeMutableBytes { dst in
+            data.withUnsafeBytes { src in
+                let payload = src.baseAddress! + 12
+                let n = compression_decode_buffer(dst.bindMemory(to: UInt8.self).baseAddress!, Int(rawSize),
+                                                  payload.assumingMemoryBound(to: UInt8.self), data.count - 12,
+                                                  nil, COMPRESSION_LZFSE)
+                return n == Int(rawSize)
+            }
+        }
+        return ok ? raw : nil                    // corrupt stream → reject (caller re-crawls)
+    }
 
     public static func defaultURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -22,7 +62,7 @@ extension FileIndex {
 
     /// Serialize the live (non-tombstoned) index to a blob. Tombstones are
     /// compacted away on save so the file never accumulates garbage.
-    public func snapshotData(lastEventId: UInt64, savedAt: Double) -> Data {
+    public func snapshotData(lastEventId: UInt64, savedAt: Double, compress: Bool = true) -> Data {
         rdlock(); defer { unlock() }   // reads all arrays to serialize
 
         // Compact: drop tombstoned entries, remap indices.
@@ -88,13 +128,14 @@ extension FileIndex {
         appendArrayBytes(oType, &d)
         appendArrayBytes(oFlags, &d)
         appendArrayBytes(oHidden, &d)
-        return d
+        return compress ? Snapshot.compress(d) : d
     }
 
     /// Replace this index's contents from a snapshot blob. Returns the metadata
     /// on success, nil if the blob is invalid/incompatible.
-    public func loadSnapshot(_ data: Data) -> Snapshot.Meta? {
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Snapshot.Meta? in
+    public func loadSnapshot(_ dataIn: Data) -> Snapshot.Meta? {
+        guard let data = Snapshot.decompressIfNeeded(dataIn) else { return nil }
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Snapshot.Meta? in
             var off = 0
             guard raw.count >= 48 else { return nil }
             let m: UInt32 = readScalar(raw, &off)

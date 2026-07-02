@@ -101,6 +101,8 @@ struct SyntaxHelpView: View {
         ("case:on",          "make the whole query case-sensitive"),
         ("ww:",              "match whole words only (report ≠ reporting)"),
         ("dupe:",            "only names that exist more than once (duplicate finder)"),
+        ("content:text",     "search INSIDE files (on-demand, slower — combine with ext:)"),
+        ("tag:red;blue",     "Finder tags — ; = OR, repeat tag: = AND"),
     ]
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {

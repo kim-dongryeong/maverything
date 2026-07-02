@@ -48,10 +48,141 @@ public final class SearchEngine: @unchecked Sendable {
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
-        index.withReadLock {
+        // content:/tag: are post-filters that do FILE I/O (read contents / xattrs), so they
+        // must run OUTSIDE the index read lock — a long scan must never block the reconciler.
+        // The name/metadata scan first narrows candidates under the lock as usual.
+        let post: ParsedQuery? = {
+            guard mode != .regex else { return nil }
+            let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
+            return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
+        }()
+        let innerLimit = post != nil ? 5_000_000 : limit   // need the FULL candidate set pre-filter
+        var res = index.withReadLock {
             _search(query, mode: mode, scope: scope, sortKey: sortKey,
-                    ascending: ascending, limit: limit, now: now, scopeRoot: scopeRoot)
+                    ascending: ascending, limit: innerLimit, now: now, scopeRoot: scopeRoot)
         }
+        if let p = post {
+            let clock = ContinuousClock(); let t0 = clock.now
+            var ids = res.ids
+            if !p.tagGroups.isEmpty { ids = Self.filterByTags(ids, groups: p.tagGroups, index: index) }
+            if let needle = p.contentNeedle {
+                ids = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive, index: index)
+            }
+            let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
+            res = SearchResults(ids: capped, total: ids.count, truncated: ids.count > capped.count,
+                                queryMillis: res.queryMillis + secondsBetween(t0, clock.now) * 1000)
+        }
+        return res
+    }
+
+    // MARK: - post-lock filters (content: / tag:) — Everything 1.4-style on-demand
+
+    private static let contentMaxFileBytes: Int64 = 64 << 20     // skip files > 64 MB
+    private static let contentMaxCandidates = 200_000            // scan budget (bare `content:` safety)
+
+    /// On-demand file-content substring (ASCII case-insensitive unless case:on) — the
+    /// same 64 KiB-window streaming model Cardinal uses; no content index is kept.
+    static func filterByContent(_ ids: [Int32], needle: [UInt8], caseSensitive: Bool,
+                                index: FileIndex) -> [Int32] {
+        guard !needle.isEmpty else { return ids }
+        let folded = caseSensitive ? needle : needle.map(asciiLower)
+        var out: [Int32] = []
+        var scanned = 0
+        for id in ids {
+            let r = index.row(Int(id))
+            if r.isDir { continue }
+            if r.size > contentMaxFileBytes { continue }
+            if scanned >= contentMaxCandidates { break }   // budget → truncated, not frozen
+            scanned += 1
+            if fileContains(path: r.path, needle: folded, caseSensitive: caseSensitive) {
+                out.append(id)
+            }
+        }
+        return out
+    }
+
+    /// Streaming scan: 64 KiB windows with a needle-1 overlap so matches can span
+    /// chunk boundaries; case-insensitive mode lowercases the window in place.
+    static func fileContains(path: String, needle: [UInt8], caseSensitive: Bool) -> Bool {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        let winSize = 64 << 10
+        let keep = needle.count - 1
+        var buf = [UInt8](repeating: 0, count: winSize + max(0, keep))
+        var carry = 0
+        while true {
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress! + carry, winSize) }
+            if n <= 0 { return false }
+            let total = carry + n
+            if !caseSensitive {
+                for i in carry..<total { buf[i] = asciiLower(buf[i]) }
+            }
+            let hit = buf.withUnsafeBytes { raw in
+                needle.withUnsafeBytes { nd in
+                    memmem(raw.baseAddress!, total, nd.baseAddress!, needle.count) != nil
+                }
+            }
+            if hit { return true }
+            if n < winSize { return false }                 // EOF
+            if keep > 0 {                                   // slide the overlap window
+                for i in 0..<keep { buf[i] = buf[total - keep + i] }
+                carry = keep
+            }
+        }
+    }
+
+    /// Finder-tag filter: per-file xattr reads for small candidate sets; above the
+    /// threshold, pre-filter through Spotlight (`mdfind`) exactly like Cardinal does.
+    static let tagMdfindThreshold = 10_000
+
+    static func filterByTags(_ ids: [Int32], groups: [[String]], index: FileIndex) -> [Int32] {
+        if ids.count > tagMdfindThreshold, let sets = mdfindTagPathSets(groups: groups) {
+            return ids.filter { id in
+                let p = index.path(Int(id)).precomposedStringWithCanonicalMapping
+                return sets.allSatisfy { $0.contains(p) }
+            }
+        }
+        return ids.filter { id in
+            let tags = xattrTagNames(path: index.path(Int(id)))
+            guard !tags.isEmpty else { return false }
+            return groups.allSatisfy { group in
+                group.contains { want in tags.contains { $0.contains(want) } }
+            }
+        }
+    }
+
+    /// Lowercased Finder tag names from com.apple.metadata:_kMDItemUserTags.
+    static func xattrTagNames(path: String) -> [String] {
+        let name = "com.apple.metadata:_kMDItemUserTags"
+        let size = getxattr(path, name, nil, 0, 0, 0)
+        guard size > 0 else { return [] }
+        var data = Data(count: size)
+        let got = data.withUnsafeMutableBytes { getxattr(path, name, $0.baseAddress, size, 0, 0) }
+        guard got > 0,
+              let arr = try? PropertyListSerialization.propertyList(
+                  from: data.prefix(got), options: [], format: nil) as? [String] else { return [] }
+        return arr.map { $0.split(separator: "\n").first.map(String.init)?.lowercased() ?? $0.lowercased() }
+    }
+
+    /// One NFC path set per AND-group via `mdfind` (any tag in the group matches).
+    private static func mdfindTagPathSets(groups: [[String]]) -> [Set<String>]? {
+        var sets: [Set<String>] = []
+        for group in groups {
+            let pred = group.map { "kMDItemUserTags == \"*\($0)*\"cd" }.joined(separator: " || ")
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+            proc.arguments = [pred]
+            let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = Pipe()
+            do { try proc.run() } catch { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return nil }
+            let paths = String(decoding: data, as: UTF8.self)
+                .split(separator: "\n").map { String($0).precomposedStringWithCanonicalMapping }
+            sets.append(Set(paths))
+        }
+        return sets
     }
 
     private func _search(_ query: String, mode: MatchMode, scope: SearchScope,

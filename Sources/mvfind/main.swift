@@ -74,6 +74,18 @@ if let data = try? Data(contentsOf: snapURL), index.loadSnapshot(data) != nil {
 
 let engine = SearchEngine(index: index)
 let now = Date().timeIntervalSince1970
+// MVFIND_BENCH=N: run the query N times in-process and report each engine ms —
+// isolates WARM engine latency from snapshot load + first-query sort-order build
+// (the honest number to compare against a resident app queried over IPC).
+if let benchN = ProcessInfo.processInfo.environment["MVFIND_BENCH"].flatMap(Int.init), benchN > 0 {
+    for i in 1...benchN {
+        let b = engine.search(query, mode: mode, scope: scope, sortKey: sort,
+                              ascending: sort != .relevance, limit: limit, now: now)
+        FileHandle.standardError.write(Data(String(
+            format: "bench[%d]: %d matches in %.2f ms\n", i, b.total, b.queryMillis).utf8))
+    }
+    exit(0)
+}
 let r = engine.search(query, mode: mode, scope: scope, sortKey: sort,
                       ascending: sort != .relevance, limit: countOnly ? 5_000_000 : limit, now: now)
 

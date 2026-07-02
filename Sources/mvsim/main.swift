@@ -292,6 +292,28 @@ try? fm.removeItem(atPath: root + "/selfheal_x.txt")
 _ = rec.reconcile(eventPaths: [root])          // again NO invalidate()
 check("mutationGen: deleted file gone w/o explicit invalidate()", !has("selfheal_x", "selfheal_x.txt"))
 
+// content: — on-demand file-content substring (Everything 1.4-style)
+try? "The SECRET-token lives here, quietly.".write(toFile: root + "/contentful.txt", atomically: true, encoding: .utf8)
+try? "nothing to see".write(toFile: root + "/boring.txt", atomically: true, encoding: .utf8)
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+check("content: finds by contents (case-insensitive)", has("content:secret-token", "contentful.txt"))
+check("content: excludes non-matching files", !has("content:secret-token", "boring.txt"))
+check("content: combined with ext filter", has("ext:txt content:quietly", "contentful.txt"))
+check("content: no match returns empty", engine.search("content:zzznope_xyz", limit: 100, now: now).total == 0)
+
+// tag: — Finder tag filter (xattr path; mdfind path needs >10k candidates, not simulated)
+func setTag(_ path: String, _ tags: [String]) {
+    let value = tags.map { "\($0)\n2" }
+    if let d = try? PropertyListSerialization.data(fromPropertyList: value, format: .binary, options: 0) {
+        _ = d.withUnsafeBytes { setxattr(path, "com.apple.metadata:_kMDItemUserTags", $0.baseAddress, $0.count, 0, 0) }
+    }
+}
+setTag(root + "/contentful.txt", ["Green"])
+check("tag: finds tagged file", has("tag:green", "contentful.txt"))
+check("tag: excludes untagged file", !has("tag:green", "boring.txt"))
+check("tag: wrong tag finds nothing", !has("tag:purple", "contentful.txt"))
+
+
 // dynamic mount lifecycle: a new crawl root can be appended after launch, then tombstoned
 // as one subtree on unmount. Both operations must self-invalidate search caches.
 mkdir(dynamicRoot)
@@ -308,7 +330,8 @@ check("dynamic unmount: tombstones whole mounted root",
 check("dynamic unmount: root dir lookup removed", index.dirIndex(forPath: dynamicRoot) == nil)
 
 // ---- snapshot round-trip ----
-let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)
+let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)                 // compressed (default)
+let rawBlob = index.snapshotData(lastEventId: 777, savedAt: 1.0, compress: false)  // raw v5 for byte surgery
 let idx2 = FileIndex()
 let meta = idx2.loadSnapshot(blob); idx2.buildLiveIndexes()
 let e2 = SearchEngine(index: idx2)
@@ -323,7 +346,7 @@ check("snapshot: Unicode fold survives round-trip",
 // flipping the version byte and narrowing the nameOff array, then confirm the
 // migration read path in loadSnapshot reconstructs identical results.
 let v4blob: Data = {
-    var b = [UInt8](blob)
+    var b = [UInt8](rawBlob)
     func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
     let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
     b[4] = 4; b[5] = 0; b[6] = 0; b[7] = 0                  // version 5 → 4 (little-endian UInt32)
@@ -374,13 +397,13 @@ check("snapshot v4→v5: corrupt offsets reject without replacing index",
 
 // v5-NATIVE rejection (regression guards for the Int-conversion trap fixed in f4ab553):
 // (a) truncated v5 must reject via the expected-length math, index untouched
-let shortV5 = Data(blob.dropLast())
+let shortV5 = Data(rawBlob.dropLast())
 let shortV5Idx = FileIndex()
 check("snapshot v5: truncated blob rejects without touching index",
       shortV5Idx.loadSnapshot(shortV5) == nil && shortV5Idx.count == 0)
 // (b) corrupt v5 with a huge 8-byte nameOff (>= 2^63) must reject, NOT trap on Int()
 let corruptV5: Data = {
-    var b = [UInt8](blob)
+    var b = [UInt8](rawBlob)
     func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
     let blobLen = rdU64(32), uBlobLen = rdU64(40)
     let nameOffStart = 48 + blobLen*2 + uBlobLen

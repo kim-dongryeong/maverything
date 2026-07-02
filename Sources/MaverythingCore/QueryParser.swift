@@ -25,12 +25,15 @@ public struct ParsedQuery: Sendable {
     public var onlyFiles = false                    // `file:`   — match non-directories only
     public var wholeWord = false                    // `ww:` — Everything's Match Whole Word
     public var dupesOnly = false                    // `dupe:` — names that occur more than once
+    public var contentNeedle: [UInt8]? = nil        // `content:` — on-demand file-content substring
+    public var tagGroups: [[String]] = []           // `tag:a;b` = OR-group; multiple tag: = AND
     public var caseSensitive = false
 
     public var hasFilters: Bool {
         !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
             || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
             || onlyDirs || onlyFiles || wholeWord || dupesOnly
+            || contentNeedle != nil || !tagGroups.isEmpty
     }
     public var isEmpty: Bool { terms.isEmpty && !hasFilters }
 
@@ -112,6 +115,15 @@ public enum QueryParser {
             return true
         case "dupe", "dupes", "dup":           // Everything's duplicate finder (by name)
             if !negated { q.dupesOnly = true }
+            return true
+        case "content":                        // on-demand content search (Everything 1.4-style)
+            if !negated, !val.isEmpty { q.contentNeedle = Array(val.utf8) }
+            return true
+        case "tag", "t":                       // Finder tags: `tag:red;blue` = OR, repeat = AND
+            if !negated, !val.isEmpty {
+                let group = val.split(separator: ";").map { $0.lowercased() }.filter { !$0.isEmpty }
+                if !group.isEmpty { q.tagGroups.append(group) }
+            }
             return true
         case "folder", "folders", "dir":       // restrict to directories (Everything's folder:)
             applyTypeFilter(dir: true, val: val, negated: negated, into: &q)

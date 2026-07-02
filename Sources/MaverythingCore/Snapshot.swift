@@ -23,7 +23,7 @@ extension FileIndex {
     /// Serialize the live (non-tombstoned) index to a blob. Tombstones are
     /// compacted away on save so the file never accumulates garbage.
     public func snapshotData(lastEventId: UInt64, savedAt: Double) -> Data {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }   // reads all arrays to serialize
 
         // Compact: drop tombstoned entries, remap indices.
         let n = nameOff.count
@@ -95,7 +95,7 @@ extension FileIndex {
             let expected = 40 + blobLen * 2 + count * perEntry
             guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
-            lock.lock(); defer { lock.unlock() }
+            wrlock(); defer { unlock() }   // replaces all arrays
             nameBlob = readArray(raw, &off, blobLen, UInt8.self)
             foldBlob = readArray(raw, &off, blobLen, UInt8.self)
             nameOff = readArray(raw, &off, count, UInt32.self)

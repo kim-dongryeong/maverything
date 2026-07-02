@@ -33,25 +33,37 @@ public final class FileIndex: @unchecked Sendable {
     var childrenOf: [Int32: [Int32]] = [:]
     var dirIndexByPath: [String: Int32] = [:]
 
-    /// Guards mutation during the concurrent crawl and live FS updates. Search
-    /// also takes this lock around its scan so a live delta never tears a read.
-    let lock = NSLock()
+    /// A READ-WRITE lock: many concurrent readers (searches + row/path accessors +
+    /// main-thread cell rendering) run in parallel; only mutations (crawl append,
+    /// reconcile, clear) take the exclusive write lock. This stops a background search
+    /// from stalling main-thread rendering (and vice-versa) the way one exclusive lock
+    /// did. Heap-allocated so concurrent `pthread_*lock(rwlock)` calls don't trip
+    /// Swift's exclusive-access-to-a-`var` checking.
+    private let rwlock: UnsafeMutablePointer<pthread_rwlock_t> = {
+        let p = UnsafeMutablePointer<pthread_rwlock_t>.allocate(capacity: 1)
+        pthread_rwlock_init(p, nil)
+        return p
+    }()
+    @inline(__always) func rdlock() { pthread_rwlock_rdlock(rwlock) }   // internal: Snapshot.swift extension uses these
+    @inline(__always) func wrlock() { pthread_rwlock_wrlock(rwlock) }
+    @inline(__always) func unlock() { pthread_rwlock_unlock(rwlock) }
+    deinit { pthread_rwlock_destroy(rwlock); rwlock.deallocate() }
 
     /// Bumped on every clear() so an in-flight reconcile from a previous crawl
     /// generation can detect it's stale and no-op instead of corrupting the fresh index.
     private var epochValue = 0
-    public func currentEpoch() -> Int { lock.lock(); defer { lock.unlock() }; return epochValue }
+    public func currentEpoch() -> Int { rdlock(); defer { unlock() }; return epochValue }
 
     public init() {}
 
     public var count: Int { nameOff.count }
 
     /// Lock-safe count for live progress polling while a crawl is appending.
-    public func safeCount() -> Int { lock.lock(); defer { lock.unlock() }; return nameOff.count }
+    public func safeCount() -> Int { rdlock(); defer { unlock() }; return nameOff.count }
 
     /// (total slots, tombstoned) — for deciding when to compact away dead entries.
     public func liveStats() -> (total: Int, deleted: Int) {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         var d = 0
         for x in deleted where x { d += 1 }
         return (nameOff.count, d)
@@ -59,15 +71,15 @@ public final class FileIndex: @unchecked Sendable {
 
     // Locked (safe to call from the main thread while the reconciler mutates).
     @inline(__always) public func isDir(_ i: Int) -> Bool {
-        lock.lock(); defer { lock.unlock() }; return objType[i] == VNODE_VDIR
+        rdlock(); defer { unlock() }; return objType[i] == VNODE_VDIR
     }
     @inline(__always) public func isDeleted(_ i: Int) -> Bool {
-        lock.lock(); defer { lock.unlock() }; return deleted[i]
+        rdlock(); defer { unlock() }; return deleted[i]
     }
 
     /// Empties the index (for a full re-crawl).
     public func clear() {
-        lock.lock(); defer { lock.unlock() }
+        wrlock(); defer { unlock() }
         epochValue &+= 1   // invalidate any in-flight reconcile captured before this
         nameBlob.removeAll(keepingCapacity: false)
         foldBlob.removeAll(keepingCapacity: false)
@@ -82,6 +94,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func reserveCapacity(_ n: Int) {
+        wrlock(); defer { unlock() }   // reallocation must not race a concurrent reader
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
         crtime.reserveCapacity(n)
@@ -93,7 +106,7 @@ public final class FileIndex: @unchecked Sendable {
 
     /// Appends a crawl root (absolute path stored as the name). Returns its index.
     public func appendRoot(path: String) -> Int32 {
-        lock.lock(); defer { lock.unlock() }
+        wrlock(); defer { unlock() }
         // NFC-normalize like every other stored name, so a non-ASCII volume root is
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
@@ -114,7 +127,7 @@ public final class FileIndex: @unchecked Sendable {
     /// no string/dict work under the lock — so the parallel crawl stays fast.
     /// Live-update maps are built afterwards by `buildLiveIndexes()`.
     func appendChildren(parent parentIdx: Int32, displayParent: String, _ batch: ChildBatch) -> Int32 {
-        lock.lock(); defer { lock.unlock() }
+        wrlock(); defer { unlock() }
         let base = Int32(nameOff.count)
         let blobBase = UInt32(nameBlob.count)
         nameBlob.append(contentsOf: batch.blob)
@@ -137,7 +150,7 @@ public final class FileIndex: @unchecked Sendable {
     /// pass can compute each directory's display path from its parent's. This is
     /// far faster than doing it under the crawl lock.
     public func buildLiveIndexes() {
-        lock.lock(); defer { lock.unlock() }
+        wrlock(); defer { unlock() }
         let n = nameOff.count
         childrenOf.removeAll(keepingCapacity: true)
         dirIndexByPath.removeAll(keepingCapacity: true)
@@ -166,7 +179,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Runs `body` while holding the index lock (used by the search scan so a
     /// concurrent live delta can't reallocate the arrays mid-read).
     @inline(__always) func withReadLock<T>(_ body: () -> T) -> T {
-        lock.lock(); defer { lock.unlock() }; return body()
+        rdlock(); defer { unlock() }; return body()
     }
 
     func _name(_ i: Int) -> String {
@@ -197,14 +210,14 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     /// The bare file/dir name of entry `i`.
-    public func name(_ i: Int) -> String { lock.lock(); defer { lock.unlock() }; return _name(i) }
+    public func name(_ i: Int) -> String { rdlock(); defer { unlock() }; return _name(i) }
 
     /// Reconstructs the absolute path of entry `i` by walking parents.
-    public func path(_ i: Int) -> String { lock.lock(); defer { lock.unlock() }; return _path(i) }
+    public func path(_ i: Int) -> String { rdlock(); defer { unlock() }; return _path(i) }
 
     /// Resolve a folder's absolute path to its entry index (for folder-scoped search).
     public func dirIndex(forPath p: String) -> Int32? {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         guard let i = dirIndexByPath[p], !deleted[Int(i)] else { return nil }
         return i
     }
@@ -212,7 +225,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Total size of everything inside a directory subtree — the "size" Finder shows
     /// for a package/bundle. Iterative DFS over childrenOf; hop-bounded for safety.
     public func subtreeSize(of dirIdx: Int32) -> Int64 {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         var total: Int64 = 0
         var stack: [Int32] = [dirIdx]
         var hops = 0
@@ -228,7 +241,7 @@ public final class FileIndex: @unchecked Sendable {
 
     /// The parent directory's absolute path (for display).
     public func directory(_ i: Int) -> String {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         let p = parent[i]
         return p < 0 ? _path(i) : _path(Int(p))
     }
@@ -242,7 +255,7 @@ public final class FileIndex: @unchecked Sendable {
         public let isDir: Bool
     }
     public func row(_ i: Int) -> RowInfo {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         guard i >= 0, i < nameOff.count else {
             return RowInfo(name: "", path: "", directory: "", ext: "", size: 0, mtime: 0, crtime: 0, isDir: false)
         }
@@ -255,7 +268,7 @@ public final class FileIndex: @unchecked Sendable {
 
     /// Locked sum of file sizes for the given entries (directories excluded).
     public func totalSize(of ids: [Int32]) -> Int64 {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         var b: Int64 = 0
         for id in ids { let i = Int(id); if i >= 0, i < objType.count, objType[i] != VNODE_VDIR { b += size[i] } }
         return b
@@ -265,7 +278,7 @@ public final class FileIndex: @unchecked Sendable {
 
     /// Look up a directory entry by its display path (FSEvents path).
     func liveDirIndex(forDisplayPath p: String) -> Int32? {
-        lock.lock(); defer { lock.unlock() }
+        rdlock(); defer { unlock() }
         guard let i = dirIndexByPath[p], !deleted[Int(i)] else { return nil }
         return i
     }
@@ -274,7 +287,7 @@ public final class FileIndex: @unchecked Sendable {
     /// adds / removes / attribute updates atomically. Returns what changed.
     func applyDirDiff(dirIdx: Int32, displayPath: String, current: [DirEntry],
                       expectedEpoch: Int) -> ReconcileResult {
-        lock.lock(); defer { lock.unlock() }
+        wrlock(); defer { unlock() }
         var res = ReconcileResult()
         guard epochValue == expectedEpoch else { return res }   // stale reconcile from a prior crawl
         let di = Int(dirIdx)

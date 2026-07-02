@@ -30,7 +30,12 @@ final class MVTableView: NSTableView {
         if mods == [.command], event.keyCode == 51 {           // ⌘⌫ → move to Trash
             coordinator?.moveToTrash(); return
         }
+        if mods == [.command], event.keyCode == 34 {           // ⌘I → Get Info (Finder)
+            coordinator?.getInfo(); return
+        }
         switch event.keyCode {
+        case 48:            // Tab → hand focus back to the search field (Everything-style)
+            coordinator?.focusSearch()
         case 120:           // F2 → rename
             coordinator?.beginRename()
         case 49:            // space → toggle Quick Look
@@ -153,9 +158,14 @@ struct ResultsTableView: NSViewRepresentable {
         add("Open", #selector(Coordinator.openItem), key: "\r")
         add("Open Enclosing Folder", #selector(Coordinator.openEnclosing))
         add("Quick Look", #selector(Coordinator.quickLook), key: " ")
+        add("Get Info", #selector(Coordinator.getInfo), key: "i", mask: [.command])
         menu.addItem(.separator())
         add("Search in This Folder", #selector(Coordinator.searchInFolder))
         add("Reveal in Finder", #selector(Coordinator.revealItem), key: "r", mask: [.command])
+        // Tags submenu (Finder colors) — writes via URL resource values
+        let tagsItem = NSMenuItem(title: "Tags", action: nil, keyEquivalent: "")
+        tagsItem.submenu = context.coordinator.makeTagsMenu()
+        menu.addItem(tagsItem)
         menu.addItem(.separator())
         add("Copy", #selector(Coordinator.copyFile), key: "c", mask: [.command])
         add("Copy as Pathname", #selector(Coordinator.copyPath), key: "c", mask: [.command, .option])
@@ -331,7 +341,27 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.textField?.stringValue = r.directory
                 cell.textField?.textColor = .secondaryLabelColor
             case "size":
-                cell.textField?.stringValue = r.isDir ? "--" : byteFormatter.string(fromByteCount: r.size)
+                if r.isDir {
+                    if !r.ext.isEmpty {   // package/bundle (.app, .framework…) → total size, like Finder
+                        if let bytes = BundleSizeCache.size(path: r.path, dirIdx: id, index: model.index,
+                            onReady: { [weak tableView] in
+                                guard let tv = tableView else { return }
+                                let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("size"))
+                                if col >= 0, row < tv.numberOfRows {
+                                    tv.reloadData(forRowIndexes: IndexSet(integer: row),
+                                                  columnIndexes: IndexSet(integer: col))
+                                }
+                            }) {
+                            cell.textField?.stringValue = byteFormatter.string(fromByteCount: bytes)
+                        } else {
+                            cell.textField?.stringValue = "…"   // computing
+                        }
+                    } else {
+                        cell.textField?.stringValue = "--"
+                    }
+                } else {
+                    cell.textField?.stringValue = byteFormatter.string(fromByteCount: r.size)
+                }
                 cell.textField?.alignment = .right
                 cell.textField?.textColor = .secondaryLabelColor
             case "date":
@@ -585,6 +615,75 @@ struct ResultsTableView: NSViewRepresentable {
             guard let tv = tableView, tv.selectedRow >= 0, tv.selectedRow < ids.count else { return }
             let r = model.index.row(Int(ids[tv.selectedRow]))
             model.searchInFolder(path: r.path, isDir: r.isDir)
+        }
+
+        /// ⌘I → open Finder's Get Info window(s) for the selection (same as Finder,
+        /// so bundle size, tags, permissions all show natively). Uses Apple Events.
+        @objc func getInfo() {
+            let paths = selectedPaths()
+            guard !paths.isEmpty else { return }
+            let refs = paths.map { p -> String in
+                let esc = p.replacingOccurrences(of: "\\", with: "\\\\")
+                            .replacingOccurrences(of: "\"", with: "\\\"")
+                return "POSIX file \"\(esc)\""
+            }.joined(separator: ", ")
+            let src = """
+            tell application "Finder"
+              activate
+              repeat with theItem in {\(refs)}
+                open information window of (theItem as alias)
+              end repeat
+            end tell
+            """
+            var err: NSDictionary?
+            NSAppleScript(source: src)?.executeAndReturnError(&err)
+            if let err { NSSound.beep(); NSLog("Get Info failed: \(err)") }
+        }
+
+        // MARK: - Finder tags
+
+        private static let tagColors: [(String, String?)] = [   // (title, tag name / nil = clear)
+            ("None", nil), ("Red", "Red"), ("Orange", "Orange"), ("Yellow", "Yellow"),
+            ("Green", "Green"), ("Blue", "Blue"), ("Purple", "Purple"), ("Gray", "Gray"),
+        ]
+
+        func makeTagsMenu() -> NSMenu {
+            let m = NSMenu()
+            m.autoenablesItems = false
+            for (title, tag) in Self.tagColors {
+                let it = NSMenuItem(title: title, action: #selector(setTag(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = tag ?? ""
+                m.addItem(it)
+                if tag == nil { m.addItem(.separator()) }
+            }
+            return m
+        }
+
+        // Finder's standard tag color codes (as stored in _kMDItemUserTags: "Name\nCode").
+        private func colorCode(_ tag: String) -> String? {
+            switch tag {
+            case "Gray": return "1"; case "Green": return "2"; case "Purple": return "3"
+            case "Blue": return "4"; case "Yellow": return "5"; case "Red": return "6"
+            case "Orange": return "7"; default: return nil
+            }
+        }
+
+        @objc private func setTag(_ sender: NSMenuItem) {
+            let tag = (sender.representedObject as? String) ?? ""
+            for p in selectedPaths() { writeTag(tag, to: p) }
+        }
+
+        /// Write a single Finder tag (with its color) via the extended attribute — the
+        /// URLResourceValues.tagNames setter is macOS 26+, so we set the xattr directly.
+        private func writeTag(_ tag: String, to path: String) {
+            let name = "com.apple.metadata:_kMDItemUserTags"
+            if tag.isEmpty { removexattr(path, name, 0); return }   // clear all tags
+            let value = colorCode(tag).map { "\(tag)\n\($0)" } ?? tag
+            guard let data = try? PropertyListSerialization.data(
+                fromPropertyList: [value], format: .binary, options: 0) else { return }
+            let ok = data.withUnsafeBytes { setxattr(path, name, $0.baseAddress, $0.count, 0, 0) }
+            if ok != 0 { NSSound.beep() }
         }
 
         @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }

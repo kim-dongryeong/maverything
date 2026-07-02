@@ -207,6 +207,23 @@ public final class FileIndex: @unchecked Sendable {
         return i
     }
 
+    /// Total size of everything inside a directory subtree — the "size" Finder shows
+    /// for a package/bundle. Iterative DFS over childrenOf; hop-bounded for safety.
+    public func subtreeSize(of dirIdx: Int32) -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        var total: Int64 = 0
+        var stack: [Int32] = [dirIdx]
+        var hops = 0
+        while let cur = stack.popLast() {
+            hops += 1; if hops > 20_000_000 { break }
+            let i = Int(cur)
+            if i < 0 || i >= objType.count || deleted[i] { continue }
+            if objType[i] != VNODE_VDIR { total += size[i] }
+            if let kids = childrenOf[cur] { stack.append(contentsOf: kids) }
+        }
+        return total
+    }
+
     /// The parent directory's absolute path (for display).
     public func directory(_ i: Int) -> String {
         lock.lock(); defer { lock.unlock() }

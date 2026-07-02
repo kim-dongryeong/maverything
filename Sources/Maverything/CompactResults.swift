@@ -1,4 +1,5 @@
 import AppKit
+import MaverythingCore
 import SwiftUI
 
 /// Layout A — a Spotlight/Alfred-style slim results list (top matches only),
@@ -76,6 +77,31 @@ struct CompactResults: View {
             .background(selected ? Color.accentColor.opacity(0.18) : .clear)
             .contentShape(Rectangle())
         }
+    }
+}
+
+/// Caches computed bundle/package sizes (a .app's total, like Finder shows). The
+/// subtree sum is done off the main thread; `onReady` fires once it's available.
+enum BundleSizeCache {
+    private static var cache: [String: Int64] = [:]
+    private static var inflight: Set<String> = []
+    private static let lock = NSLock()
+
+    static func size(path: String, dirIdx: Int32, index: MaverythingCore.FileIndex,
+                     onReady: @escaping () -> Void) -> Int64? {
+        lock.lock()
+        if let c = cache[path] { lock.unlock(); return c }
+        if inflight.contains(path) { lock.unlock(); return nil }
+        inflight.insert(path); lock.unlock()
+        DispatchQueue.global(qos: .utility).async {
+            let s = index.subtreeSize(of: dirIdx)
+            lock.lock()
+            if cache.count < 20_000 { cache[path] = s }
+            inflight.remove(path)
+            lock.unlock()
+            DispatchQueue.main.async { onReady() }
+        }
+        return nil
     }
 }
 

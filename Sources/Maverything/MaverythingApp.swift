@@ -22,9 +22,8 @@ struct MaverythingApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: 960, height: 620)
         .commands {
-            CommandGroup(replacing: .appInfo) {
-                Button("Reindex Now") { model.reindex() }.keyboardShortcut("r", modifiers: .command)
-            }
+            SearchCommands(model: model)   // Everything's Search menu (⌃U/⌃I/⌃B/⌃R live here)
+            ViewCommands(model: model)     // layouts ⌘1/2/3 in the View menu
         }
 
         Settings {
@@ -37,6 +36,57 @@ struct MaverythingApp: App {
             SettingsLink { Text("Settings…") }
             Divider()
             Button("Quit Maverything") { NSApp.terminate(nil) }   // willTerminate saves the snapshot once
+        }
+    }
+}
+
+/// The menu-bar "Search" menu — the canonical macOS home for these shortcuts
+/// (mirrors Windows Everything's Search menu, same key set).
+struct SearchCommands: Commands {
+    @ObservedObject var model: AppModel
+
+    var body: some Commands {
+        CommandMenu("Search") {
+            Button("Focus Search Field") { model.focusNonce &+= 1 }
+                .keyboardShortcut("f")                                    // ⌘F, the standard "find"
+            Divider()
+            Toggle("Match Path", isOn: Binding(
+                get: { model.scope == .fullPath },
+                set: { model.scope = $0 ? .fullPath : .nameOnly }))
+                .keyboardShortcut("u", modifiers: .control)
+            Toggle("Match Case", isOn: $model.matchCase)
+                .keyboardShortcut("i", modifiers: .control)
+            Toggle("Match Whole Word", isOn: $model.wholeWord)
+                .keyboardShortcut("b", modifiers: .control)
+            Toggle("Enable Regex", isOn: Binding(
+                get: { model.matchMode == .regex },
+                set: { model.matchMode = $0 ? .regex : .exact }))
+                .keyboardShortcut("r", modifiers: .control)
+            Divider()
+            Picker("Match Mode", selection: $model.matchMode) {
+                ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+            Divider()
+            Button("Reindex Now") { model.reindex() }
+                .keyboardShortcut("r", modifiers: [.command, .option])   // ⌥⌘R — frees ⌘R for Reveal in Finder
+        }
+    }
+}
+
+/// Layout switching as real View-menu items (⌘1/2/3), with checkmarks.
+struct ViewCommands: Commands {
+    @ObservedObject var model: AppModel
+
+    private func layoutToggle(_ l: UILayout) -> Binding<Bool> {
+        Binding(get: { model.layout == l }, set: { if $0 { model.layout = l } })
+    }
+
+    var body: some Commands {
+        CommandGroup(before: .toolbar) {
+            Toggle("Table", isOn: layoutToggle(.table)).keyboardShortcut("1")
+            Toggle("Compact Bar", isOn: layoutToggle(.compact)).keyboardShortcut("2")
+            Toggle("Two-Pane Preview", isOn: layoutToggle(.twoPane)).keyboardShortcut("3")
+            Divider()
         }
     }
 }

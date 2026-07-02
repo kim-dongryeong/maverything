@@ -16,7 +16,6 @@ struct ContentView: View {
             Divider()
             statusBar
         }
-        .background(shortcuts)
         .preferredColorScheme(model.appearance.colorScheme)
         .onAppear { searchFocused = true }
         .onChange(of: model.focusNonce) { searchFocused = true }
@@ -39,20 +38,8 @@ struct ContentView: View {
         }
     }
 
-    // hidden keyboard shortcuts — Everything's toggle set (⌃U/⌃B/⌃I/⌃R) + ⌘1/2/3 layouts
-    private var shortcuts: some View {
-        Group {
-            Button("") { model.toggleScope() }.keyboardShortcut("u", modifiers: .control)       // Match Path
-            Button("") { model.wholeWord.toggle() }.keyboardShortcut("b", modifiers: .control)  // Match Whole Word
-            Button("") { model.matchCase.toggle() }.keyboardShortcut("i", modifiers: .control)  // Match Case
-            Button("") {                                                                        // Enable Regex
-                model.matchMode = model.matchMode == .regex ? .exact : .regex
-            }.keyboardShortcut("r", modifiers: .control)
-            Button("") { model.layout = .table }.keyboardShortcut("1", modifiers: .command)
-            Button("") { model.layout = .compact }.keyboardShortcut("2", modifiers: .command)
-            Button("") { model.layout = .twoPane }.keyboardShortcut("3", modifiers: .command)
-        }.hidden()
-    }
+    // (⌃U/⌃B/⌃I/⌃R and ⌘1/2/3 now live in the REAL menu bar — SearchCommands /
+    // ViewCommands in MaverythingApp — the canonical macOS home for shortcuts.)
 
     private var searchBar: some View {
         HStack(spacing: 8) {

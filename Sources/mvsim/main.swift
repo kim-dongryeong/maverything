@@ -116,6 +116,16 @@ let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
 
+// negated filters (review #2)
+check("NOT-filter: '-ext:png' excludes images", !has("image -ext:png", "image_001.png"))
+check("NOT-filter: '-ext:png' keeps AppModel.swift", has("app -ext:png", "AppModel.swift"))
+check("NOT-filter: '-size:>1mb' excludes big.bin", !has("-size:>1mb", "big.bin"))
+check("NOT-filter: '-dm:today' excludes today's report.txt", !has("report -dm:today", "report.txt"))
+// ext with leading dot (review #4)
+check("ext '.png' (leading dot) still matches", has("ext:.png", "image_001.png"))
+// name: forces name scope even conceptually (review #3) — name:data shouldn't match by path
+check("name: term matches filename", has("name:data", "data.json"))
+
 // regex mode
 check("regex: '^report\\.' matches report.txt", has("^report\\.", "report.txt", mode: .regex))
 check("regex: '\\.png$' matches image_001.png", has("\\.png$", "image_001.png", mode: .regex))

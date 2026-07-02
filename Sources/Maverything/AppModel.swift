@@ -263,7 +263,7 @@ final class AppModel: ObservableObject {
             self.liveRefreshScheduled = false
             guard !self.isIndexing else { return }
             self.engine.invalidate()
-            self.indexedCount = self.index.count
+            self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()
         }
     }

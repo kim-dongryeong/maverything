@@ -87,6 +87,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.foldBlob.withUnsafeBufferPointer { fb in
         index.nameOff.withUnsafeBufferPointer { offB in
         index.nameLen.withUnsafeBufferPointer { lenB in
+        index.deleted.withUnsafeBufferPointer { delB in
         order.withUnsafeBufferPointer { ordB in
         needle.withUnsafeBufferPointer { nd in
             let hayBase = fb.baseAddress!
@@ -100,6 +101,7 @@ public final class SearchEngine: @unchecked Sendable {
                     var ids = [Int32](); var total = 0
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        if delB[id] { continue }   // defensive tombstone skip
                         let o = Int(offB[id]); let l = Int(lenB[id])
                         if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil {
                             total += 1; ids.append(Int32(id))
@@ -108,7 +110,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outTot[c] = total
                 }
             }}
-        }}}}}
+        }}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out = [Int32](); out.reserveCapacity(min(total, limit))
@@ -181,6 +183,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.nameLen.withUnsafeBufferPointer { lenB in
         index.size.withUnsafeBufferPointer { szB in
         index.mtime.withUnsafeBufferPointer { mtB in
+        index.deleted.withUnsafeBufferPointer { delB in
         order.withUnsafeBufferPointer { ordB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
@@ -192,12 +195,17 @@ public final class SearchEngine: @unchecked Sendable {
                     var ids = [Int32](); var scores = [Int32](); var total = 0
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        if delB[id] { continue }   // defensive: skip tombstones even if order is stale
                         let o = Int(offB[id]); let l = Int(lenB[id])
-                        // filters first (cheap)
+                        // include filters (cheap) first
                         if !parsed.exts.isEmpty && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
                         if !parsed.sizes.isEmpty && !self.sizeMatches(szB[id], parsed.sizes) { continue }
                         if let df = parsed.dateFrom, mtB[id] < df { continue }
                         if let dt = parsed.dateTo, mtB[id] >= dt { continue }
+                        // negated filters: exclude if the candidate matches any of them
+                        if !parsed.notExts.isEmpty && self.extMatches(fbBase, o, l, parsed.notExts) { continue }
+                        if self.excludedBySize(szB[id], parsed.notSizes) { continue }
+                        if self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
                         // terms
                         let hayBase = caseSensitive ? nbBase : fbBase
                         var score = 0; var ok = true
@@ -236,7 +244,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
                 }
             }}}
-        }}}}}}}
+        }}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]
@@ -284,6 +292,22 @@ public final class SearchEngine: @unchecked Sendable {
             }
         }
         return true
+    }
+
+    // negated filters exclude if the candidate matches ANY of them
+    @inline(__always)
+    private func excludedBySize(_ s: Int64, _ nots: [(SizeOp, Int64)]) -> Bool {
+        for f in nots where sizeMatches(s, [f]) { return true }
+        return false
+    }
+    @inline(__always)
+    private func excludedByDate(_ mt: Int64, _ ranges: [(Int64?, Int64?)]) -> Bool {
+        for (from, to) in ranges {
+            let after = from.map { mt >= $0 } ?? true
+            let before = to.map { mt < $0 } ?? true
+            if after && before { return true }
+        }
+        return false
     }
 
     // MARK: - sort order (argsort) with caching

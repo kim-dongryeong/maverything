@@ -13,13 +13,20 @@ public struct QueryTerm: Sendable {
 /// it doesn't recognize falls back to a plain substring term (never errors).
 public struct ParsedQuery: Sendable {
     public var terms: [QueryTerm] = []
-    public var exts: [[UInt8]] = []                 // folded, no leading dot
+    public var exts: [[UInt8]] = []                 // folded, no leading dot (include)
     public var sizes: [(SizeOp, Int64)] = []
     public var dateFrom: Int64? = nil               // mtime ns >=
     public var dateTo: Int64? = nil                 // mtime ns <
+    // negated filters (`-ext:txt`, `-size:>1mb`, `-dm:today`): candidate must NOT match these
+    public var notExts: [[UInt8]] = []
+    public var notSizes: [(SizeOp, Int64)] = []
+    public var notDateRanges: [(Int64?, Int64?)] = []
     public var caseSensitive = false
 
-    public var hasFilters: Bool { !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil }
+    public var hasFilters: Bool {
+        !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
+            || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
+    }
     public var isEmpty: Bool { terms.isEmpty && !hasFilters }
 
     /// Fast-path eligibility: one positive name-scope term, no filters → the
@@ -51,11 +58,13 @@ public enum QueryParser {
             if let colon = tok.firstIndex(of: ":"), colon != tok.startIndex {
                 let key = String(tok[..<colon]).lowercased()
                 let val = String(tok[tok.index(after: colon)...])
-                if applyFilter(key: key, val: val, now: now, into: &q) { continue }
+                if applyFilter(key: key, val: val, negated: negated, now: now, into: &q) { continue }
                 // not a known filter → fall through as a plain term (keep the colon)
             }
 
-            let scope: TermScope = (tok.lowercased().hasPrefix("path:")) ? .path : defaultScope
+            // The prefix is authoritative BOTH ways (name: forces name scope even in ⌃U path mode)
+            let low = tok.lowercased()
+            let scope: TermScope = low.hasPrefix("name:") ? .name : (low.hasPrefix("path:") ? .path : defaultScope)
             let body = stripScopePrefix(tok).precomposedStringWithCanonicalMapping  // NFC to match index
             if body.isEmpty { continue }
             let bytes = q.caseSensitive ? Array(body.utf8) : Array(body.utf8).map(asciiLower)
@@ -69,7 +78,8 @@ public enum QueryParser {
         return s
     }
 
-    private static func applyFilter(key: String, val: String, now: TimeInterval, into q: inout ParsedQuery) -> Bool {
+    private static func applyFilter(key: String, val: String, negated: Bool,
+                                    now: TimeInterval, into q: inout ParsedQuery) -> Bool {
         switch key {
         case "name", "path":
             return false   // handled as scoped terms, not filters
@@ -77,14 +87,21 @@ public enum QueryParser {
             return true
         case "ext", "exts":
             for e in val.split(separator: ",") {
-                q.exts.append(Array(e.lowercased().utf8))
+                // strip one leading '.', fold with the SAME ASCII fold as the name blob
+                var s = String(e); if s.hasPrefix(".") { s.removeFirst() }
+                let bytes = Array(s.utf8).map(asciiLower)
+                if negated { q.notExts.append(bytes) } else { q.exts.append(bytes) }
             }
             return true
         case "size":
-            if let (op, n) = parseSize(val) { q.sizes.append((op, n)); return true }
-            return false
+            guard let (op, n) = parseSize(val) else { return false }
+            if negated { q.notSizes.append((op, n)) } else { q.sizes.append((op, n)) }
+            return true
         case "dm", "modified", "date":
-            return parseDate(val, now: now, into: &q)
+            guard let (from, to) = parseDate(val, now: now) else { return false }
+            if negated { q.notDateRanges.append((from, to)) }
+            else { if let f = from { q.dateFrom = f }; if let t = to { q.dateTo = t } }
+            return true
         default:
             return false
         }
@@ -105,31 +122,34 @@ public enum QueryParser {
         return (op, Int64(num * Double(mult)))
     }
 
-    static func parseDate(_ v: String, now: TimeInterval, into q: inout ParsedQuery) -> Bool {
+    /// Returns (from, to) mtime-ns bounds (half-open [from, to)). Uses the LOCAL
+    /// calendar consistently for both relative and explicit dates, and always sets
+    /// an upper bound for relative windows so future-dated files don't leak in.
+    static func parseDate(_ v: String, now: TimeInterval) -> (Int64?, Int64?)? {
         let s = v.lowercased()
+        let cal = Calendar.current
         let day: TimeInterval = 86_400
-        let startOfToday = (now - now.truncatingRemainder(dividingBy: day))
+        let startOfToday = cal.startOfDay(for: Date(timeIntervalSince1970: now)).timeIntervalSince1970
         func ns(_ t: TimeInterval) -> Int64 { Int64(t * 1e9) }
         switch s {
-        case "today": q.dateFrom = ns(startOfToday); return true
-        case "yesterday": q.dateFrom = ns(startOfToday - day); q.dateTo = ns(startOfToday); return true
-        case "week", "thisweek": q.dateFrom = ns(startOfToday - 7*day); return true
-        case "month": q.dateFrom = ns(startOfToday - 30*day); return true
+        case "today":            return (ns(startOfToday), ns(startOfToday + day))
+        case "yesterday":        return (ns(startOfToday - day), ns(startOfToday))
+        case "week", "thisweek": return (ns(startOfToday - 7 * day), ns(startOfToday + day))
+        case "month":            return (ns(startOfToday - 30 * day), ns(startOfToday + day))
         default: break
         }
         var op = "="; var datePart = s
         if s.hasPrefix(">") { op = ">"; datePart.removeFirst() }
         else if s.hasPrefix("<") { op = "<"; datePart.removeFirst() }
         let fmt = DateFormatter(); fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd"
-        guard let d = fmt.date(from: datePart) else { return false }
+        fmt.dateFormat = "yyyy-MM-dd"   // timeZone defaults to local, matching startOfDay above
+        guard let d = fmt.date(from: datePart) else { return nil }
         let t = d.timeIntervalSince1970
         switch op {
-        case ">": q.dateFrom = ns(t)
-        case "<": q.dateTo = ns(t)
-        default:  q.dateFrom = ns(t); q.dateTo = ns(t + day)
+        case ">": return (ns(t + day), nil)     // strictly after that day
+        case "<": return (nil, ns(t))
+        default:  return (ns(t), ns(t + day))    // that whole day
         }
-        return true
     }
 
     /// Split on whitespace but keep "quoted phrases" together.

@@ -325,8 +325,15 @@ struct ResultsTableView: NSViewRepresentable {
             }
             switch colID {
             case "name":
-                if let attr = highlightedName(name: r.name) { cell.textField?.attributedStringValue = attr }
-                else { cell.textField?.stringValue = r.name }
+                let hl = highlightedName(name: r.name)
+                let dots = TagCache.dots(forPath: r.path)   // Finder color tags → trailing dots
+                if hl == nil, dots == nil {
+                    cell.textField?.stringValue = r.name
+                } else {
+                    let base = NSMutableAttributedString(attributedString: hl ?? NSAttributedString(string: r.name))
+                    if let dots { base.append(dots) }
+                    cell.textField?.attributedStringValue = base
+                }
                 cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir)
             case "kind":
                 cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir)
@@ -671,7 +678,14 @@ struct ResultsTableView: NSViewRepresentable {
 
         @objc private func setTag(_ sender: NSMenuItem) {
             let tag = (sender.representedObject as? String) ?? ""
-            for p in selectedPaths() { writeTag(tag, to: p) }
+            for p in selectedPaths() { writeTag(tag, to: p); TagCache.invalidate(p) }
+            // refresh the tag dots on the affected rows
+            if let tv = tableView {
+                let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+                if col >= 0 {
+                    tv.reloadData(forRowIndexes: tv.selectedRowIndexes, columnIndexes: IndexSet(integer: col))
+                }
+            }
         }
 
         /// Write a single Finder tag (with its color) via the extended attribute — the

@@ -105,6 +105,60 @@ enum BundleSizeCache {
     }
 }
 
+/// Reads & caches Finder color tags (per path) so the list can show colored dots
+/// like Finder's list view. Reads are lazy (visible rows only) via the xattr.
+enum TagCache {
+    private static var cache: [String: [NSColor]] = [:]
+    private static let lock = NSLock()
+
+    static func colors(forPath path: String) -> [NSColor] {
+        lock.lock()
+        if let c = cache[path] { lock.unlock(); return c }
+        lock.unlock()
+        let cols = read(path)
+        lock.lock(); if cache.count < 20_000 { cache[path] = cols }; lock.unlock()
+        return cols
+    }
+
+    /// Colored "●" run to append after a filename, or nil if the file has no color tags.
+    static func dots(forPath path: String) -> NSAttributedString? {
+        let cols = colors(forPath: path)
+        guard !cols.isEmpty else { return nil }
+        let out = NSMutableAttributedString(string: " ")
+        for c in cols {
+            out.append(NSAttributedString(string: "●",
+                attributes: [.foregroundColor: c, .font: NSFont.systemFont(ofSize: 9)]))
+        }
+        return out
+    }
+
+    static func invalidate(_ path: String) { lock.lock(); cache[path] = nil; lock.unlock() }
+
+    private static func read(_ path: String) -> [NSColor] {
+        let name = "com.apple.metadata:_kMDItemUserTags"
+        let size = getxattr(path, name, nil, 0, 0, 0)
+        guard size > 0 else { return [] }
+        var data = Data(count: size)
+        let got = data.withUnsafeMutableBytes { getxattr(path, name, $0.baseAddress, size, 0, 0) }
+        guard got > 0 else { return [] }
+        guard let arr = try? PropertyListSerialization.propertyList(
+            from: data.prefix(got), options: [], format: nil) as? [String] else { return [] }
+        return arr.compactMap { tagColor($0) }
+    }
+
+    // Tag strings are "Name\nColorCode"; map Finder's codes to colors (no code → no dot).
+    private static func tagColor(_ s: String) -> NSColor? {
+        let parts = s.split(separator: "\n", omittingEmptySubsequences: false)
+        guard parts.count >= 2, let code = Int(parts[1]) else { return nil }
+        switch code {
+        case 1: return .systemGray;   case 2: return .systemGreen
+        case 3: return .systemPurple; case 4: return .systemBlue
+        case 5: return .systemYellow; case 6: return .systemRed
+        case 7: return .systemOrange; default: return nil
+        }
+    }
+}
+
 /// Tiny icon cache so list/preview rows don't re-fetch NSWorkspace icons.
 enum IconCache {
     private static var cache: [String: NSImage] = [:]   // keyed by extension / "dir" / "file"

@@ -18,6 +18,11 @@ final class MVTableView: NSTableView {
         switch event.keyCode {
         case 125, 126, 116, 121, 115, 119:   // ↓ ↑ pgDn pgUp home end
             coordinator?.model.lastNavAt = ProcessInfo.processInfo.systemUptime
+            // A HELD key delivers auto-repeats each in its own runloop cycle, so per-cycle
+            // coalescing still published once per repeat — a SwiftUI transaction between
+            // every native selection step (the residual jank). During a repeat run we stop
+            // publishing entirely; keyUp (or a quiet-gap fallback) publishes ONCE at the end.
+            if event.isARepeat { coordinator?.beginNavRepeat() }
         default: break
         }
         if event.keyCode == 8 {                                 // C
@@ -58,6 +63,15 @@ final class MVTableView: NSTableView {
         default:
             super.keyDown(with: event)   // arrows etc. → native selection movement
         }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        switch event.keyCode {
+        case 125, 126, 116, 121, 115, 119:   // nav key released → publish the final selection once
+            coordinator?.endNavRepeat()
+        default: break
+        }
+        super.keyUp(with: event)
     }
 
     func toggleQuickLook() {
@@ -326,7 +340,17 @@ struct ResultsTableView: NSViewRepresentable {
             switch colID {
             case "name":
                 let hl = highlightedName(name: r.name)
-                let dots = TagCache.dots(forPath: r.path)   // Finder color tags → trailing dots
+                // Tag dots + bundle icons resolve off-thread on cache miss (no getxattr /
+                // icon-services XPC on the main thread while arrow-hold scrolls new rows);
+                // when they land, just re-render this row's name cell from the cache.
+                let refreshName: () -> Void = { [weak tableView] in
+                    guard let tv = tableView else { return }
+                    let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+                    if col >= 0, row < tv.numberOfRows {
+                        tv.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: col))
+                    }
+                }
+                let dots = TagCache.dots(forPath: r.path, onReady: refreshName)   // Finder color tags
                 if hl == nil, dots == nil {
                     cell.textField?.stringValue = r.name
                 } else {
@@ -334,7 +358,7 @@ struct ResultsTableView: NSViewRepresentable {
                     if let dots { base.append(dots) }
                     cell.textField?.attributedStringValue = base
                 }
-                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir)
+                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir, onReady: refreshName)
             case "kind":
                 cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir)
                 cell.textField?.textColor = .secondaryLabelColor
@@ -462,13 +486,35 @@ struct ResultsTableView: NSViewRepresentable {
         private var pendingBytesWork: DispatchWorkItem?
         private var selectionToken = 0
         private var selectionPublishPending = false
+        private var navRepeatActive = false
+        private var navRepeatFallback: DispatchWorkItem?
+
+        /// A nav key is auto-repeating: stop mirroring selection into the model entirely
+        /// (each publish is a SwiftUI transaction between native selection steps — the
+        /// hold jank). keyUp publishes once; a quiet-gap fallback covers a lost keyUp
+        /// (e.g. focus change mid-hold).
+        func beginNavRepeat() {
+            navRepeatActive = true
+            navRepeatFallback?.cancel()
+            let w = DispatchWorkItem { [weak self] in self?.endNavRepeat() }
+            navRepeatFallback = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
+        }
+
+        func endNavRepeat() {
+            navRepeatFallback?.cancel(); navRepeatFallback = nil
+            guard navRepeatActive else { return }
+            navRepeatActive = false
+            if let tv = tableView { publishSelection(tv) }
+        }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
-            // AppKit calls this SYNCHRONOUSLY inside keyDown, on every arrow auto-repeat.
-            // Publishing the @Published mirrors (which drives a SwiftUI transaction) here
-            // would run on every keyDown and starve the native selection movement → the
-            // held-arrow "jumps". Coalesce to ONE publish per runloop tick so keyDown
-            // returns immediately and the native row-by-row movement stays smooth.
+            // AppKit calls this SYNCHRONOUSLY inside keyDown. During a held-key repeat run
+            // we suppress publishing wholesale (see beginNavRepeat) — the visible selection
+            // is native NSTableView state and needs no model mirror to move smoothly.
+            if navRepeatActive { return }
+            // Otherwise coalesce to one publish per runloop tick (mouse drags, programmatic
+            // multi-select changes) so a burst still collapses.
             if selectionPublishPending { return }
             selectionPublishPending = true
             DispatchQueue.main.async { [weak self] in

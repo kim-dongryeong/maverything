@@ -106,24 +106,36 @@ enum BundleSizeCache {
 }
 
 /// Reads & caches Finder color tags (per path) so the list can show colored dots
-/// like Finder's list view. Reads are lazy (visible rows only) via the xattr.
+/// like Finder's list view. Cache misses are resolved OFF the main thread (the
+/// getxattr syscall per fresh row adds up during sustained arrow-hold scrolling);
+/// `onReady` fires on main once colors are cached — only when there ARE tags.
 enum TagCache {
     private static var cache: [String: [NSColor]] = [:]
+    private static var inflight: Set<String> = []
     private static let lock = NSLock()
 
-    static func colors(forPath path: String) -> [NSColor] {
+    /// Cached colors, or nil while unknown (a background fetch is kicked off).
+    static func colors(forPath path: String, onReady: (() -> Void)? = nil) -> [NSColor]? {
         lock.lock()
         if let c = cache[path] { lock.unlock(); return c }
-        lock.unlock()
-        let cols = read(path)
-        lock.lock(); if cache.count < 20_000 { cache[path] = cols }; lock.unlock()
-        return cols
+        if inflight.contains(path) { lock.unlock(); return nil }
+        inflight.insert(path); lock.unlock()
+        DispatchQueue.global(qos: .utility).async {
+            let cols = read(path)
+            lock.lock()
+            if cache.count < 20_000 { cache[path] = cols }
+            inflight.remove(path)
+            lock.unlock()
+            // Re-render only when the row actually has dots to show.
+            if !cols.isEmpty, let onReady { DispatchQueue.main.async { onReady() } }
+        }
+        return nil
     }
 
-    /// Colored "●" run to append after a filename, or nil if the file has no color tags.
-    static func dots(forPath path: String) -> NSAttributedString? {
-        let cols = colors(forPath: path)
-        guard !cols.isEmpty else { return nil }
+    /// Colored "●" run to append after a filename, or nil if the file has no color tags
+    /// (or they're still loading — `onReady` re-renders the row when they arrive).
+    static func dots(forPath path: String, onReady: (() -> Void)? = nil) -> NSAttributedString? {
+        guard let cols = colors(forPath: path, onReady: onReady), !cols.isEmpty else { return nil }
         let out = NSMutableAttributedString(string: " ")
         for c in cols {
             out.append(NSAttributedString(string: "●",
@@ -160,10 +172,16 @@ enum TagCache {
 }
 
 /// Tiny icon cache so list/preview rows don't re-fetch NSWorkspace icons.
+/// Non-bundle icons are keyed per extension (misses are rare after warm-up), but
+/// bundles (.app/.framework…) are keyed PER PATH — those misses hit icon services
+/// (XPC, can take ms) so they resolve OFF the main thread behind a placeholder,
+/// with `onReady` re-rendering the row when the real icon lands.
 enum IconCache {
-    private static var cache: [String: NSImage] = [:]   // keyed by extension / "dir" / "file"
+    private static var cache: [String: NSImage] = [:]   // keyed by extension / "dir" / "file" / bundle path
+    private static var inflight: Set<String> = []
     private static let lock = NSLock()
-    static func icon(for path: String, isDir: Bool) -> NSImage {
+
+    static func icon(for path: String, isDir: Bool, onReady: (() -> Void)? = nil) -> NSImage {
         let ext = (path as NSString).pathExtension.lowercased()
         // A directory WITH an extension is a bundle/package (.app, .framework, .bundle…)
         // and carries its OWN icon — key it by path so it doesn't collapse onto the shared
@@ -171,12 +189,34 @@ enum IconCache {
         let isBundle = isDir && !ext.isEmpty
         let key = isBundle ? ("\u{1}pkg\u{1}" + path)
                            : (isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext))
-        lock.lock(); defer { lock.unlock() }
-        if let c = cache[key] { return c }
+        lock.lock()
+        if let c = cache[key] { lock.unlock(); return c }
+        lock.unlock()
+
+        if isBundle, let onReady {
+            // Placeholder now; real bundle icon off-thread (NSWorkspace is thread-safe here).
+            lock.lock()
+            let queued = !inflight.insert(key).inserted
+            lock.unlock()
+            if !queued {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let img = NSWorkspace.shared.icon(forFile: path)
+                    img.size = NSSize(width: 16, height: 16)
+                    lock.lock()
+                    if cache.count < 5_000 { cache[key] = img }   // cap per-path growth
+                    inflight.remove(key)
+                    lock.unlock()
+                    DispatchQueue.main.async { onReady() }
+                }
+            }
+            return icon(for: "/", isDir: true)   // shared generic-folder placeholder (cached)
+        }
+
         let img = NSWorkspace.shared.icon(forFile: path)
         img.size = NSSize(width: 16, height: 16)
-        // Per-path bundle icons could grow unbounded as the user scrolls; cap them.
+        lock.lock()
         if !isBundle || cache.count < 5_000 { cache[key] = img }
+        lock.unlock()
         return img
     }
 }

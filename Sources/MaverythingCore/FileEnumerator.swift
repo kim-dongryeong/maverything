@@ -211,7 +211,7 @@ public final class FileEnumerator: @unchecked Sendable {
 
                 // A mounted volume is crawled as its OWN root, so don't also add it here as a
                 // childless stub under its parent (that duplicates the entry and, via
-                // dirIndexByPath last-write-wins, would orphan the real subtree).
+                // dirIndexByHash last-write-wins, would orphan the real subtree).
                 if objType == VNODE_VDIR, !mountPoints.isEmpty {
                     // NFC so a non-ASCII mount name (e.g. /Volumes/외장하드) matches the NFC
                     // mountPoints set — otherwise the crawl double-indexes the volume.

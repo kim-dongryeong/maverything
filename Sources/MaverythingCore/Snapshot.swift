@@ -213,7 +213,7 @@ extension FileIndex {
             flags = loadedFlags
             hidden = loadedHiddenBytes.map { $0 != 0 }
             deleted = [Bool](repeating: false, count: count)
-            childrenOf.removeAll(); dirIndexByPath.removeAll()
+            childrenOf.removeAll(); dirIndexByHash.removeAll()
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }
     }

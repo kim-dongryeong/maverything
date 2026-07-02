@@ -34,10 +34,16 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var deleted: [Bool] = []     // tombstones (live removals)
 
     // Live-update indexes (built during crawl, maintained by the reconciler).
-    // childrenOf maps a directory entry to its child entry indices; dirIndexByPath
-    // maps a directory's DISPLAY path to its entry index so FSEvents paths resolve.
+    // childrenOf maps a directory entry to its child entry indices; dirIndexByHash
+    // maps the FNV-1a 64 hash of a directory's DISPLAY path (NFC bytes) to its entry
+    // index so FSEvents paths resolve WITHOUT storing every directory's path string
+    // (~400k dirs × 60-100+ B each). Lookups verify the hit by reconstructing the
+    // entry's real path, so a hash collision can never resolve to a wrong directory —
+    // it just misses (nil) and the caller treats the dir as unknown. Two different
+    // dirs colliding on insert is last-write-wins (same as the old String map for
+    // equal paths); the loser merely falls back to parent-rescan reconciles.
     var childrenOf: [Int32: [Int32]] = [:]
-    var dirIndexByPath: [String: Int32] = [:]
+    var dirIndexByHash: [UInt64: Int32] = [:]
 
     /// A READ-WRITE lock: many concurrent readers (searches + row/path accessors +
     /// main-thread cell rendering) run in parallel; only mutations (crawl append,
@@ -109,7 +115,7 @@ public final class FileIndex: @unchecked Sendable {
         flags.removeAll(keepingCapacity: false); hidden.removeAll(keepingCapacity: false)
         deleted.removeAll(keepingCapacity: false)
         childrenOf.removeAll(keepingCapacity: false)
-        dirIndexByPath.removeAll(keepingCapacity: false)
+        dirIndexByHash.removeAll(keepingCapacity: false)
     }
 
     public func reserveCapacity(_ n: Int) {
@@ -175,31 +181,48 @@ public final class FileIndex: @unchecked Sendable {
         return base
     }
 
-    /// Builds the live-update maps (childrenOf, dirIndexByPath) in one O(n) pass
+    /// Builds the live-update maps (childrenOf, dirIndexByHash) in one O(n) pass
     /// after the crawl. Entries are appended parent-before-child, so a forward
-    /// pass can compute each directory's display path from its parent's. This is
-    /// far faster than doing it under the crawl lock.
+    /// pass can extend each directory's display-path FNV state from its parent's —
+    /// no path string is ever materialized (FNV-1a streams left-to-right, and a
+    /// child's display path is parentPath + "/" + name), so the only transient is
+    /// one UInt64 per entry instead of an array of every directory path string.
     public func buildLiveIndexes() {
         wrlock(); defer { unlock() }
         let n = nameOff.count
         childrenOf.removeAll(keepingCapacity: true)
-        dirIndexByPath.removeAll(keepingCapacity: true)
-        var dirPath = [String?](repeating: nil, count: n)   // display path for dir entries
-        for i in 0..<n {
-            let p = parent[i]
-            if p >= 0 { childrenOf[p, default: []].append(Int32(i)) }
-            if objType[i] == VNODE_VDIR {
-                let nm = _name(i)
-                let path: String
-                if p < 0 {
-                    path = nm   // root: name IS the display path
-                } else if let base = dirPath[Int(p)] {
-                    path = base == "/" ? "/" + nm : base + "/" + nm
-                } else {
-                    path = nm   // shouldn't happen (parent dir precedes child)
+        dirIndexByHash.removeAll(keepingCapacity: true)
+        var dirHash = [UInt64](repeating: 0, count: n)   // FNV state of each dir's display path
+        nameBlob.withUnsafeBufferPointer { blob in
+            // Feed entry i's name bytes into FNV state h. Blob bytes are NFC (normalized
+            // at ingestion), so this equals hashing the reconstructed path's String.utf8.
+            func feedName(_ h: UInt64, _ i: Int) -> UInt64 {
+                var h = h
+                let o = Int(nameOff[i]), e = o + Int(nameLen[i])
+                for k in o..<e { h = fnvFeed(h, blob[k]) }
+                return h
+            }
+            for i in 0..<n {
+                let p = parent[i]
+                if p >= 0 { childrenOf[p, default: []].append(Int32(i)) }
+                if objType[i] == VNODE_VDIR {
+                    let pi = Int(p)
+                    let h: UInt64
+                    if p < 0 {
+                        h = feedName(fnvOffsetBasis, i)   // root: name IS the display path
+                    } else if pi < i, objType[pi] == VNODE_VDIR {
+                        // parentPath + "/" + name — unless the parent is a "/" root,
+                        // whose display path already IS the separator ("/" + name).
+                        let parentIsSlashRoot = parent[pi] < 0 && nameLen[pi] == 1
+                            && blob[Int(nameOff[pi])] == UInt8(ascii: "/")
+                        h = feedName(parentIsSlashRoot ? dirHash[pi]
+                                                       : fnvFeed(dirHash[pi], UInt8(ascii: "/")), i)
+                    } else {
+                        h = feedName(fnvOffsetBasis, i)   // shouldn't happen (parent dir precedes child)
+                    }
+                    dirHash[i] = h
+                    dirIndexByHash[h] = Int32(i)   // "/" roots collide; harmless
                 }
-                dirPath[i] = path
-                dirIndexByPath[path] = Int32(i)   // "/" roots collide; harmless
             }
         }
     }
@@ -246,10 +269,27 @@ public final class FileIndex: @unchecked Sendable {
     public func path(_ i: Int) -> String { rdlock(); defer { unlock() }; return _path(i) }
 
     /// Resolve a folder's absolute path to its entry index (for folder-scoped search).
+    /// NFC-normalizes first: the map is keyed by NFC bytes, whereas the old String
+    /// dictionary hashed canonically-equivalent paths identically.
     public func dirIndex(forPath p: String) -> Int32? {
         rdlock(); defer { unlock() }
-        guard let i = dirIndexByPath[p], !deleted[Int(i)] else { return nil }
+        return _dirIndexVerified(p.precomposedStringWithCanonicalMapping)
+    }
+
+    /// Hash-keyed dir lookup with verification (caller holds the lock; `p` must be NFC).
+    /// Reconstructs the candidate's real path and compares, so an FNV collision can
+    /// never resolve to a WRONG directory — a colliding query just misses (nil), which
+    /// callers already treat as "unknown dir" (safe parent-rescan fallback).
+    @inline(__always) private func _dirIndexVerified(_ p: String) -> Int32? {
+        guard let i = dirIndexByHash[pathHash(p)], !deleted[Int(i)], _path(Int(i)) == p else { return nil }
         return i
+    }
+
+    /// FNV-1a 64 over the NFC display-path bytes (the dirIndexByHash key).
+    @inline(__always) private func pathHash(_ s: String) -> UInt64 {
+        var h = fnvOffsetBasis
+        for b in s.utf8 { h = fnvFeed(h, b) }
+        return h
     }
 
     /// Total size of everything inside a directory subtree — the "size" Finder shows
@@ -312,8 +352,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Look up a directory entry by its display path (FSEvents path).
     func liveDirIndex(forDisplayPath p: String) -> Int32? {
         rdlock(); defer { unlock() }
-        guard let i = dirIndexByPath[p], !deleted[Int(i)] else { return nil }
-        return i
+        return _dirIndexVerified(p.precomposedStringWithCanonicalMapping)
     }
 
     /// Tombstone a mounted root (or any indexed directory subtree) by display path.
@@ -322,7 +361,7 @@ public final class FileIndex: @unchecked Sendable {
     public func markDeletedSubtree(displayPath rawPath: String) -> Int {
         wrlock(); defer { unlock() }
         let p = rawPath.precomposedStringWithCanonicalMapping
-        guard let idx = dirIndexByPath[p], !deleted[Int(idx)] else { return 0 }
+        guard let idx = _dirIndexVerified(p) else { return 0 }
         let removed = _markDeletedSubtree(idx)
         if removed > 0 { bumpMut() }
         return removed
@@ -331,7 +370,7 @@ public final class FileIndex: @unchecked Sendable {
     /// Tombstone any CHILD-STUB copy of a mounted volume's path — an entry for the same
     /// display path indexed as a child of its parent dir (e.g. /Volumes) by a reconciler
     /// racing the mount — while keeping the appended ROOT copy (parent == -1). Re-points
-    /// dirIndexByPath at the root copy. Returns rows tombstoned.
+    /// dirIndexByHash at the root copy. Returns rows tombstoned.
     @discardableResult
     public func tombstoneChildStubCopies(ofRootPath rawPath: String) -> Int {
         wrlock(); defer { unlock() }
@@ -342,14 +381,14 @@ public final class FileIndex: @unchecked Sendable {
         let lastName = (p as NSString).lastPathComponent
         var removed = 0
         // The stub lives under the parent dir's children; the root copy has parent == -1.
-        if let pi = dirIndexByPath[parentPath], !deleted[Int(pi)], let kids = childrenOf[pi] {
+        if let pi = _dirIndexVerified(parentPath), let kids = childrenOf[pi] {
             for k in kids where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
                 removed += _markDeletedSubtree(k)
             }
         }
         // Ensure the path resolves to the surviving root copy for future reconciles.
         for i in 0..<parent.count where parent[i] == -1 && !deleted[i] && _name(i) == p {
-            dirIndexByPath[p] = Int32(i)
+            dirIndexByHash[pathHash(p)] = Int32(i)
             break
         }
         if removed > 0 { bumpMut() }
@@ -385,7 +424,7 @@ public final class FileIndex: @unchecked Sendable {
                                 mtime: c.mtime, crtime: c.crtime, objType: c.objType, flags: c.flags)
             if c.objType == VNODE_VDIR {
                 let cp = displayPath == "/" ? "/" + nameStr : displayPath + "/" + nameStr
-                dirIndexByPath[cp] = ni
+                dirIndexByHash[pathHash(cp)] = ni
                 res.newDirs.append(LiveDir(idx: ni, path: cp))  // recurse into it
             }
             return ni
@@ -443,12 +482,12 @@ public final class FileIndex: @unchecked Sendable {
             if deleted[c] { continue }
             deleted[c] = true
             removed += 1
-            // Drop the path→id mapping so it can't leak for the whole session on high churn
+            // Drop the hash→id mapping so it can't leak for the whole session on high churn
             // (e.g. repeatedly deleted node_modules/build dirs). Guard on identity so we never
             // remove a same-path entry that was just re-created (file→dir flip re-adds after this).
             if objType[c] == VNODE_VDIR {
-                let pth = _path(c)
-                if dirIndexByPath[pth] == cur { dirIndexByPath.removeValue(forKey: pth) }
+                let h = pathHash(_path(c))
+                if dirIndexByHash[h] == cur { dirIndexByHash.removeValue(forKey: h) }
             }
             if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
         }
@@ -484,6 +523,14 @@ public let VNODE_VLNK: UInt8 = 5   // symbolic link (crawled with NOFOLLOW)
 
 let noUnicodeFoldOffset = UInt64.max
 private let searchFoldLocale = Locale(identifier: "en_US_POSIX")
+
+// FNV-1a 64 primitives for dirIndexByHash keys (streamed byte-by-byte so
+// buildLiveIndexes can extend a parent dir's path hash without building strings).
+private let fnvOffsetBasis: UInt64 = 0xcbf2_9ce4_8422_2325
+private let fnvPrime: UInt64 = 0x100_0000_01b3
+@inline(__always) private func fnvFeed(_ h: UInt64, _ b: UInt8) -> UInt64 {
+    (h ^ UInt64(b)) &* fnvPrime
+}
 
 @inline(__always) private func checkedBlobOffset(_ local: UInt64, adding base: UInt64) -> UInt64 {
     let (offset, overflow) = local.addingReportingOverflow(base)

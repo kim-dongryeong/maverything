@@ -188,8 +188,24 @@ public final class SearchEngine: @unchecked Sendable {
         let relevance = (sortKey == .relevance)
         let order = orderArray(for: relevance ? .name : sortKey)
         let n = order.count
-        let needsPath = parsed.terms.contains { $0.scope == .path }
         let caseSensitive = parsed.caseSensitive
+        // Flatten term bytes into one contiguous buffer + trivial refs so the hot loop
+        // uses raw pointers only. Touching each term's [UInt8] array (ARC retain/release)
+        // per candidate made multi-term scans ~10x slower than single-term.
+        var termBlob: [UInt8] = []
+        var termRefs: [(off: Int, len: Int, negated: Bool, isPath: Bool)] = []
+        termRefs.reserveCapacity(parsed.terms.count)
+        for t in parsed.terms {
+            termRefs.append((termBlob.count, t.bytes.count, t.negated, t.scope == .path))
+            termBlob.append(contentsOf: t.bytes)
+        }
+        let termCount = termRefs.count
+        // Hoist filter presence out of the loop (avoid per-candidate array access + ARC).
+        let hasExts = !parsed.exts.isEmpty, hasSizes = !parsed.sizes.isEmpty
+        let hasNotExts = !parsed.notExts.isEmpty, hasNotSizes = !parsed.notSizes.isEmpty
+        let hasNotDates = !parsed.notDateRanges.isEmpty
+        let df = parsed.dateFrom, dt = parsed.dateTo
+        let onlyDirs = parsed.onlyDirs, onlyFiles = parsed.onlyFiles
 
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
@@ -207,7 +223,10 @@ public final class SearchEngine: @unchecked Sendable {
         index.objType.withUnsafeBufferPointer { otB in
         index.parent.withUnsafeBufferPointer { parB in
         order.withUnsafeBufferPointer { ordB in
+        termBlob.withUnsafeBufferPointer { tblobB in
+        termRefs.withUnsafeBufferPointer { trefsB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
+            let tblobBase = tblobB.baseAddress   // non-nil whenever termCount > 0
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkScores.withUnsafeMutableBufferPointer { outScores in
             chunkTotals.withUnsafeMutableBufferPointer { outTot in
@@ -221,44 +240,44 @@ public final class SearchEngine: @unchecked Sendable {
                         // folder scope: only entries under the chosen directory subtree
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         // type filters (folder: / file:)
-                        if parsed.onlyDirs && otB[id] != VNODE_VDIR { continue }
-                        if parsed.onlyFiles && otB[id] == VNODE_VDIR { continue }
+                        if onlyDirs && otB[id] != VNODE_VDIR { continue }
+                        if onlyFiles && otB[id] == VNODE_VDIR { continue }
                         let o = Int(offB[id]); let l = Int(lenB[id])
                         // include filters (cheap) first
-                        if !parsed.exts.isEmpty && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
-                        if !parsed.sizes.isEmpty && !self.sizeMatches(szB[id], parsed.sizes) { continue }
-                        if let df = parsed.dateFrom, mtB[id] < df { continue }
-                        if let dt = parsed.dateTo, mtB[id] >= dt { continue }
+                        if hasExts && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
+                        if hasSizes && !self.sizeMatches(szB[id], parsed.sizes) { continue }
+                        if let df, mtB[id] < df { continue }
+                        if let dt, mtB[id] >= dt { continue }
                         // negated filters: exclude if the candidate matches any of them
-                        if !parsed.notExts.isEmpty && self.extMatches(fbBase, o, l, parsed.notExts) { continue }
-                        if self.excludedBySize(szB[id], parsed.notSizes) { continue }
-                        if self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
-                        // terms
+                        if hasNotExts && self.extMatches(fbBase, o, l, parsed.notExts) { continue }
+                        if hasNotSizes && self.excludedBySize(szB[id], parsed.notSizes) { continue }
+                        if hasNotDates && self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
+                        // terms — raw pointers into the flattened term blob (no per-candidate ARC)
                         let hayBase = caseSensitive ? nbBase : fbBase
                         var score = 0; var ok = true
                         var pathBytes: [UInt8]? = nil
-                        for term in parsed.terms {
+                        var ti = 0
+                        while ti < termCount {
+                            let tr = trefsB[ti]
+                            let needlePtr = tblobBase! + tr.off
                             let out: MatchOutcome
-                            if term.scope == .path || (needsPath && false) {
+                            if tr.isPath {
                                 if pathBytes == nil {
                                     let p = self.index._path(id)
                                     pathBytes = caseSensitive ? Array(p.utf8) : Array(p.utf8).map(asciiLower)
                                 }
-                                out = term.bytes.withUnsafeBufferPointer { tb in
-                                    pathBytes!.withUnsafeBufferPointer { pb in
-                                        Matcher.match(hay: pb.baseAddress!, hayLen: pb.count,
-                                                      needle: tb.baseAddress!, needleLen: tb.count, mode: mode)
-                                    }
+                                out = pathBytes!.withUnsafeBufferPointer { pb in
+                                    Matcher.match(hay: pb.baseAddress!, hayLen: pb.count,
+                                                  needle: needlePtr, needleLen: tr.len, mode: mode)
                                 }
                             } else {
-                                out = term.bytes.withUnsafeBufferPointer { tb in
-                                    Matcher.match(hay: hayBase + o, hayLen: l,
-                                                  needle: tb.baseAddress!, needleLen: tb.count, mode: mode)
-                                }
+                                out = Matcher.match(hay: hayBase + o, hayLen: l,
+                                                    needle: needlePtr, needleLen: tr.len, mode: mode)
                             }
-                            let pass = term.negated ? !out.matched : out.matched
+                            let pass = tr.negated ? !out.matched : out.matched
                             if !pass { ok = false; break }
-                            if !term.negated { score += out.score }
+                            if !tr.negated { score += out.score }
+                            ti += 1
                         }
                         if !ok { continue }
                         total += 1
@@ -271,7 +290,7 @@ public final class SearchEngine: @unchecked Sendable {
                     outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
                 }
             }}}
-        }}}}}}}}}}
+        }}}}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]

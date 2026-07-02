@@ -131,6 +131,9 @@ final class AppModel: ObservableObject {
     private let searchQueue = DispatchQueue(label: "maverything.search", qos: .userInteractive)
     private let indexQueue = DispatchQueue(label: "maverything.index", qos: .userInitiated)
     private var searchSeq = 0
+    private let seqLock = NSLock()   // guards searchSeq so the search queue can pre-check staleness
+    private func nextSearchSeq() -> Int { seqLock.lock(); searchSeq &+= 1; let v = searchSeq; seqLock.unlock(); return v }
+    private func currentSearchSeq() -> Int { seqLock.lock(); defer { seqLock.unlock() }; return searchSeq }
     private var started = false
     private var currentEnumerator: FileEnumerator?
     private var indexGen = 0
@@ -540,8 +543,7 @@ final class AppModel: ObservableObject {
 
     func runSearch() {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
-        searchSeq &+= 1
-        let seq = searchSeq
+        let seq = nextSearchSeq()
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
         let root = scopeRoot
         let now = Date().timeIntervalSince1970
@@ -549,13 +551,16 @@ final class AppModel: ObservableObject {
         let idx = self.index
         searchQueue.async { [weak self] in
             guard let self else { return }
+            // Superseded by a newer keystroke before our turn on the serial queue → skip
+            // the whole scan (typing enqueues many searches; only the latest need run).
+            guard self.currentSearchSeq() == seq else { return }
             let rootIdx = root.flatMap { idx.dirIndex(forPath: $0) }
             // A folder scope that can't be resolved (deleted/renamed folder, or the
             // index mid-reindex) must NOT silently degrade into a whole-disk search —
             // return nothing, since the scope chip still says "in <folder>".
             if root != nil, rootIdx == nil {
                 DispatchQueue.main.async {
-                    guard seq == self.searchSeq else { return }
+                    guard self.currentSearchSeq() == seq else { return }
                     self.resultsStore.ids = []; self.resultTotal = 0; self.resultShown = 0
                     self.resultsVersion &+= 1
                 }
@@ -564,7 +569,7 @@ final class AppModel: ObservableObject {
             let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc,
                                     now: now, scopeRoot: rootIdx)
             DispatchQueue.main.async {
-                guard seq == self.searchSeq else { return }   // drop stale
+                guard self.currentSearchSeq() == seq else { return }   // drop stale
                 self.resultsStore.ids = res.ids
                 self.resultTotal = res.total
                 self.resultShown = res.ids.count

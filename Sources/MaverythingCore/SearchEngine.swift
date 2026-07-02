@@ -24,12 +24,24 @@ public final class SearchEngine: @unchecked Sendable {
     public internal(set) var generation: Int = 0
     private let cacheLock = NSLock()
 
+    // Incremental "narrow as you type": remember the FULL match set of the last simple
+    // exact query so the next keystroke (which appends to it) can rescan only that set
+    // instead of the whole index. Everything's key perceived-speed trick.
+    private let incLock = NSLock()
+    private var incValid = false
+    private var incNeedle: [UInt8] = []
+    private var incIDs: [Int32] = []          // full, untruncated, in sort order
+    private var incSortKey: SortKey = .name
+    private var incAscending = true
+    private var incGen = -1
+
     public init(index: FileIndex, workers: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.index = index
         self.workerCount = max(1, workers)
     }
 
     public func invalidate() { cacheLock.lock(); generation &+= 1; cacheLock.unlock() }
+    private func currentGen() -> Int { cacheLock.lock(); defer { cacheLock.unlock() }; return generation }
 
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
@@ -129,46 +141,99 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func fastExact(needle: [UInt8], sortKey: SortKey, ascending: Bool,
                            limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
-        let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
-        let n = order.count
-        let nChunks = max(1, min(workerCount, n / 16_000 + 1))
-        let chunkSize = (n + nChunks - 1) / nChunks
-        var chunkIDs = [[Int32]](repeating: [], count: nChunks)
-        var chunkTotals = [Int](repeating: 0, count: nChunks)
+        let gen = currentGen()
+        // Incremental narrowing: if this needle extends the cached one (same order + index
+        // generation), rescan ONLY the cached full match set — O(prev matches), not O(index).
+        var base: [Int32]? = nil
+        incLock.lock()
+        if incValid, incGen == gen, incSortKey == sortKey, incAscending == ascending,
+           !incNeedle.isEmpty, needle.count > incNeedle.count, Self.hasPrefix(needle, incNeedle) {
+            base = incIDs
+        }
+        incLock.unlock()
 
-        index.foldBlob.withUnsafeBufferPointer { fb in
-        index.nameOff.withUnsafeBufferPointer { offB in
-        index.nameLen.withUnsafeBufferPointer { lenB in
-        index.deleted.withUnsafeBufferPointer { delB in
-        order.withUnsafeBufferPointer { ordB in
-        needle.withUnsafeBufferPointer { nd in
-            let hayBase = fb.baseAddress!
-            let needleBase = UnsafeRawPointer(nd.baseAddress!)
-            let needleLen = needle.count
-            chunkIDs.withUnsafeMutableBufferPointer { outIDs in
-            chunkTotals.withUnsafeMutableBufferPointer { outTot in
-                DispatchQueue.concurrentPerform(iterations: nChunks) { c in
-                    let lo = c * chunkSize, hi = min(n, lo + chunkSize)
-                    if lo >= hi { return }
-                    var ids = [Int32](); var total = 0
-                    for k in lo..<hi {
-                        let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
-                        if delB[id] { continue }   // defensive tombstone skip
-                        let o = Int(offB[id]); let l = Int(lenB[id])
-                        if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil {
-                            total += 1; ids.append(Int32(id))
-                        }
-                    }
-                    outIDs[c] = ids; outTot[c] = total
+        var full: [Int32]     // the COMPLETE match set (in sort order), before the display cap
+
+        if let base {
+            // Serial rescan of the (already ordered, already small) previous result set.
+            var res = [Int32](); res.reserveCapacity(base.count)
+            index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+            index.deleted.withUnsafeBufferPointer { delB in
+            needle.withUnsafeBufferPointer { nd in
+                let hayBase = fb.baseAddress!
+                let needleBase = UnsafeRawPointer(nd.baseAddress!)
+                let needleLen = needle.count
+                for id32 in base {
+                    let id = Int(id32)
+                    if delB[id] { continue }
+                    let o = Int(offB[id]); let l = Int(lenB[id])
+                    if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil { res.append(id32) }
                 }
-            }}
-        }}}}}}
+            }}}}}
+            full = res
+        } else {
+            let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+            let n = order.count
+            let nChunks = max(1, min(workerCount, n / 16_000 + 1))
+            let chunkSize = (n + nChunks - 1) / nChunks
+            var chunkIDs = [[Int32]](repeating: [], count: nChunks)
 
-        let total = chunkTotals.reduce(0, +)
-        var out = [Int32](); out.reserveCapacity(min(total, limit))
-        outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
+            index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+            index.deleted.withUnsafeBufferPointer { delB in
+            order.withUnsafeBufferPointer { ordB in
+            needle.withUnsafeBufferPointer { nd in
+                let hayBase = fb.baseAddress!
+                let needleBase = UnsafeRawPointer(nd.baseAddress!)
+                let needleLen = needle.count
+                chunkIDs.withUnsafeMutableBufferPointer { outIDs in
+                    DispatchQueue.concurrentPerform(iterations: nChunks) { c in
+                        let lo = c * chunkSize, hi = min(n, lo + chunkSize)
+                        if lo >= hi { return }
+                        var ids = [Int32]()
+                        for k in lo..<hi {
+                            let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                            if delB[id] { continue }   // defensive tombstone skip
+                            let o = Int(offB[id]); let l = Int(lenB[id])
+                            if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil {
+                                ids.append(Int32(id))
+                            }
+                        }
+                        outIDs[c] = ids
+                    }
+                }
+            }}}}}}
+            // chunks each keep ALL their matches (no per-chunk cap) → concat = full set in order
+            var merged = [Int32](); merged.reserveCapacity(chunkIDs.reduce(0) { $0 + $1.count })
+            for c in 0..<chunkIDs.count { merged.append(contentsOf: chunkIDs[c]) }
+            full = merged
+        }
+
+        let total = full.count
+        let out = total > limit ? Array(full[0..<limit]) : full
+        // Cache the full set for the next keystroke — only when it's complete (untruncated).
+        incLock.lock()
+        if total <= limit {
+            incValid = true; incGen = gen; incNeedle = needle; incIDs = full
+            incSortKey = sortKey; incAscending = ascending
+        } else {
+            incValid = false
+        }
+        incLock.unlock()
+
         return SearchResults(ids: out, total: total, truncated: total > out.count,
                              queryMillis: secondsBetween(start, clock.now) * 1000)
+    }
+
+    /// True if `bytes` begins with `prefix` (byte-wise).
+    @inline(__always)
+    private static func hasPrefix(_ bytes: [UInt8], _ prefix: [UInt8]) -> Bool {
+        guard prefix.count <= bytes.count else { return false }
+        for i in 0..<prefix.count where bytes[i] != prefix[i] { return false }
+        return true
     }
 
     // MARK: - regex mode (power mode; builds a String per candidate, so slower)

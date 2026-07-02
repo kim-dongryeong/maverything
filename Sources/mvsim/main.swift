@@ -139,6 +139,14 @@ check("type: 'folder: -folder:data' → dirs excluding 'data' (not empty, keeps 
 check("type: '-file:report' excludes report.txt but keeps data.json",
       !has("-file:report", "report.txt") && has("-file:report", "data.json"))
 
+// incremental "narrow as you type": extending a query must equal a from-scratch full scan
+_ = engine.search("re", limit: 100_000, now: now)                      // caches full set for "re"
+let incNarrow = engine.search("rep", limit: 100_000, now: now).ids     // narrowed from "re"
+_ = engine.search("zzznope", limit: 100_000, now: now)                 // breaks the prefix chain
+let incFull = engine.search("rep", limit: 100_000, now: now).ids       // full parallel scan
+check("incremental narrowing == full scan (same set)", Set(incNarrow) == Set(incFull))
+check("incremental narrowing == full scan (same order)", incNarrow == incFull)
+
 // folder scope ("Search in This Folder") — restrict to a subtree via parent walk
 if let dataDir = index.dirIndex(forPath: root + "/data") {
     let inData = Set(engine.search("json", limit: 10_000, now: now, scopeRoot: dataDir).ids.map { index.name(Int($0)) })

@@ -125,6 +125,28 @@ let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
 
+// relevance top-K parity checks
+let relFull = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 1000, now: now).ids
+let relLimit1 = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 1, now: now).ids
+check("relevance top-K: limit 1 matches first of full search",
+      relLimit1.first == relFull.first)
+
+let relAscending = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: true, limit: 1000, now: now).ids
+let relAscLimit2 = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: true, limit: 2, now: now).ids
+check("relevance top-K: ascending limit 2 matches prefix of ascending full",
+      Array(relAscending.prefix(2)) == relAscLimit2)
+
+let relDescFull = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 1000, now: now).ids
+let relDescLimit3 = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 3, now: now).ids
+check("relevance top-K: descending limit 3 matches prefix of descending full",
+      Array(relDescFull.prefix(3)) == relDescLimit3)
+
+let relAllLimitMatches = (1...min(5, relFull.count)).allSatisfy { lim in
+    let limIds = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: lim, now: now).ids
+    return limIds == Array(relFull.prefix(lim))
+}
+check("relevance top-K: any limit matches prefix of full search", relAllLimitMatches)
+
 // path-column sort (OQ1A): the "Path" header must sort by true folded full path,
 // NOT by basename. The fixture is built so the two orders provably disagree.
 let byName = names("marker", sort: .name)

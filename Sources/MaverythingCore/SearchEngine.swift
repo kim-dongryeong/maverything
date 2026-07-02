@@ -418,6 +418,7 @@ public final class SearchEngine: @unchecked Sendable {
 
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
         let chunkSize = (n + nChunks - 1) / nChunks
+        let pruneThreshold = limit + max(512, limit)
         var chunkIDs = [[Int32]](repeating: [], count: nChunks)
         var chunkScores = [[Int32]](repeating: [], count: nChunks)
         var chunkTotals = [Int](repeating: 0, count: nChunks)
@@ -446,7 +447,13 @@ public final class SearchEngine: @unchecked Sendable {
                 DispatchQueue.concurrentPerform(iterations: nChunks) { c in
                     let lo = c * chunkSize, hi = min(n, lo + chunkSize)
                     if lo >= hi { return }
-                    var ids = [Int32](); var scores = [Int32](); var total = 0
+                    var ids = [Int32](); var total = 0
+                    var pairs: [(id: Int32, score: Int32)] = []
+                    if relevance {
+                        pairs.reserveCapacity(min(hi - lo, pruneThreshold + 1))
+                    } else {
+                        ids.reserveCapacity(min(hi - lo, limit))
+                    }
                     // Per-chunk scratch for on-the-fly path reconstruction (path-scope terms).
                     // Reused across every candidate in the chunk → no per-candidate allocation.
                     var pathScratch = [UInt8](repeating: 0, count: 8192)
@@ -513,12 +520,36 @@ public final class SearchEngine: @unchecked Sendable {
                         if !ok { continue }
                         total += 1
                         if relevance {
-                            ids.append(Int32(id)); scores.append(Int32(clamping: score))
+                            pairs.append((id: Int32(id), score: Int32(clamping: score)))
+                            if pairs.count > pruneThreshold {
+                                pairs.sort { a, b in
+                                    if a.score != b.score {
+                                        return ascending ? a.score < b.score : a.score > b.score
+                                    }
+                                    return a.id < b.id
+                                }
+                                pairs.removeSubrange(limit..<pairs.count)
+                            }
                         } else if ids.count < limit {
                             ids.append(Int32(id))
                         }
                     }
-                    outIDs[c] = ids; outScores[c] = scores; outTot[c] = total
+                    if relevance && pairs.count > limit {
+                        pairs.sort { a, b in
+                            if a.score != b.score {
+                                    return ascending ? a.score < b.score : a.score > b.score
+                            }
+                            return a.id < b.id
+                        }
+                        pairs.removeSubrange(limit..<pairs.count)
+                    }
+                    if relevance {
+                        outIDs[c] = pairs.map { $0.id }
+                        outScores[c] = pairs.map { $0.score }
+                    } else {
+                        outIDs[c] = ids
+                    }
+                    outTot[c] = total
                     }}
                 }
             }}}
@@ -528,7 +559,7 @@ public final class SearchEngine: @unchecked Sendable {
         var out: [Int32]
         if relevance {
             var pairs: [(Int32, Int32)] = []
-            pairs.reserveCapacity(min(total, 200_000))
+            pairs.reserveCapacity(min(total, nChunks * limit))
             for c in 0..<nChunks {
                 let ids = chunkIDs[c], scs = chunkScores[c]
                 for j in 0..<ids.count { pairs.append((ids[j], scs[j])) }

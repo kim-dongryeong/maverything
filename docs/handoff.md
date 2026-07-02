@@ -1,5 +1,5 @@
-## TURN: CODEX
-**Updated:** 2026-07-02 20:40
+## TURN: AGY
+**Updated:** 2026-07-02 20:54
 
 ## GOAL
 Milestone **L4 — accuracy & performance polish** for Maverything (the macOS voidtools-
@@ -15,11 +15,13 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
   regexSearch; orderCache keyed on `index.mutationGenLocked`; incremental narrowing;
   `computePathOrder` = true folded full-path argsort for the Path column, cached),
   `FileIndex` (struct-of-arrays + rwlock rdlock()/wrlock(); `computeOrder` per SortKey;
-  `foldBlob` = asciiLower(NFC) sharing nameOff/nameLen), `FileEnumerator` (getattrlistbulk
-  crawl), `Watcher` (FSWatcher + Reconciler), `Snapshot`, `Volumes`, `Matching`, `QueryParser`.
+  `foldBlob` = asciiLower(NFC) sharing nameOff/nameLen; `unicodeFoldBlob` has independent
+  UInt64/UInt32 offsets for non-ASCII case/diacritic-insensitive search), `FileEnumerator`
+  (getattrlistbulk crawl), `Watcher` (FSWatcher + Reconciler), `Snapshot`, `Volumes`,
+  `Matching`, `QueryParser`.
 - App `Sources/Maverything/`: `AppModel`, `ResultsTableView`, `CompactResults`, `PreviewPane`,
   `ContentView`, `FilterBar`, `SearchMenus`, `OptionsButton`, `Settings`.
-- Harness: `.build/release/mvsim` (62 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
+- Harness: `.build/release/mvsim` (71 scenarios → must stay 100% green), `mvfind` CLI, `mvtest`.
 - Build: `swift build -c release`. Sim: `.build/release/mvsim`.
 
 ## OPEN QUESTIONS  (→ build ALL options, switchable; never choose for the user)
@@ -30,13 +32,12 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
    - B) Directory-order tuple keys (parent order, then name) for cheaper rebuilds remains
      an OPTIONAL perf variant — SAME output order as 1A, so purely a rebuild-cost trade;
      defer unless path-sort rebuild shows up hot in mvtest (not user-visible, not urgent).
-2. **Non-ASCII case folding** — `foldBlob` is ASCII-only lowercased, so `CAFÉ.txt` is not
-   found by `café`/`cafe`. Options:
-   - A) Add a Unicode-lowercased fold blob with its OWN offsets (foldOff/foldLen), since
-     Unicode lowercasing can change byte length; keep the ASCII fast path for pure-ASCII
-     names. Fold the query the same way. ← implement.
-   - B) ASCII fold + a slow Unicode fallback compare only when the query has non-ASCII.
-   Korean (Hangul) is caseless so unaffected; target accented-Latin/Cyrillic. mvsim assert.
+2. **Non-ASCII case folding** — ✅ DONE (2A, CODEX turn). Added `unicodeFoldBlob`
+   with independent `unicodeFoldOff`/`unicodeFoldLen` for non-ASCII names; pure-ASCII
+   names keep the existing ASCII `foldBlob` fast path and store a sentinel instead of
+   duplicate Unicode bytes. Query terms use the same NFC + case/diacritic-insensitive
+   fold, so `CAFÉ.txt` is found by `café` and `cafe`; path-scope search and snapshot
+   v4 round-trip are covered. mvsim +5 (66→71).
 3. **Relevance sort top-K** — `general()` relevance path stores + sorts EVERY match then
    takes `limit`. Use per-chunk bounded top-K (or partial selection) then merge, so a broad
    relevance query doesn't allocate/sort millions of pairs. Keep results identical.
@@ -47,7 +48,7 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 
 ## DONE-WHEN
 - [x] Path-column sort yields true path order (not name order); mvsim asserts it. (64e4ffb)
-- [ ] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
+- [x] Non-ASCII case folding: `CAFÉ` findable via `café`/`cafe`; ASCII fast path intact; mvsim asserts.
 - [ ] Relevance sort uses bounded top-K (no full-set sort); results unchanged; mvsim still green.
 - [ ] Mount after launch is indexed+watched; unmount tombstones the volume (best-effort test/log).
 - [ ] Name-blob offsets widened past the 4 GiB `UInt32` cap (UInt64 or segmented) — or a guarded graceful cap.
@@ -67,19 +68,12 @@ options A/B/C, BUILD THEM ALL (switchable) — never silently pick one.
 - Prefer `## TURN: BLOCKED` + a crisp question over guessing on irreversible choices.
 
 ## NEXT
-CODEX: **OPEN QUESTION 2A (non-ASCII case-folding fold blob)** — self-contained. Add a
-Unicode-lowercased fold blob with its OWN offsets (`foldOff`/`foldLen`) since Unicode
-lowercasing can change byte length; keep the ASCII-only `foldBlob` fast path for pure-ASCII
-names (skip building a Unicode variant when the name is ASCII). Fold the QUERY the same way,
-and route name matching to the Unicode blob only when the query contains non-ASCII (or always,
-if cheap). Add mvsim: `CAFÉ.txt` findable via `café` AND `cafe`; ASCII fast path unchanged;
-Korean (caseless) unaffected. Watch: `nameOff`/`nameLen` are UInt32/UInt16 — a parallel
-Unicode blob needs its own offset widths and must be kept in lock-step through
-appendRoot/appendChildren/_appendOne/clear/snapshot (and bump mutationGen under wrlock).
-Then AGY: **3 (relevance top-K, bounded per-chunk selection)**. Then CLAUDE loops back for
-**4 (dynamic mounts)** + the UInt32 4 GiB name-blob cap + mvsim growth + cross-review.
-
-Red-team for CODEX: verify `computePathOrder` holds the read lock via `orderArray`→`computeOrder`
-(no self-locking), reconstructs paths String-free (`foldedPathBytes`), and is cached — no eager
-per-row path building. Confirm the `.path` order truncates deep paths gracefully (8192 scratch /
-4096 stack) rather than crashing.
+AGY: first red-team CODEX's Unicode-fold increment: verify `unicodeFoldOff`/`unicodeFoldLen`
+stay lock-step through `appendRoot`/`appendChildren`/`_appendOne`/`clear`/snapshot v4, pure-ASCII
+names use the sentinel fast path, query folding is shared by `QueryParser`, case-sensitive
+search still uses `nameBlob`, and all reads happen under `SearchEngine.search`'s index read lock.
+Then implement **OPEN QUESTION 3 (relevance top-K)**: `general()` currently stores and sorts
+every relevance match before applying `limit`; replace that with per-chunk bounded top-K or
+partial selection plus merge, keeping result order identical for both ascending and descending.
+Add mvsim parity coverage for relevance top-K. Then CLAUDE loops back for **4 (dynamic mounts)**
++ the UInt32 4 GiB name-blob cap + remaining cross-review.

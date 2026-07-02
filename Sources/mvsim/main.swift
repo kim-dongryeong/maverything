@@ -39,6 +39,7 @@ write("data/big.bin", bytes: 5 * 1_048_576, mtime: oldTime)
 write("data/tiny.txt", bytes: 10)
 write("intl/한글파일.txt", bytes: 30)                   // unicode
 write("intl/café.md", bytes: 30)
+write("intl/CAFÉ.txt", bytes: 30)
 write("src/a/b/c/d/leaf.txt", bytes: 5)                // deep nesting
 write(".hidden/.secret.txt", bytes: 5)                 // hidden
 // path-column sort fixture (OQ1A): basename order and full-path order DISAGREE here —
@@ -114,6 +115,10 @@ check("name: plain term ignores parent dir name", !has("data", "leaf.txt"))
 
 // unicode (ASCII-fold leaves non-ASCII intact; substring still works)
 check("unicode: '한글' finds 한글파일.txt", has("한글", "한글파일.txt"))
+check("unicode-fold: 'café' finds CAFÉ.txt", has("café", "CAFÉ.txt"))
+check("unicode-fold: 'cafe' finds CAFÉ.txt", has("cafe", "CAFÉ.txt"))
+check("unicode-fold: uppercase accented query finds café.md", has("CAFÉ", "café.md"))
+check("unicode-fold: path:cafe finds CAFÉ.txt via folded path", has("path:cafe", "CAFÉ.txt"))
 
 // relevance sort sanity (fuzzy: exact-ish beats scattered)
 let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now: now).ids.map { index.name(Int($0)) }
@@ -247,6 +252,8 @@ let e2 = SearchEngine(index: idx2)
 check("snapshot: lastEventId preserved", meta?.lastEventId == 777)
 check("snapshot: 'png' count survives round-trip",
       e2.search("png", limit: 10_000, now: now).total == engine.search("png", limit: 10_000, now: now).total)
+check("snapshot: Unicode fold survives round-trip",
+      e2.search("cafe", limit: 10_000, now: now).ids.map { idx2.name(Int($0)) }.contains("CAFÉ.txt"))
 
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]

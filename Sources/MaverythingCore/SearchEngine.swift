@@ -142,7 +142,89 @@ public final class SearchEngine: @unchecked Sendable {
         return w
     }
 
-    // MARK: - fast exact substring path (unchanged tuned scan)
+    /// Path bytes for case-insensitive matching: emit the ASCII-folded component
+    /// for ordinary names, and the independent Unicode search fold for non-ASCII
+    /// names whose fold may have a different byte length.
+    @inline(__always)
+    private func searchFoldedPathBytes(_ id: Int,
+                                       asciiBlob: UnsafePointer<UInt8>,
+                                       offB: UnsafeBufferPointer<UInt32>,
+                                       lenB: UnsafeBufferPointer<UInt16>,
+                                       unicodeBlob: UnsafePointer<UInt8>?,
+                                       unicodeOffB: UnsafeBufferPointer<UInt64>,
+                                       unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                       parB: UnsafeBufferPointer<Int32>,
+                                       stack: UnsafeMutableBufferPointer<Int32>,
+                                       out: UnsafeMutableBufferPointer<UInt8>) -> Int {
+        let cap = out.count
+        let slash = UInt8(ascii: "/")
+        var depth = 0, cur = id
+        while parB[cur] >= 0 && depth < stack.count {
+            stack[depth] = Int32(cur); depth += 1; cur = Int(parB[cur])
+        }
+        var w = 0
+        @inline(__always) func emit(_ e: Int) {
+            if unicodeOffB[e] != noUnicodeFoldOffset, let unicodeBlob {
+                let o = Int(unicodeOffB[e]); let l = Int(unicodeLenB[e])
+                var j = 0
+                while j < l && w < cap { out[w] = unicodeBlob[o + j]; w += 1; j += 1 }
+            } else {
+                let o = Int(offB[e]); let l = Int(lenB[e])
+                var j = 0
+                while j < l && w < cap { out[w] = asciiBlob[o + j]; w += 1; j += 1 }
+            }
+        }
+        let ro = Int(offB[cur]); let rl = Int(lenB[cur])
+        if !(rl == 1 && asciiBlob[ro] == slash) { emit(cur) }
+        var s = depth - 1
+        while s >= 0 {
+            if w < cap { out[w] = slash; w += 1 }
+            emit(Int(stack[s])); s -= 1
+        }
+        if w == 0 && cap > 0 { out[0] = slash; w = 1 }
+        return w
+    }
+
+    @inline(__always)
+    private func foldedNameContains(id: Int,
+                                    asciiBase: UnsafePointer<UInt8>,
+                                    offB: UnsafeBufferPointer<UInt32>,
+                                    lenB: UnsafeBufferPointer<UInt16>,
+                                    unicodeBase: UnsafePointer<UInt8>?,
+                                    unicodeOffB: UnsafeBufferPointer<UInt64>,
+                                    unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                    needle: UnsafeRawPointer,
+                                    needleLen: Int) -> Bool {
+        let o = Int(offB[id]); let l = Int(lenB[id])
+        if l >= needleLen, memmem(asciiBase + o, l, needle, needleLen) != nil { return true }
+        guard unicodeOffB[id] != noUnicodeFoldOffset, let unicodeBase else { return false }
+        let uo = Int(unicodeOffB[id]); let ul = Int(unicodeLenB[id])
+        return ul >= needleLen && memmem(unicodeBase + uo, ul, needle, needleLen) != nil
+    }
+
+    @inline(__always)
+    private func matchFoldedName(id: Int,
+                                 asciiBase: UnsafePointer<UInt8>,
+                                 offB: UnsafeBufferPointer<UInt32>,
+                                 lenB: UnsafeBufferPointer<UInt16>,
+                                 unicodeBase: UnsafePointer<UInt8>?,
+                                 unicodeOffB: UnsafeBufferPointer<UInt64>,
+                                 unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                 needle: UnsafePointer<UInt8>,
+                                 needleLen: Int,
+                                 mode: MatchMode) -> MatchOutcome {
+        let o = Int(offB[id]); let l = Int(lenB[id])
+        var best = Matcher.match(hay: asciiBase + o, hayLen: l,
+                                 needle: needle, needleLen: needleLen, mode: mode)
+        guard unicodeOffB[id] != noUnicodeFoldOffset, let unicodeBase else { return best }
+        let uo = Int(unicodeOffB[id]); let ul = Int(unicodeLenB[id])
+        let folded = Matcher.match(hay: unicodeBase + uo, hayLen: ul,
+                                   needle: needle, needleLen: needleLen, mode: mode)
+        if !best.matched || (folded.matched && folded.score > best.score) { best = folded }
+        return best
+    }
+
+    // MARK: - fast exact substring path
 
     private func fastExact(needle: [UInt8], sortKey: SortKey, ascending: Bool,
                            limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
@@ -163,20 +245,29 @@ public final class SearchEngine: @unchecked Sendable {
             // Serial rescan of the (already ordered, already small) previous result set.
             var res = [Int32](); res.reserveCapacity(base.count)
             index.foldBlob.withUnsafeBufferPointer { fb in
+            index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
+            index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
+            index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
             index.deleted.withUnsafeBufferPointer { delB in
             needle.withUnsafeBufferPointer { nd in
                 let hayBase = fb.baseAddress!
+                let unicodeBase = ufb.baseAddress
                 let needleBase = UnsafeRawPointer(nd.baseAddress!)
                 let needleLen = needle.count
                 for id32 in base {
                     let id = Int(id32)
                     if delB[id] { continue }
-                    let o = Int(offB[id]); let l = Int(lenB[id])
-                    if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil { res.append(id32) }
+                    if self.foldedNameContains(id: id, asciiBase: hayBase,
+                                               offB: offB, lenB: lenB,
+                                               unicodeBase: unicodeBase,
+                                               unicodeOffB: uOffB, unicodeLenB: uLenB,
+                                               needle: needleBase, needleLen: needleLen) {
+                        res.append(id32)
+                    }
                 }
-            }}}}}
+            }}}}}}}}
             full = res
         } else {
             let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
@@ -186,12 +277,16 @@ public final class SearchEngine: @unchecked Sendable {
             var chunkIDs = [[Int32]](repeating: [], count: nChunks)
 
             index.foldBlob.withUnsafeBufferPointer { fb in
+            index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
+            index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
+            index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
             index.deleted.withUnsafeBufferPointer { delB in
             order.withUnsafeBufferPointer { ordB in
             needle.withUnsafeBufferPointer { nd in
                 let hayBase = fb.baseAddress!
+                let unicodeBase = ufb.baseAddress
                 let needleBase = UnsafeRawPointer(nd.baseAddress!)
                 let needleLen = needle.count
                 chunkIDs.withUnsafeMutableBufferPointer { outIDs in
@@ -202,15 +297,18 @@ public final class SearchEngine: @unchecked Sendable {
                         for k in lo..<hi {
                             let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                             if delB[id] { continue }   // defensive tombstone skip
-                            let o = Int(offB[id]); let l = Int(lenB[id])
-                            if l >= needleLen, memmem(hayBase + o, l, needleBase, needleLen) != nil {
+                            if self.foldedNameContains(id: id, asciiBase: hayBase,
+                                                       offB: offB, lenB: lenB,
+                                                       unicodeBase: unicodeBase,
+                                                       unicodeOffB: uOffB, unicodeLenB: uLenB,
+                                                       needle: needleBase, needleLen: needleLen) {
                                 ids.append(Int32(id))
                             }
                         }
                         outIDs[c] = ids
                     }
                 }
-            }}}}}}
+            }}}}}}}}}
             // chunks each keep ALL their matches (no per-chunk cap) → concat = full set in order
             var merged = [Int32](); merged.reserveCapacity(chunkIDs.reduce(0) { $0 + $1.count })
             for c in 0..<chunkIDs.count { merged.append(contentsOf: chunkIDs[c]) }
@@ -325,9 +423,12 @@ public final class SearchEngine: @unchecked Sendable {
         var chunkTotals = [Int](repeating: 0, count: nChunks)
 
         index.foldBlob.withUnsafeBufferPointer { fb in
+        index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
         index.nameBlob.withUnsafeBufferPointer { nb in
         index.nameOff.withUnsafeBufferPointer { offB in
         index.nameLen.withUnsafeBufferPointer { lenB in
+        index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
+        index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
         index.size.withUnsafeBufferPointer { szB in
         index.mtime.withUnsafeBufferPointer { mtB in
         index.deleted.withUnsafeBufferPointer { delB in
@@ -337,6 +438,7 @@ public final class SearchEngine: @unchecked Sendable {
         termBlob.withUnsafeBufferPointer { tblobB in
         termRefs.withUnsafeBufferPointer { trefsB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
+            let unicodeBase = ufb.baseAddress
             let tblobBase = tblobB.baseAddress   // non-nil whenever termCount > 0
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkScores.withUnsafeMutableBufferPointer { outScores in
@@ -345,8 +447,6 @@ public final class SearchEngine: @unchecked Sendable {
                     let lo = c * chunkSize, hi = min(n, lo + chunkSize)
                     if lo >= hi { return }
                     var ids = [Int32](); var scores = [Int32](); var total = 0
-                    let hayBase = caseSensitive ? nbBase : fbBase
-                    let pathBlob = caseSensitive ? nbBase : fbBase
                     // Per-chunk scratch for on-the-fly path reconstruction (path-scope terms).
                     // Reused across every candidate in the chunk → no per-candidate allocation.
                     var pathScratch = [UInt8](repeating: 0, count: 8192)
@@ -381,14 +481,29 @@ public final class SearchEngine: @unchecked Sendable {
                             let out: MatchOutcome
                             if tr.isPath {
                                 if pathLen < 0 {
-                                    pathLen = self.foldedPathBytes(id, blob: pathBlob, offB: offB,
-                                                                   lenB: lenB, parB: parB, stack: isb, out: psb)
+                                    if caseSensitive {
+                                        pathLen = self.foldedPathBytes(id, blob: nbBase, offB: offB,
+                                                                       lenB: lenB, parB: parB, stack: isb, out: psb)
+                                    } else {
+                                        pathLen = self.searchFoldedPathBytes(id, asciiBlob: fbBase,
+                                                                             offB: offB, lenB: lenB,
+                                                                             unicodeBlob: unicodeBase,
+                                                                             unicodeOffB: uOffB,
+                                                                             unicodeLenB: uLenB,
+                                                                             parB: parB, stack: isb, out: psb)
+                                    }
                                 }
                                 out = Matcher.match(hay: psb.baseAddress!, hayLen: pathLen,
                                                     needle: needlePtr, needleLen: tr.len, mode: mode)
-                            } else {
-                                out = Matcher.match(hay: hayBase + o, hayLen: l,
+                            } else if caseSensitive {
+                                out = Matcher.match(hay: nbBase + o, hayLen: l,
                                                     needle: needlePtr, needleLen: tr.len, mode: mode)
+                            } else {
+                                out = self.matchFoldedName(id: id, asciiBase: fbBase,
+                                                           offB: offB, lenB: lenB,
+                                                           unicodeBase: unicodeBase,
+                                                           unicodeOffB: uOffB, unicodeLenB: uLenB,
+                                                           needle: needlePtr, needleLen: tr.len, mode: mode)
                             }
                             let pass = tr.negated ? !out.matched : out.matched
                             if !pass { ok = false; break }
@@ -407,7 +522,7 @@ public final class SearchEngine: @unchecked Sendable {
                     }}
                 }
             }}}
-        }}}}}}}}}}}}
+        }}}}}}}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]
@@ -607,5 +722,5 @@ public final class SearchEngine: @unchecked Sendable {
 }
 
 @inline(__always) func foldedBytes(_ s: String) -> [UInt8] {
-    Array(s.precomposedStringWithCanonicalMapping.utf8).map(asciiLower)
+    searchFoldedBytes(s)
 }

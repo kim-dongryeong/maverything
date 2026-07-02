@@ -11,11 +11,17 @@ import Foundation
 /// Root entries (the crawl roots, e.g. "/" or "/Users/me") have `parent == -1`
 /// and store their *absolute path* as their name.
 public final class FileIndex: @unchecked Sendable {
-    // Packed name storage. `nameOff[i] ..< nameOff[i]+nameLen[i]` indexes both blobs.
+    // Packed name storage. `nameOff[i] ..< nameOff[i]+nameLen[i]` indexes the
+    // original and ASCII-folded blobs. Non-ASCII names additionally get a
+    // case/diacritic-insensitive search fold with independent offsets because
+    // Unicode folding can change the UTF-8 byte length (e.g. CAFÉ -> cafe).
     public internal(set) var nameBlob: [UInt8] = []   // original UTF-8 bytes
     public internal(set) var foldBlob: [UInt8] = []   // ASCII-lowercased shadow (same offsets)
+    public internal(set) var unicodeFoldBlob: [UInt8] = []
     public internal(set) var nameOff: [UInt32] = []
     public internal(set) var nameLen: [UInt16] = []
+    public internal(set) var unicodeFoldOff: [UInt64] = []
+    public internal(set) var unicodeFoldLen: [UInt32] = []
 
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
@@ -94,7 +100,9 @@ public final class FileIndex: @unchecked Sendable {
         epochValue &+= 1   // invalidate any in-flight reconcile captured before this
         nameBlob.removeAll(keepingCapacity: false)
         foldBlob.removeAll(keepingCapacity: false)
+        unicodeFoldBlob.removeAll(keepingCapacity: false)
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
+        unicodeFoldOff.removeAll(keepingCapacity: false); unicodeFoldLen.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
@@ -107,6 +115,7 @@ public final class FileIndex: @unchecked Sendable {
     public func reserveCapacity(_ n: Int) {
         wrlock(); defer { unlock() }   // reallocation must not race a concurrent reader
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
+        unicodeFoldOff.reserveCapacity(n); unicodeFoldLen.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
         crtime.reserveCapacity(n)
         objType.reserveCapacity(n); flags.reserveCapacity(n); hidden.reserveCapacity(n)
@@ -127,6 +136,8 @@ public final class FileIndex: @unchecked Sendable {
         nameLen.append(UInt16(bytes.count))
         nameBlob.append(contentsOf: bytes)
         foldBlob.append(contentsOf: bytes.map(asciiLower))
+        appendUnicodeFoldStorage(for: bytes, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(-1)
         size.append(0); mtime.append(0); crtime.append(0)
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
@@ -143,10 +154,16 @@ public final class FileIndex: @unchecked Sendable {
         bumpMut()
         let base = Int32(nameOff.count)
         let blobBase = UInt32(nameBlob.count)
+        let unicodeBlobBase = UInt64(unicodeFoldBlob.count)
         nameBlob.append(contentsOf: batch.blob)
         foldBlob.append(contentsOf: batch.fold)
+        unicodeFoldBlob.append(contentsOf: batch.unicodeFoldBlob)
         for o in batch.off { nameOff.append(o &+ blobBase) }
         nameLen.append(contentsOf: batch.len)
+        for o in batch.unicodeFoldOff {
+            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : o &+ unicodeBlobBase)
+        }
+        unicodeFoldLen.append(contentsOf: batch.unicodeFoldLen)
         size.append(contentsOf: batch.size)
         mtime.append(contentsOf: batch.mtime)
         crtime.append(contentsOf: batch.crtime)
@@ -357,6 +374,8 @@ public final class FileIndex: @unchecked Sendable {
         nameOff.append(UInt32(nameBlob.count)); nameLen.append(UInt16(name.count))
         nameBlob.append(contentsOf: name)
         for b in name { foldBlob.append(asciiLower(b)) }
+        appendUnicodeFoldStorage(for: name, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(p); size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         hidden.append((name.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0)
         deleted.append(false)
@@ -407,8 +426,52 @@ public let VNODE_VREG: UInt8 = 1
 public let VNODE_VDIR: UInt8 = 2
 public let VNODE_VLNK: UInt8 = 5
 
+let noUnicodeFoldOffset = UInt64.max
+private let searchFoldLocale = Locale(identifier: "en_US_POSIX")
+
 @inline(__always) func asciiLower(_ b: UInt8) -> UInt8 {
     (b >= 65 && b <= 90) ? b &+ 32 : b
+}
+
+@inline(__always) func containsNonASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+    for b in bytes where b >= 0x80 { return true }
+    return false
+}
+
+func searchFoldedBytes(_ s: String) -> [UInt8] {
+    let nfc = s.precomposedStringWithCanonicalMapping
+    var ascii = true
+    for b in nfc.utf8 where b >= 0x80 { ascii = false; break }
+    if ascii { return Array(nfc.utf8).map(asciiLower) }
+    let folded = nfc.folding(options: [.caseInsensitive, .diacriticInsensitive],
+                             locale: searchFoldLocale)
+        .precomposedStringWithCanonicalMapping
+    return Array(folded.utf8)
+}
+
+func unicodeSearchFoldBytes(_ bytes: UnsafeBufferPointer<UInt8>) -> [UInt8] {
+    let s = String(decoding: bytes, as: UTF8.self)
+    return searchFoldedBytes(s)
+}
+
+func appendUnicodeFoldStorage(for bytes: [UInt8], blob: inout [UInt8],
+                              off: inout [UInt64], len: inout [UInt32]) {
+    bytes.withUnsafeBufferPointer { bp in
+        appendUnicodeFoldStorage(for: bp, blob: &blob, off: &off, len: &len)
+    }
+}
+
+func appendUnicodeFoldStorage(for bytes: UnsafeBufferPointer<UInt8>, blob: inout [UInt8],
+                              off: inout [UInt64], len: inout [UInt32]) {
+    guard containsNonASCII(bytes) else {
+        off.append(noUnicodeFoldOffset)
+        len.append(0)
+        return
+    }
+    let folded = unicodeSearchFoldBytes(bytes)
+    off.append(UInt64(blob.count))
+    len.append(UInt32(folded.count))
+    blob.append(contentsOf: folded)
 }
 
 /// Canonicalize a filename to NFC. macOS/APFS often returns decomposed (NFD)
@@ -429,8 +492,11 @@ public let VNODE_VLNK: UInt8 = 5
 struct ChildBatch {
     var blob: [UInt8] = []
     var fold: [UInt8] = []
+    var unicodeFoldBlob: [UInt8] = []
     var off: [UInt32] = []
     var len: [UInt16] = []
+    var unicodeFoldOff: [UInt64] = []
+    var unicodeFoldLen: [UInt32] = []
     var size: [Int64] = []
     var mtime: [Int64] = []
     var crtime: [Int64] = []
@@ -460,6 +526,8 @@ struct ChildBatch {
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
         for b in nameBytes { fold.append(asciiLower(b)) }
+        appendUnicodeFoldStorage(for: nameBytes, blob: &unicodeFoldBlob,
+                                 off: &unicodeFoldOff, len: &unicodeFoldLen)
         size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         let isHidden = (nameBytes.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0
         hidden.append(isHidden)

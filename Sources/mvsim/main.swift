@@ -306,10 +306,11 @@ engine.foldersFirst = true
 let ffIds = engine.search("", sortKey: .name, ascending: true, limit: 100_000, now: now).ids
 var seenFileFF = false; var ffOK = true
 for id in ffIds {
-    let d = index.isDir(Int(id))
+    // Finder semantics: package dirs (.bundle) COUNT AS FILES in the partition
+    let d = index.isDir(Int(id)) && !index.name(Int(id)).hasSuffix(".bundle")
     if !d { seenFileFF = true } else if seenFileFF { ffOK = false; break }
 }
-check("foldersFirst: no directory appears after the first file", ffOK && seenFileFF)
+check("foldersFirst: no real directory appears after the first file", ffOK && seenFileFF)
 engine.foldersFirst = false
 
 // Everything's duplicate finder (dupe:)

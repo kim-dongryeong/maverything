@@ -165,8 +165,18 @@ enum KindCache {
     private static let lock = NSLock()
     static func kind(for path: String, isDir: Bool, isLink: Bool = false) -> String {
         if isLink { return "Alias" }
-        if isDir { return "Folder" }
         let ext = (path as NSString).pathExtension.lowercased()
+        if isDir {
+            // A directory WITH an extension is a typed bundle — report Finder's kind
+            // ("Bundle", "Framework", "Application"…) instead of a blanket "Folder".
+            guard !ext.isEmpty else { return "Folder" }
+            lock.lock(); defer { lock.unlock() }
+            if let c = cache["d:" + ext] { return c }
+            let k = UTType(filenameExtension: ext, conformingTo: .directory)?.localizedDescription
+                ?? UTType(filenameExtension: ext)?.localizedDescription ?? "Folder"
+            cache["d:" + ext] = k
+            return k
+        }
         if ext.isEmpty { return "Document" }
         lock.lock(); defer { lock.unlock() }
         if let c = cache[ext] { return c }

@@ -199,7 +199,12 @@ enum IconCache {
             lock.unlock()
             if !queued {
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let img = NSWorkspace.shared.icon(forFile: path)
+                    // Finder rule: only PACKAGES (.app, most .bundle) get their own icon;
+                    // a browsable directory with an extension (.framework, .asset) shows
+                    // the plain FOLDER icon. Match it exactly via isFilePackage.
+                    let isPkg = isLink || NSWorkspace.shared.isFilePackage(atPath: path)
+                    let img = isPkg ? NSWorkspace.shared.icon(forFile: path)
+                                    : NSWorkspace.shared.icon(for: .folder)
                     img.size = NSSize(width: 16, height: 16)
                     lock.lock()
                     if cache.count < 5_000 { cache[key] = img }   // cap per-path growth

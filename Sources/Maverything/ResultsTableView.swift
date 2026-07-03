@@ -252,9 +252,12 @@ struct ResultsTableView: NSViewRepresentable {
             it.target = context.coordinator
             menu.addItem(it)
         }
-        add("Open", #selector(Coordinator.openItem), key: "\r")
+        // NOTE: no "\r"/" " key equivalents here — while an NSMenu is open, a key
+        // equivalent HIJACKS that key, so pressing Return on a highlighted item would
+        // fire "Open" instead of the highlighted command (user-reported bug).
+        add("Open", #selector(Coordinator.openItem))
         add("Open Enclosing Folder", #selector(Coordinator.openEnclosing))
-        add("Quick Look", #selector(Coordinator.quickLook), key: " ")
+        add("Quick Look", #selector(Coordinator.quickLook))
         add("Get Info", #selector(Coordinator.getInfo), key: "i", mask: [.command])
         menu.addItem(.separator())
         add("Search in This Folder", #selector(Coordinator.searchInFolder))
@@ -855,8 +858,10 @@ struct ResultsTableView: NSViewRepresentable {
         }
 
         @objc func openEnclosing() {
-            let dirs = Set(selectedPaths().map { ($0 as NSString).deletingLastPathComponent })
-            for d in dirs { NSWorkspace.shared.open(URL(fileURLWithPath: d)) }
+            // Open the parent folder WITH the file selected (Finder semantics) —
+            // just opening the folder leaves the user hunting for the row's file.
+            let urls = selectedPaths().map { URL(fileURLWithPath: $0) }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
         }
 
         @objc func searchInFolder() {

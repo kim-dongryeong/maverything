@@ -1,6 +1,7 @@
 import AppKit
 import MaverythingCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Layout A — a Spotlight/Alfred-style slim results list (top matches only),
 /// keyboard-navigable: ↑/↓ move, ⏎ opens, ↑ at top returns to the search field.
@@ -213,14 +214,29 @@ enum IconCache {
                     DispatchQueue.main.async { onReady() }
                 }
             }
-            return icon(for: "/", isDir: true)   // shared generic-folder placeholder (cached)
+            return genericIcon(dir: true)        // stable folder placeholder (never a volume icon)
         }
 
-        let img = NSWorkspace.shared.icon(forFile: path)
+        // Generic dir/file keys must come from a STABLE source: fetching icon(forFile:)
+        // for whatever folder renders first can poison the shared key with a VOLUME or
+        // custom-icon folder (e.g. "/" → Macintosh HD icon on every plain folder).
+        let img: NSImage
+        if key == "\u{1}dir" || key == "\u{1}file" {
+            img = genericIcon(dir: isDir)
+        } else {
+            img = NSWorkspace.shared.icon(forFile: path)
+        }
         img.size = NSSize(width: 16, height: 16)
         lock.lock()
         if !isBundle || cache.count < 5_000 { cache[key] = img }
         lock.unlock()
+        return img
+    }
+
+    /// UTType-based generic icons — identical for every plain folder / extensionless file.
+    private static func genericIcon(dir: Bool) -> NSImage {
+        let img = NSWorkspace.shared.icon(for: dir ? .folder : .data)
+        img.size = NSSize(width: 16, height: 16)
         return img
     }
 }

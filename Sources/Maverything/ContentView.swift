@@ -150,7 +150,7 @@ struct ContentView: View {
             // too). The label always shows the live state, e.g. "Exact · Path".
             Menu {
                 Picker("Match Mode", selection: $model.matchMode) {
-                    ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                    ForEach(MatchMode.uiModes, id: \.self) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.inline)
                 Divider()

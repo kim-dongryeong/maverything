@@ -971,7 +971,8 @@ final class AppModel: ObservableObject {
     }
 
     func applySaved(_ s: SavedSearch) {
-        matchMode = MatchMode(rawValue: s.matchMode) ?? .exact
+        let mm = MatchMode(rawValue: s.matchMode) ?? .exact
+        matchMode = mm == .wildcard ? .exact : mm   // wildcard mode retired from UI (auto-glob covers it)
         typeFilter = TypeFilter(rawValue: s.typeFilter) ?? .all
         scope = SearchScope(rawValue: s.scope) ?? .nameOnly
         query = s.query

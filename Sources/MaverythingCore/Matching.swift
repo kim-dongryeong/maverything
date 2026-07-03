@@ -9,6 +9,12 @@ public enum MatchMode: Int, Sendable, CaseIterable {
     case wildcard   // glob: * and ? against the whole name (Everything wildcard)
     case regex      // full regular expression (NSRegularExpression); slower power mode
 
+    /// What the app's mode pickers offer. Wildcard is NOT a mode in the UI —
+    /// like Everything, it is always-on syntax (typing * or ? auto-engages glob
+    /// matching in Exact). The case survives for the engine/CLI (mvfind
+    /// --wildcard: bare term = whole-name match) and old persisted state.
+    public static var uiModes: [MatchMode] { [.exact, .fuzzy, .regex] }
+
     public var label: String {
         switch self {
         case .exact: return "Exact"

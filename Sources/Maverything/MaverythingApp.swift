@@ -64,7 +64,7 @@ struct SearchCommands: Commands {
                 .keyboardShortcut("r", modifiers: .control)
             Divider()
             Picker("Match Mode", selection: $model.matchMode) {
-                ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                ForEach(MatchMode.uiModes, id: \.self) { Text($0.label).tag($0) }
             }
             Divider()
             Button("Reindex Now") { model.reindex() }

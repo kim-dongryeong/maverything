@@ -35,8 +35,8 @@ struct OptionsButton: NSViewRepresentable {
             let m = NSMenu()
             group(m, "Layout", UILayout.allCases.map(\.label),
                   selected: UILayout.allCases.firstIndex(of: model.layout) ?? 0, cmd: "layout")
-            group(m, "Match mode", MatchMode.allCases.map(\.label),
-                  selected: MatchMode.allCases.firstIndex(of: model.matchMode) ?? 0, cmd: "mode")
+            group(m, "Match mode", MatchMode.uiModes.map(\.label),
+                  selected: MatchMode.uiModes.firstIndex(of: model.matchMode) ?? 0, cmd: "mode")
             // Everything's search-toggle set (same shortcuts as the original)
             check(m, "Match Path", model.scope == .fullPath, cmd: "scope", key: "u", mask: [.control])
             check(m, "Match Case", model.matchCase, cmd: "case", key: "i", mask: [.control])
@@ -113,7 +113,7 @@ struct OptionsButton: NSViewRepresentable {
             // so re-selecting the current value would needlessly reset scroll/selection.
             switch cmd {
             case "layout":  if model.layout != UILayout.allCases[i] { model.layout = UILayout.allCases[i] }
-            case "mode":    if model.matchMode != MatchMode.allCases[i] { model.matchMode = MatchMode.allCases[i] }
+            case "mode":    if model.matchMode != MatchMode.uiModes[i] { model.matchMode = MatchMode.uiModes[i] }
             case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
                             if model.sortKey != k { model.sortKey = k }
             case "scope":   model.toggleScope()          // Match Path check toggle (⌃U)

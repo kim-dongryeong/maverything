@@ -296,6 +296,14 @@ check("folders-first: package sorts with FILES not folders",
       pkgPos >= 0 && (sawRealDirEnd == -1 || pkgPos > sawRealDirEnd))
 engine.foldersFirst = false; engine.invalidate()
 
+// Everything's "Match whole filename when using wildcards" toggle
+check("wildcard-whole ON: 'port*' misses report.txt (anchored)", !has("port*", "report.txt"))
+engine.wholeNameWildcards = false; engine.invalidate()
+check("wildcard-whole OFF: 'port*' finds report.txt (match anywhere)", has("port*", "report.txt"))
+check("wildcard-whole OFF: '?ata.json' finds data.json", has("?ata.json", "data.json"))
+engine.wholeNameWildcards = true; engine.invalidate()
+check("wildcard-whole restored: anchored again", !has("port*", "report.txt"))
+
 // Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
 check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
 check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))

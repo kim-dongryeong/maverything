@@ -95,6 +95,15 @@ final class AppModel: ObservableObject {
     @Published var matchMode: MatchMode = .exact
     @Published var wholeWord = false               // Everything's Match Whole Word (ww:, ⌃B)
     @Published var matchCase = false               // Everything's Match Case (case:on, ⌃I)
+    /// Everything's "Match whole filename when using wildcards" (Options ▸ Search).
+    @Published var wildcardWholeName: Bool =
+        (UserDefaults.standard.object(forKey: "mv.wildcardWholeName") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(wildcardWholeName, forKey: "mv.wildcardWholeName")
+            engine.wholeNameWildcards = wildcardWholeName
+            runSearch()
+        }
+    }
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
     @Published var recentQueries: [String] = AppModel.loadRecents()
     @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
@@ -311,6 +320,7 @@ final class AppModel: ObservableObject {
         engine.useFolderSizes = indexFolderSizes
         engine.foldersFirst = foldersFirst
         engine.hideHidden = !showHidden
+        engine.wholeNameWildcards = wildcardWholeName
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess

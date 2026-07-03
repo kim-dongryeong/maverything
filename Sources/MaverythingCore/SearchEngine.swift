@@ -61,6 +61,12 @@ public final class SearchEngine: @unchecked Sendable {
     /// exclude-hidden). The index always stays complete.
     public var hideHidden = false
 
+    /// Everything's "Match whole filename when using wildcards" (default ON there
+    /// and here). OFF = a wildcard pattern matches ANYWHERE in the name: mic?o
+    /// behaves like *mic?o* and now finds "microsoft". Implemented by star-
+    /// wrapping glob terms at compile time — the matcher itself stays anchored.
+    public var wholeNameWildcards = true
+
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
@@ -728,10 +734,16 @@ public final class SearchEngine: @unchecked Sendable {
         var termBlob: [UInt8] = []
         var termRefs: [(off: Int, len: Int, group: Int, negated: Bool, isPath: Bool, isGlob: Bool)] = []
         termRefs.reserveCapacity(parsed.termGroups.reduce(0) { $0 + $1.count })
+        let star = UInt8(ascii: "*")
         for (gi, g) in parsed.termGroups.enumerated() {
             for t in g {
-                termRefs.append((termBlob.count, t.bytes.count, gi, t.negated, t.scope == .path, t.isGlob))
-                termBlob.append(contentsOf: t.bytes)
+                var bytes = t.bytes
+                if !wholeNameWildcards, t.isGlob || mode == .wildcard, !bytes.isEmpty {
+                    if bytes.first != star { bytes.insert(star, at: 0) }
+                    if bytes.last != star { bytes.append(star) }
+                }
+                termRefs.append((termBlob.count, bytes.count, gi, t.negated, t.scope == .path, t.isGlob))
+                termBlob.append(contentsOf: bytes)
             }
         }
         let termCount = termRefs.count

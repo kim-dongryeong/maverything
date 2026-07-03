@@ -39,14 +39,14 @@ struct OptionsButton: NSViewRepresentable {
             // the gear is VIEW & APP options only, so nothing is listed twice.)
             group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
                   selected: sortIndex(model.sortKey), cmd: "sort",
-                  keys: ["1", "2", "3", "4", "5", "6"], keyMask: [.control, .command])
+                  keys: ["1", "2", "3", "4", "5", "6"], keyMask: [.control])
             group(m, "Appearance", Appearance.allCases.map(\.label),
                   selected: Appearance.allCases.firstIndex(of: model.appearance) ?? 0, cmd: "appear")
             group(m, "Density", RowDensity.allCases.map(\.label),
                   selected: RowDensity.allCases.firstIndex(of: model.density) ?? 0, cmd: "density")
             group(m, "Thumbnail Size", ["Medium", "Large", "Extra Large"],
                   selected: model.thumbSize >= 176 ? 2 : (model.thumbSize >= 128 ? 1 : 0), cmd: "thumb")
-            check(m, "Ascending", model.ascending, cmd: "asc", key: "0", mask: [.control, .command])
+            check(m, "Ascending", model.ascending, cmd: "asc", key: "0", mask: [.control])
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
             check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
             check(m, "Icon Preview in List", model.iconPreview, cmd: "iconprev")

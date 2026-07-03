@@ -35,8 +35,17 @@ struct CompactResults: View {
             .onKeyPress(.space) {                       // Quick Look, same as the table
                 guard let s = model.selectedID else { return .ignored }
                 GridQL.shared.paths = [model.path(s)]
+                GridQL.shared.onKey = { code in          // arrows browse while panel is key
+                    switch code {
+                    case 125: move(+1, self.ids, proxy); return true   // ↓
+                    case 126: move(-1, self.ids, proxy); return true   // ↑
+                    case 49:  QLPreviewPanel.shared().orderOut(nil); return true
+                    default: return false
+                    }
+                }
                 if let panel = QLPreviewPanel.shared() {
                     panel.dataSource = GridQL.shared
+                    panel.delegate = GridQL.shared
                     panel.reloadData()
                     panel.makeKeyAndOrderFront(nil)
                 }
@@ -52,6 +61,12 @@ struct CompactResults: View {
                 if model.selectedID == nil, let first = ids.first { model.selectedID = first }
                 if let s = model.selectedID { proxy.scrollTo(s, anchor: .center) }
             }
+            .onAppear {                       // selection carried over from another layout
+                if let s = model.selectedID, ids.contains(s) {
+                    listFocused = true
+                    proxy.scrollTo(s, anchor: .center)
+                }
+            }
         }
         .id(model.queryNonce)   // only rebuild identity on a NEW query, not on every live refresh
         // (empty / no-results / indexing states are drawn by ContentView's stateOverlay,
@@ -66,6 +81,15 @@ struct CompactResults: View {
         let clamped = min(max(next, 0), ids.count - 1)
         model.selectedID = ids[clamped]
         proxy.scrollTo(ids[clamped], anchor: .center)
+        refreshQLIfOpen(ids[clamped])
+    }
+
+    /// Open Quick Look keeps tracking the selection (same panel plumbing as the grid).
+    private func refreshQLIfOpen(_ id: Int32) {
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              QLPreviewPanel.shared().isVisible else { return }
+        GridQL.shared.paths = [model.path(id)]
+        QLPreviewPanel.shared().reloadData()
     }
 
     private func open(_ id: Int32) { AppModel.finderOpen(model.path(id)) }

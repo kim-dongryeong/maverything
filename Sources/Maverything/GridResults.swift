@@ -6,13 +6,14 @@ import SwiftUI
 /// Icon-grid layout (⌘4) — Everything 1.4's Medium/Large/Extra-Large Icons,
 /// done the macOS way: Finder-style grid with real QuickLook thumbnails.
 /// Photos, designs and PDFs become findable BY EYE, not just by name.
+/// Selection lives in model.selectedID so it SURVIVES layout switches.
 struct GridResults: View {
     @ObservedObject var model: AppModel
-    @State private var selected: Int32? = nil
     @FocusState private var focused: Bool
     private let cap = 2_000                      // thumbnails are costly — cap the grid
 
     private var ids: [Int32] { Array(model.resultsStore.ids.prefix(cap)) }
+    private var selected: Int32? { model.selectedID }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -22,8 +23,16 @@ struct GridResults: View {
                     ForEach(ids, id: \.self) { id in
                         cell(id)
                             .id(id)
-                            .onTapGesture(count: 2) { AppModel.finderOpen(model.path(id)) }
-                            .onTapGesture { select(id) }
+                            // simultaneous single+double tap: chained onTapGestures made
+                            // the single tap WAIT out the double-click window (the
+                            // "selection feels slow" bug). Now select fires instantly
+                            // on click one and a double still opens, Finder-style.
+                            .gesture(TapGesture(count: 2).onEnded {
+                                AppModel.finderOpen(model.path(id))
+                            })
+                            .simultaneousGesture(TapGesture().onEnded {
+                                select(id); focused = true
+                            })
                             .contextMenu {
                                 Button("Open") { AppModel.finderOpen(model.path(id)) }
                                 Button("Reveal in Finder") { reveal(id) }
@@ -35,7 +44,7 @@ struct GridResults: View {
                 }
                 .padding(14)
             }
-            .onChange(of: selected) { _, sel in
+            .onChange(of: model.selectedID) { _, sel in
                 if let sel { proxy.scrollTo(sel) }
             }
         }
@@ -43,9 +52,18 @@ struct GridResults: View {
         .focused($focused)
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { press in handleKey(press) }
-        .onAppear { focused = true; if selected == nil { selected = ids.first } }
+        .onAppear {
+            // Carry over the selection from the previous layout; only steal focus
+            // when there IS one (cold launch: selectedID nil → field keeps focus).
+            if let sel = selected, ids.contains(sel) { focused = true }
+            else if selected != nil { model.selectedID = ids.first; focused = true }
+        }
+        .onChange(of: model.focusResultsNonce) {           // ↓ / Enter from the field
+            focused = true
+            if selected == nil || !ids.contains(selected!) { model.selectedID = ids.first }
+        }
         .onChange(of: model.resultsVersion) {
-            if let sel = selected, !ids.contains(sel) { selected = ids.first }
+            if let sel = selected, !ids.contains(sel) { model.selectedID = ids.first }
         }
     }
 
@@ -72,10 +90,23 @@ struct GridResults: View {
     }
 
     private func select(_ id: Int32) {
-        selected = id
         model.selectedID = id
         model.selectionCount = 1
         model.selectionBytes = 0
+        refreshQLIfOpen(id)
+    }
+    private func move(_ delta: Int) {
+        let items = ids
+        guard !items.isEmpty else { return }
+        let idx = selected.flatMap { items.firstIndex(of: $0) } ?? 0
+        select(items[min(items.count - 1, max(0, idx + delta))])
+    }
+    /// Keep the open Quick Look panel following the selection (table-mode parity).
+    private func refreshQLIfOpen(_ id: Int32) {
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              QLPreviewPanel.shared().isVisible else { return }
+        GridQL.shared.paths = [model.path(id)]
+        QLPreviewPanel.shared().reloadData()
     }
     private func reveal(_ id: Int32) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path(id))])
@@ -86,8 +117,24 @@ struct GridResults: View {
     }
     private func quickLook(_ id: Int32) {
         GridQL.shared.paths = [model.path(id)]
+        // While the panel is key OUR view gets no key events — the panel's
+        // delegate hook (previewPanel(_:handle:)) routes arrows back here so
+        // ←→↑↓ keep browsing with the preview open.
+        GridQL.shared.onKey = { code in
+            let cols = max(1, currentColumns())
+            switch code {
+            case 123: move(-1); return true          // ←
+            case 124: move(+1); return true          // →
+            case 125: move(+cols); return true       // ↓
+            case 126: move(-cols); return true       // ↑
+            case 49:                                  // Space again → close (toggle)
+                QLPreviewPanel.shared().orderOut(nil); return true
+            default: return false
+            }
+        }
         if let panel = QLPreviewPanel.shared() {
             panel.dataSource = GridQL.shared
+            panel.delegate = GridQL.shared
             panel.reloadData()
             panel.makeKeyAndOrderFront(nil)
         }
@@ -99,11 +146,11 @@ struct GridResults: View {
         let cols = max(1, currentColumns())
         let idx = selected.flatMap { items.firstIndex(of: $0) } ?? 0
         switch press.key {
-        case .rightArrow: select(items[min(items.count - 1, idx + 1)]); return .handled
-        case .leftArrow:  select(items[max(0, idx - 1)]); return .handled
-        case .downArrow:  select(items[min(items.count - 1, idx + cols)]); return .handled
+        case .rightArrow: move(+1); return .handled
+        case .leftArrow:  move(-1); return .handled
+        case .downArrow:  move(+cols); return .handled
         case .upArrow:
-            if idx - cols < 0 { model.focusNonce &+= 1 } else { select(items[idx - cols]) }
+            if idx - cols < 0 { model.focusNonce &+= 1 } else { move(-cols) }
             return .handled
         case .space:      if let sel = selected { quickLook(sel) }; return .handled
         case .return:     if let sel = selected { AppModel.finderOpen(model.path(sel)) }; return .handled
@@ -115,20 +162,27 @@ struct GridResults: View {
     }
 
     /// Approximate visible column count from the window width (for ↑/↓ moves).
+    /// mainWindow, NOT keyWindow — the QL panel is key while previewing.
     private func currentColumns() -> Int {
-        let w = NSApp.keyWindow?.contentView?.bounds.width ?? 960
+        let w = (NSApp.mainWindow ?? NSApp.keyWindow)?.contentView?.bounds.width ?? 960
         return max(1, Int((w - 28) / (model.thumbSize + 40)))
     }
 }
 
-/// Detached QLPreviewPanel data source (the grid is SwiftUI — no NSResponder
-/// to take panel control, so we drive the panel directly).
-final class GridQL: NSObject, QLPreviewPanelDataSource {
+/// Detached QLPreviewPanel data source + delegate (SwiftUI layouts have no
+/// NSResponder to take panel control, so we drive the panel directly).
+/// onKey receives keyCodes the panel would otherwise swallow; true = handled.
+final class GridQL: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     static let shared = GridQL()
     var paths: [String] = []
+    var onKey: ((UInt16) -> Bool)?
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { paths.count }
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
         URL(fileURLWithPath: paths[index]) as QLPreviewItem
+    }
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown else { return false }
+        return onKey?(event.keyCode) ?? false     // delegate fires on the main thread
     }
 }
 

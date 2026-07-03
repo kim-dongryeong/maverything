@@ -28,7 +28,7 @@ struct MaverythingApp: App {
                 Button("Search Syntax") { model.showSyntax = true }
                     .keyboardShortcut("/")
                 Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                    .keyboardShortcut("/", modifiers: [.command, .control])
+                    .keyboardShortcut("/", modifiers: .control)
             }
         }
 
@@ -87,7 +87,7 @@ struct SearchCommands: Commands {
             Button("Search Syntax") { model.showSyntax = true }
                 .keyboardShortcut("/")                                    // ⌘/
             Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                .keyboardShortcut("/", modifiers: [.command, .control])   // ⌃⌘/ — ⇧⌘/ is macOS's Help-search
+                .keyboardShortcut("/", modifiers: .control)               // ⌃/ — ⇧⌘/ is macOS's Help-search
         }
     }
 }
@@ -117,21 +117,21 @@ struct ViewCommands: Commands {
             Toggle("Two-Pane Preview", isOn: layoutToggle(.twoPane)).keyboardShortcut("3")
             Toggle("Icon Grid", isOn: layoutToggle(.grid)).keyboardShortcut("4")
             Divider()
-            // Sort By — Finder's ⌃⌘n convention (Everything uses Ctrl+n on Windows)
+            // Sort By — ⌃n, matching Everything's Ctrl+n exactly
             Toggle("Sort by Name", isOn: sortToggle(.name))
-                .keyboardShortcut("1", modifiers: [.control, .command])
+                .keyboardShortcut("1", modifiers: .control)
             Toggle("Sort by Path", isOn: sortToggle(.path))
-                .keyboardShortcut("2", modifiers: [.control, .command])
+                .keyboardShortcut("2", modifiers: .control)
             Toggle("Sort by Size", isOn: sortToggle(.size))
-                .keyboardShortcut("3", modifiers: [.control, .command])
+                .keyboardShortcut("3", modifiers: .control)
             Toggle("Sort by Date Modified", isOn: sortToggle(.dateModified))
-                .keyboardShortcut("4", modifiers: [.control, .command])
+                .keyboardShortcut("4", modifiers: .control)
             Toggle("Sort by Date Created", isOn: sortToggle(.dateCreated))
-                .keyboardShortcut("5", modifiers: [.control, .command])
+                .keyboardShortcut("5", modifiers: .control)
             Toggle("Sort by Relevance", isOn: sortToggle(.relevance))
-                .keyboardShortcut("6", modifiers: [.control, .command])
+                .keyboardShortcut("6", modifiers: .control)
             Toggle("Ascending", isOn: $model.ascending)
-                .keyboardShortcut("0", modifiers: [.control, .command])
+                .keyboardShortcut("0", modifiers: .control)
             Divider()
         }
     }

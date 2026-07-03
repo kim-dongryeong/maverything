@@ -284,6 +284,11 @@ struct ResultsTableView: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
+        // Returning from another layout: re-adopt the shared selection so arrows
+        // continue from the same file (selection must SURVIVE layout switches).
+        DispatchQueue.main.async { [weak coordinator = context.coordinator] in
+            coordinator?.restoreSelectionFromModel()
+        }
         return scroll
     }
 
@@ -834,6 +839,14 @@ struct ResultsTableView: NSViewRepresentable {
         }
 
         // MARK: - Actions
+
+        func restoreSelectionFromModel() {
+            guard let tv = tableView, let sel = model.selectedID,
+                  let row = ids.firstIndex(of: sel) else { return }
+            tv.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            tv.scrollRowToVisible(row)
+            tv.window?.makeFirstResponder(tv)   // arrows work immediately
+        }
 
         private func selectedPaths() -> [String] {
             guard let tv = tableView else { return [] }

@@ -128,12 +128,12 @@ struct ShortcutsSheet: View {
         ]),
         ("App", [
             ("⌘1 – ⌘4", "Table · Compact · Two-Pane · Icon Grid"),
-            ("⌃⌘1 – ⌃⌘6", "sort: Name · Path · Size · Modified · Created · Relevance (again = flip)"),
-            ("⌃⌘0", "toggle ascending ↔ descending"),
+            ("⌃1 – ⌃6", "sort: Name · Path · Size · Modified · Created · Relevance (again = flip)"),
+            ("⌃0", "toggle ascending ↔ descending"),
             ("⌥⌘R", "reindex now"),
             ("⌘,", "settings"),
             ("⇧Space", "summon from anywhere (configurable)"),
-            ("⌃⌘/", "this sheet"),
+            ("⌃/", "this sheet"),
         ]),
     ]
     var body: some View {

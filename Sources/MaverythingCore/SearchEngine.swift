@@ -50,6 +50,11 @@ public final class SearchEngine: @unchecked Sendable {
     /// instead of 0. Set from the app's "Index folder sizes" toggle.
     public var useFolderSizes = true
 
+    /// Everything 1.5's "Folders first": group directories above files in every sort
+    /// (each group keeps the chosen order). Applied at RESULT level pre-cap, so it
+    /// holds for ascending AND descending traversals of the cached orders.
+    public var foldersFirst = false
+
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
@@ -61,7 +66,8 @@ public final class SearchEngine: @unchecked Sendable {
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
-        let innerLimit = post != nil ? 5_000_000 : limit   // need the FULL candidate set pre-filter
+        let needFull = post != nil || foldersFirst         // pre-cap reorder/filter needs the full set
+        let innerLimit = needFull ? 5_000_000 : limit
         var res = index.withReadLock {
             _search(query, mode: mode, scope: scope, sortKey: sortKey,
                     ascending: ascending, limit: innerLimit, now: now, scopeRoot: scopeRoot)
@@ -76,6 +82,22 @@ public final class SearchEngine: @unchecked Sendable {
             let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
             res = SearchResults(ids: capped, total: ids.count, truncated: ids.count > capped.count,
                                 queryMillis: res.queryMillis + secondsBetween(t0, clock.now) * 1000)
+        }
+        if foldersFirst {
+            // Stable partition: dirs keep their relative order, then files keep theirs.
+            // objType is captured under the lock as a COW snapshot (appends may
+            // reallocate, our reference keeps the old buffer alive — race-free).
+            let ot = index.withReadLock { index.objType }
+            var dirs: [Int32] = []; var files: [Int32] = []
+            dirs.reserveCapacity(res.ids.count); files.reserveCapacity(res.ids.count)
+            for id in res.ids {
+                let i = Int(id)
+                if i < ot.count, ot[i] == VNODE_VDIR { dirs.append(id) } else { files.append(id) }
+            }
+            var merged = dirs; merged.append(contentsOf: files)
+            let capped = merged.count > limit ? Array(merged[0..<limit]) : merged
+            res = SearchResults(ids: capped, total: res.total, truncated: res.total > capped.count,
+                                queryMillis: res.queryMillis)
         }
         return res
     }

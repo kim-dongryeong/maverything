@@ -109,6 +109,15 @@ final class AppModel: ObservableObject {
     @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
         didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
     }
+    /// Everything 1.5's "Folders first": group directories above files in every sort.
+    @Published var foldersFirst: Bool =
+        (UserDefaults.standard.object(forKey: "mv.foldersFirst") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(foldersFirst, forKey: "mv.foldersFirst")
+            engine.foldersFirst = foldersFirst
+            runSearch()
+        }
+    }
     /// Everything 1.5's "Index folder sizes": folders sort AND display by their live
     /// subtree totals (mutationGen-cached bottom-up pass, ~15 ms per rebuild at 2M).
     @Published var indexFolderSizes: Bool =
@@ -273,6 +282,7 @@ final class AppModel: ObservableObject {
         guard !started else { return }
         started = true
         engine.useFolderSizes = indexFolderSizes
+        engine.foldersFirst = foldersFirst
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess

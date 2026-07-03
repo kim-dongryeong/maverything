@@ -240,6 +240,17 @@ if let dataDir = index.dirIndex(forPath: root + "/data") {
           names.first == root)   // the crawl root's name IS its absolute path
 }
 
+// Everything 1.5-style "Folders first" (result-level stable partition)
+engine.foldersFirst = true
+let ffIds = engine.search("", sortKey: .name, ascending: true, limit: 100_000, now: now).ids
+var seenFileFF = false; var ffOK = true
+for id in ffIds {
+    let d = index.isDir(Int(id))
+    if !d { seenFileFF = true } else if seenFileFF { ffOK = false; break }
+}
+check("foldersFirst: no directory appears after the first file", ffOK && seenFileFF)
+engine.foldersFirst = false
+
 // Everything's duplicate finder (dupe:)
 check("dupe: finds twin_name.txt (exists twice)", has("dupe: twin", "twin_name.txt"))
 check("dupe: excludes unique report.txt", !has("dupe: report", "report.txt"))

@@ -128,6 +128,8 @@ struct ShortcutsSheet: View {
         ]),
         ("App", [
             ("⌘1 / ⌘2 / ⌘3", "Table · Compact · Two-Pane layout"),
+            ("⌃⌘1 – ⌃⌘6", "sort: Name · Path · Size · Modified · Created · Relevance (again = flip)"),
+            ("⌃⌘0", "toggle ascending ↔ descending"),
             ("⌥⌘R", "reindex now"),
             ("⌘,", "settings"),
             ("⇧Space", "summon from anywhere (configurable)"),

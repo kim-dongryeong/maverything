@@ -38,12 +38,13 @@ struct OptionsButton: NSViewRepresentable {
             // (Matching lives in the search bar's match menu + menu-bar Search —
             // the gear is VIEW & APP options only, so nothing is listed twice.)
             group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
-                  selected: sortIndex(model.sortKey), cmd: "sort")
+                  selected: sortIndex(model.sortKey), cmd: "sort",
+                  keys: ["1", "2", "3", "4", "5", "6"], keyMask: [.control, .command])
             group(m, "Appearance", Appearance.allCases.map(\.label),
                   selected: Appearance.allCases.firstIndex(of: model.appearance) ?? 0, cmd: "appear")
             group(m, "Density", RowDensity.allCases.map(\.label),
                   selected: RowDensity.allCases.firstIndex(of: model.density) ?? 0, cmd: "density")
-            check(m, "Ascending", model.ascending, cmd: "asc")
+            check(m, "Ascending", model.ascending, cmd: "asc", key: "0", mask: [.control, .command])
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
             check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
             m.addItem(.separator())
@@ -75,10 +76,13 @@ struct OptionsButton: NSViewRepresentable {
                        case .dateCreated: 4; case .relevance: 5 }
         }
 
-        private func group(_ menu: NSMenu, _ title: String, _ items: [String], selected: Int, cmd: String) {
+        private func group(_ menu: NSMenu, _ title: String, _ items: [String], selected: Int, cmd: String,
+                           keys: [String] = [], keyMask: NSEvent.ModifierFlags = []) {
             let sub = NSMenu()
             for (i, t) in items.enumerated() {
-                let it = NSMenuItem(title: t, action: #selector(pick(_:)), keyEquivalent: "")
+                let it = NSMenuItem(title: t, action: #selector(pick(_:)),
+                                    keyEquivalent: i < keys.count ? keys[i] : "")
+                if i < keys.count { it.keyEquivalentModifierMask = keyMask }
                 it.target = self; it.representedObject = "\(cmd):\(i)"
                 it.state = (i == selected) ? .on : .off
                 sub.addItem(it)

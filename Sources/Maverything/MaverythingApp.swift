@@ -100,11 +100,37 @@ struct ViewCommands: Commands {
         Binding(get: { model.layout == l }, set: { if $0 { model.layout = l } })
     }
 
+    /// Finder's Sort-By semantics on re-select: choosing the ACTIVE key flips
+    /// the direction instead (same muscle memory as clicking a table header).
+    private func sortToggle(_ k: SortKey) -> Binding<Bool> {
+        Binding(get: { model.sortKey == k },
+                set: { _ in
+                    if model.sortKey == k { model.ascending.toggle() }
+                    else { model.sortKey = k }
+                })
+    }
+
     var body: some Commands {
         CommandGroup(before: .toolbar) {
             Toggle("Table", isOn: layoutToggle(.table)).keyboardShortcut("1")
             Toggle("Compact Bar", isOn: layoutToggle(.compact)).keyboardShortcut("2")
             Toggle("Two-Pane Preview", isOn: layoutToggle(.twoPane)).keyboardShortcut("3")
+            Divider()
+            // Sort By — Finder's ⌃⌘n convention (Everything uses Ctrl+n on Windows)
+            Toggle("Sort by Name", isOn: sortToggle(.name))
+                .keyboardShortcut("1", modifiers: [.control, .command])
+            Toggle("Sort by Path", isOn: sortToggle(.path))
+                .keyboardShortcut("2", modifiers: [.control, .command])
+            Toggle("Sort by Size", isOn: sortToggle(.size))
+                .keyboardShortcut("3", modifiers: [.control, .command])
+            Toggle("Sort by Date Modified", isOn: sortToggle(.dateModified))
+                .keyboardShortcut("4", modifiers: [.control, .command])
+            Toggle("Sort by Date Created", isOn: sortToggle(.dateCreated))
+                .keyboardShortcut("5", modifiers: [.control, .command])
+            Toggle("Sort by Relevance", isOn: sortToggle(.relevance))
+                .keyboardShortcut("6", modifiers: [.control, .command])
+            Toggle("Ascending", isOn: $model.ascending)
+                .keyboardShortcut("0", modifiers: [.control, .command])
             Divider()
         }
     }

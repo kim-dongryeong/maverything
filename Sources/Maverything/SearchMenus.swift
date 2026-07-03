@@ -103,7 +103,7 @@ struct ShortcutsSheet: View {
     @Environment(\.dismiss) private var dismiss
     private let sections: [(String, [(String, String)])] = [
         ("Search", [
-            ("⌘F  or  /  or  Tab", "focus the search field"),
+            ("/  or  Tab", "focus the search field"),
             ("Esc (⎋)", "close help → clear query → hide the window"),
             ("⌘↑ / ⌘↓", "cycle recent searches"),
             ("↓", "jump from the field into the results"),

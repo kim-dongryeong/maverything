@@ -53,8 +53,7 @@ struct SearchCommands: Commands {
 
     var body: some Commands {
         CommandMenu("Search") {
-            Button("Focus Search Field") { model.focusNonce &+= 1 }
-                .keyboardShortcut("f")                                    // ⌘F, the standard "find"
+            Button("Focus Search Field") { model.focusNonce &+= 1 }      // '/' or Tab from the results
             Divider()
             Toggle("Match Path", isOn: Binding(
                 get: { model.scope == .fullPath },

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import UniformTypeIdentifiers
 
 public enum SortKey: Int, Sendable { case name, path, size, dateModified, dateCreated, relevance }
 public enum SearchScope: Int, Sendable { case nameOnly, fullPath }
@@ -433,6 +434,67 @@ public final class SearchEngine: @unchecked Sendable {
         return bitmap
     }
 
+    // MARK: - package-directory bitmap (Finder semantics: a package is a FILE)
+
+    private var pkgCache: [Bool] = []
+    private var pkgGen = -1
+    private let pkgLock = NSLock()
+    // ext → is-package, seeded with the common cases and extended by on-disk probes.
+    private var extPkgMap: [String: Bool] = [
+        "app": true, "bundle": true, "appex": true, "plugin": true, "kext": true,
+        "mlmodelc": true, "xcodeproj": true, "playground": true, "docset": true,
+        "photoslibrary": true, "musiclibrary": true, "tvlibrary": true, "fcpbundle": true,
+        "framework": false, "sdk": false, "platform": false, "lproj": false, "asset": false,
+    ]
+
+    /// Bitmap of directories whose extension marks them as a PACKAGE (.app, .bundle,
+    /// .photoslibrary … but NOT .framework) — Finder treats those as files, so the
+    /// folder:/file: filters and the Folders/Files chips classify them as files too.
+    /// Cached per mutationGen; ext→package decisions memoized via UTType.
+    private func packageDirBitmap() -> [Bool] {
+        let gen = index.mutationGenLocked
+        pkgLock.lock()
+        if pkgGen == gen { let c = pkgCache; pkgLock.unlock(); return c }
+        pkgLock.unlock()
+
+        let n = index.count
+        var bitmap = [Bool](repeating: false, count: n)
+        index.foldBlob.withUnsafeBufferPointer { fb in
+        index.nameOff.withUnsafeBufferPointer { offB in
+        index.nameLen.withUnsafeBufferPointer { lenB in
+        index.objType.withUnsafeBufferPointer { otB in
+        index.deleted.withUnsafeBufferPointer { delB in
+            let base = fb.baseAddress!
+            for i in 0..<n where !delB[i] && otB[i] == VNODE_VDIR {
+                let o = Int(offB[i]); let l = Int(lenB[i])
+                var dot = -1
+                var j = l - 1
+                while j > 0 { if base[o + j] == UInt8(ascii: ".") { dot = j; break }; j -= 1 }
+                guard dot > 0, dot < l - 1 else { continue }
+                let ext = String(decoding: UnsafeBufferPointer(start: base + o + dot + 1, count: l - dot - 1),
+                                 as: UTF8.self)
+                pkgLock.lock()
+                let known = extPkgMap[ext]
+                pkgLock.unlock()
+                let isPkg: Bool
+                if let known { isPkg = known }
+                else {
+                    // Headless UTType gives dyn.* types, so resolve each NEW extension
+                    // ONCE by probing a real on-disk item's isPackageKey (Foundation/LS).
+                    let url = URL(fileURLWithPath: self.index._path(i))
+                    isPkg = (try? url.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
+                    pkgLock.lock(); extPkgMap[ext] = isPkg; pkgLock.unlock()
+                }
+                if isPkg { bitmap[i] = true }
+            }
+        }}}}}
+
+        pkgLock.lock()
+        pkgGen = gen; pkgCache = bitmap
+        pkgLock.unlock()
+        return bitmap
+    }
+
     /// One term against one haystack, honoring Everything's Match Whole Word (`ww:`)
     /// for exact mode (other modes define their own shape, so ww: applies to exact).
     @inline(__always)
@@ -662,6 +724,7 @@ public final class SearchEngine: @unchecked Sendable {
         let hasNotDates = !parsed.notDateRanges.isEmpty
         let df = parsed.dateFrom, dt = parsed.dateTo
         let onlyDirs = parsed.onlyDirs, onlyFiles = parsed.onlyFiles
+        let pkgB: [Bool] = (onlyDirs || onlyFiles) ? packageDirBitmap() : []
         let wholeWord = parsed.wholeWord
         let dupeB: [Bool] = parsed.dupesOnly ? dupeBitmap() : []
         let dupesOnly = parsed.dupesOnly
@@ -725,9 +788,14 @@ public final class SearchEngine: @unchecked Sendable {
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
                         // folder scope: only entries under the chosen directory subtree
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
-                        // type filters (folder: / file:)
-                        if onlyDirs && otB[id] != VNODE_VDIR { continue }
-                        if onlyFiles && otB[id] == VNODE_VDIR { continue }
+                        // type filters (folder: / file:) — Finder semantics: a PACKAGE
+                        // directory (.app/.bundle…) counts as a FILE, not a folder.
+                        if onlyDirs || onlyFiles {
+                            let isPkg = id < pkgB.count && pkgB[id]
+                            let dirLike = otB[id] == VNODE_VDIR && !isPkg
+                            if onlyDirs && !dirLike { continue }
+                            if onlyFiles && dirLike { continue }
+                        }
                         // duplicate-name filter (dupe:)
                         if dupesOnly && (id >= dupeB.count || !dupeB[id]) { continue }
                         // empty-folder filter (empty:)

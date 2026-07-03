@@ -38,7 +38,8 @@ func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
 let oldTime = now - 200 * 86_400   // ~200 days ago
 write("report.txt", bytes: 200, mtime: now)
 write("reporting_x.txt", bytes: 4)                     // whole-word (ww:) negative case
-write("star*name.txt", bytes: 4)                       // literal * in a real filename
+write("star*name.txt", bytes: 4)
+write("pkgtest.bundle/inner.bin", bytes: 3)              // package DIR — Finder treats as a file                       // literal * in a real filename
 write("dupA/twin_name.txt", bytes: 6)                 // dupe: fixture (same name, two dirs)
 write("dupB/twin_name.txt", bytes: 7)
 write("Report.PNG", bytes: 300, mtime: oldTime)        // case-insensitivity
@@ -239,6 +240,11 @@ if let dataDir = index.dirIndex(forPath: root + "/data") {
     check("size sort (desc) ranks the fixture root dir first (largest total)",
           names.first == root)   // the crawl root's name IS its absolute path
 }
+
+// Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
+check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
+check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))
+check("package: plain dir still a folder ('folder:data')", has("folder:data", "data"))
 
 // Everything 1.5-style "Folders first" (result-level stable partition)
 engine.foldersFirst = true

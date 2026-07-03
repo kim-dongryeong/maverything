@@ -145,22 +145,27 @@ struct ContentView: View {
             HistoryMenu(model: model)
             BookmarksMenu(model: model)
 
-            Picker("", selection: $model.matchMode) {
-                ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            // Match mode + toggles consolidated into ONE compact menu (the segmented
+            // control + Path button crowded the bar; Everything keeps these in menus
+            // too). The label always shows the live state, e.g. "Exact · Path".
+            Menu {
+                Picker("Match Mode", selection: $model.matchMode) {
+                    ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.inline)
+                Divider()
+                Toggle("Match Path  (⌃U)", isOn: Binding(get: { model.scope == .fullPath },
+                                                         set: { model.scope = $0 ? .fullPath : .nameOnly }))
+                Toggle("Match Case  (⌃I)", isOn: $model.matchCase)
+                Toggle("Match Whole Word  (⌃B)", isOn: $model.wholeWord)
+            } label: {
+                HStack(spacing: 3) {
+                    Text(modeSummary).font(.system(size: 12))
+                }
             }
-            .pickerStyle(.segmented)
-            .fixedSize()                              // size to its 4 segments; no overlap
-            .help("Matching mode: Exact / Fuzzy / Wildcard / Regex")
-
-            // ⌃U scope — always-visible state (lit = matching the FULL PATH, not just names).
-            // Shortcut discoverability follows macOS convention: tooltip + the gear menu's
-            // Scope submenu, not glyphs inside the button.
-            Toggle(isOn: Binding(get: { model.scope == .fullPath },
-                                 set: { model.scope = $0 ? .fullPath : .nameOnly })) {
-                Text("Path")
-            }
-            .toggleStyle(.button)
-            .help("Match against the full path instead of just the file name (⌃U)")
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Matching: Exact / Fuzzy / Wildcard / Regex · Path ⌃U · Case ⌃I · Whole Word ⌃B")
 
             OptionsButton(model: model)
                 .frame(width: 22, height: 22)
@@ -169,6 +174,15 @@ struct ContentView: View {
         .controlSize(.regular)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    /// Live one-glance summary for the match menu label: mode + active toggles.
+    private var modeSummary: String {
+        var s = model.matchMode.label
+        if model.scope == .fullPath { s += " · Path" }
+        if model.matchCase { s += " · Aa" }
+        if model.wholeWord { s += " · W" }
+        return s
     }
 
     private var statusBar: some View {

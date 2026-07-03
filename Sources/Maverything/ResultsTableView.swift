@@ -340,12 +340,16 @@ struct ResultsTableView: NSViewRepresentable {
         col.title = title
         col.width = width
         col.minWidth = 40
-        col.sortDescriptorPrototype = NSSortDescriptor(key: sortKey, ascending: true)
+        // Size/date columns sort DESCENDING on first click (Finder/Everything behavior):
+        // ascending-first floods the top with 0-byte files and "--" folders, which reads
+        // as "sorting is broken". Name/path stay ascending-first.
+        let descFirst = ["size", "date", "created"].contains(sortKey)
+        col.sortDescriptorPrototype = NSSortDescriptor(key: sortKey, ascending: !descFirst)
         table.addTableColumn(col)
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate,
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate,
                              QLPreviewPanelDataSource, QLPreviewPanelDelegate, NSTextFieldDelegate {
         var model: AppModel
         weak var tableView: NSTableView?
@@ -867,17 +871,61 @@ struct ResultsTableView: NSViewRepresentable {
             ("Green", "Green"), ("Blue", "Blue"), ("Purple", "Purple"), ("Gray", "Gray"),
         ]
 
+        /// Finder-identical Tags submenu: each color item carries a filled color-dot
+        /// image, the items show LIVE checkmarks for the clicked file's current tags,
+        /// and clicking TOGGLES that tag (multi-tag capable) — exactly like Finder.
         func makeTagsMenu() -> NSMenu {
             let m = NSMenu()
             m.autoenablesItems = false
-            for (title, tag) in Self.tagColors {
-                let it = NSMenuItem(title: title, action: #selector(setTag(_:)), keyEquivalent: "")
-                it.target = self
-                it.representedObject = tag ?? ""
-                m.addItem(it)
-                if tag == nil { m.addItem(.separator()) }
-            }
+            m.delegate = self          // rebuilt on open so checkmarks reflect the file
             return m
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            let current = selectedPaths().first.map { Set(SearchEngine.xattrTagNames(path: $0)) } ?? []
+            for (title, tag) in Self.tagColors where tag != nil {
+                let it = NSMenuItem(title: title, action: #selector(toggleTagItem(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = tag
+                it.image = Self.tagDotImage(for: title)
+                it.state = current.contains(title.lowercased()) ? .on : .off
+                menu.addItem(it)
+            }
+            menu.addItem(.separator())
+            let none = NSMenuItem(title: "Remove All Tags", action: #selector(removeAllTags(_:)), keyEquivalent: "")
+            none.target = self
+            none.image = Self.tagDotImage(for: nil)
+            menu.addItem(none)
+        }
+
+        /// Finder-style 14pt color swatch: filled circle with a hairline ring;
+        /// nil = the empty "no tag" outline circle.
+        static func tagDotImage(for title: String?) -> NSImage {
+            let d: CGFloat = 14
+            let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { rect in
+                let inset = rect.insetBy(dx: 1.5, dy: 1.5)
+                let path = NSBezierPath(ovalIn: inset)
+                if let title, let c = Self.tagNSColor(title) {
+                    c.setFill(); path.fill()
+                    NSColor.black.withAlphaComponent(0.15).setStroke()
+                } else {
+                    NSColor.tertiaryLabelColor.setStroke()
+                }
+                path.lineWidth = 1; path.stroke()
+                return true
+            }
+            img.isTemplate = false
+            return img
+        }
+
+        static func tagNSColor(_ title: String) -> NSColor? {
+            switch title {
+            case "Red": return .systemRed;       case "Orange": return .systemOrange
+            case "Yellow": return .systemYellow; case "Green": return .systemGreen
+            case "Blue": return .systemBlue;     case "Purple": return .systemPurple
+            case "Gray": return .systemGray;     default: return nil
+            }
         }
 
         // Finder's standard tag color codes (as stored in _kMDItemUserTags: "Name\nCode").
@@ -889,28 +937,45 @@ struct ResultsTableView: NSViewRepresentable {
             }
         }
 
-        @objc private func setTag(_ sender: NSMenuItem) {
-            let tag = (sender.representedObject as? String) ?? ""
-            for p in selectedPaths() { writeTag(tag, to: p); TagCache.invalidate(p) }
-            // refresh the tag dots on the affected rows
-            if let tv = tableView {
-                let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
-                if col >= 0 {
-                    tv.reloadData(forRowIndexes: tv.selectedRowIndexes, columnIndexes: IndexSet(integer: col))
-                }
+        @objc private func toggleTagItem(_ sender: NSMenuItem) {
+            guard let tag = sender.representedObject as? String else { return }
+            for p in selectedPaths() { toggleTag(tag, at: p); TagCache.invalidate(p) }
+            refreshNameCells()
+        }
+
+        @objc private func removeAllTags(_ sender: NSMenuItem) {
+            let name = "com.apple.metadata:_kMDItemUserTags"
+            for p in selectedPaths() { removexattr(p, name, 0); TagCache.invalidate(p) }
+            refreshNameCells()
+        }
+
+        private func refreshNameCells() {
+            guard let tv = tableView else { return }
+            let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+            if col >= 0 {
+                tv.reloadData(forRowIndexes: tv.selectedRowIndexes, columnIndexes: IndexSet(integer: col))
             }
         }
 
-        /// Write a single Finder tag (with its color) via the extended attribute — the
-        /// URLResourceValues.tagNames setter is macOS 26+, so we set the xattr directly.
-        private func writeTag(_ tag: String, to path: String) {
+        /// Add the tag if absent, remove it if present (Finder semantics), preserving
+        /// the file's OTHER tags. Writes the full "Name\nCode" array back to the xattr.
+        private func toggleTag(_ tag: String, at path: String) {
             let name = "com.apple.metadata:_kMDItemUserTags"
-            if tag.isEmpty { removexattr(path, name, 0); return }   // clear all tags
-            let value = colorCode(tag).map { "\(tag)\n\($0)" } ?? tag
+            var tags = SearchEngine.xattrTagNames(path: path)   // lowercased names
+            let want = tag.lowercased()
+            if tags.contains(want) { tags.removeAll { $0 == want } }
+            else { tags.append(want) }
+            if tags.isEmpty { removexattr(path, name, 0); return }
+            // rebuild with canonical capitalization + color codes where known
+            let values: [String] = tags.map { t in
+                let cap = t.prefix(1).uppercased() + t.dropFirst()
+                return colorCode(cap).map { "\(cap)\n\($0)" } ?? cap
+            }
             guard let data = try? PropertyListSerialization.data(
-                fromPropertyList: [value], format: .binary, options: 0) else { return }
-            let ok = data.withUnsafeBytes { setxattr(path, name, $0.baseAddress, $0.count, 0, 0) }
-            if ok != 0 { NSSound.beep() }
+                fromPropertyList: values, format: .binary, options: 0) else { return }
+            if data.withUnsafeBytes({ setxattr(path, name, $0.baseAddress, $0.count, 0, 0) }) != 0 {
+                NSSound.beep()
+            }
         }
 
         @objc func quickLook() { (tableView as? MVTableView)?.toggleQuickLook() }

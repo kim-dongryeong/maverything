@@ -153,7 +153,7 @@ public final class SearchEngine: @unchecked Sendable {
     }
 
     /// Lowercased Finder tag names from com.apple.metadata:_kMDItemUserTags.
-    static func xattrTagNames(path: String) -> [String] {
+    public static func xattrTagNames(path: String) -> [String] {
         let name = "com.apple.metadata:_kMDItemUserTags"
         let size = getxattr(path, name, nil, 0, 0, 0)
         guard size > 0 else { return [] }

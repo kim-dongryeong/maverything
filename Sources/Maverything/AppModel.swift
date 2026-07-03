@@ -1098,6 +1098,7 @@ final class AppModel: ObservableObject {
 
     // Convenience for the table coordinator.
     func path(_ id: Int32) -> String { index.path(Int(id)) }
+    func isDir(_ id: Int32) -> Bool { index.isDir(Int(id)) }
     func name(_ id: Int32) -> String { index.name(Int(id)) }
     func directory(_ id: Int32) -> String { index.directory(Int(id)) }
 }

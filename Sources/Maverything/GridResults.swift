@@ -52,7 +52,7 @@ struct GridResults: View {
     @ViewBuilder private func cell(_ id: Int32) -> some View {
         let isSel = selected == id
         VStack(spacing: 6) {
-            ThumbView(path: model.path(id), size: model.thumbSize)
+            ThumbView(path: model.path(id), isDir: model.isDir(id), size: model.thumbSize)
                 .frame(width: model.thumbSize, height: model.thumbSize)
             Text(model.name(id))
                 .font(.system(size: 11.5))
@@ -132,11 +132,22 @@ final class GridQL: NSObject, QLPreviewPanelDataSource {
     }
 }
 
-/// Async QuickLook thumbnail with the file's icon as instant placeholder.
+/// Async QuickLook thumbnail over an INDEX-DRIVEN placeholder icon.
+/// The placeholder comes from UTType-by-extension (never a disk stat), and the
+/// index's own isDir decides folder-ness — so a .jpg can never render as a
+/// folder no matter what the disk/TCC says, and plain folders never waste a
+/// QL request (their thumbnail IS the folder icon).
 struct ThumbView: View {
     let path: String
+    let isDir: Bool
     let size: CGFloat
     @State private var image: NSImage? = nil
+
+    private var wantsThumbnail: Bool {
+        // files: yes. Dirs: only bundle-ish ones (.app icons, .framework →
+        // QL correctly draws the folder). Plain folders: skip, icon is final.
+        !isDir || !(path as NSString).pathExtension.isEmpty
+    }
 
     var body: some View {
         Group {
@@ -147,15 +158,41 @@ struct ThumbView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 4))
                     .shadow(color: .black.opacity(0.18), radius: 1.5, y: 0.5)
             } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: path))
+                Image(nsImage: GridIcon.icon(ext: (path as NSString).pathExtension, isDir: isDir))
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: size * 0.62, height: size * 0.62)
             }
         }
-        .task(id: path + "|\(Int(size))") {
+        .task(id: path + "|\(Int(size))|\(isDir)") {
+            guard wantsThumbnail else { image = nil; return }
             image = await ThumbCache.shared.thumbnail(for: path, side: size)
         }
+    }
+}
+
+/// Big UTType-based icons for the grid (IconCache's 16-pt instances would blur).
+/// Bounded: one NSImage per extension + dir/file generics.
+enum GridIcon {
+    private static var cache: [String: NSImage] = [:]
+    private static let lock = NSLock()
+    static func icon(ext rawExt: String, isDir: Bool) -> NSImage {
+        let ext = rawExt.lowercased()
+        let key = isDir ? "\u{1}dir" : (ext.isEmpty ? "\u{1}file" : ext)
+        lock.lock(); defer { lock.unlock() }
+        if let hit = cache[key] { return hit }
+        let img: NSImage
+        if isDir {
+            img = NSWorkspace.shared.icon(for: .folder)
+        } else if !ext.isEmpty, let ut = UTType(filenameExtension: ext) {
+            img = NSWorkspace.shared.icon(for: ut)
+        } else {
+            img = NSWorkspace.shared.icon(for: .data)
+        }
+        let copy = img.copy() as! NSImage          // never mutate NSWorkspace's shared instance
+        copy.size = NSSize(width: 128, height: 128)
+        if cache.count < 2_000 { cache[key] = copy }
+        return copy
     }
 }
 

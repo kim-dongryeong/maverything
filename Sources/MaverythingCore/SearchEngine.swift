@@ -56,6 +56,11 @@ public final class SearchEngine: @unchecked Sendable {
     /// holds for ascending AND descending traversals of the cached orders.
     public var foldersFirst = false
 
+    /// Live "hide hidden files" (dotfiles/UF_HIDDEN) — a RESULT-level filter, so
+    /// toggling is instant with NO reindex (better than Everything's index-level
+    /// exclude-hidden). The index always stays complete.
+    public var hideHidden = false
+
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
@@ -67,7 +72,7 @@ public final class SearchEngine: @unchecked Sendable {
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
-        let needFull = post != nil || foldersFirst         // pre-cap reorder/filter needs the full set
+        let needFull = post != nil || foldersFirst || hideHidden   // pre-cap reorder/filter needs the full set
         let innerLimit = needFull ? 5_000_000 : limit
         var res = index.withReadLock {
             _search(query, mode: mode, scope: scope, sortKey: sortKey,
@@ -83,6 +88,13 @@ public final class SearchEngine: @unchecked Sendable {
             let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
             res = SearchResults(ids: capped, total: ids.count, truncated: ids.count > capped.count,
                                 queryMillis: res.queryMillis + secondsBetween(t0, clock.now) * 1000)
+        }
+        if hideHidden {
+            let hid = index.withReadLock { index.hidden }   // COW snapshot, race-free
+            let kept = res.ids.filter { Int($0) < hid.count && !hid[Int($0)] }
+            let capped = kept.count > limit ? Array(kept[0..<limit]) : kept
+            res = SearchResults(ids: capped, total: kept.count, truncated: kept.count > capped.count,
+                                queryMillis: res.queryMillis)
         }
         if foldersFirst {
             // Stable partition: dirs keep their relative order, then files keep theirs.

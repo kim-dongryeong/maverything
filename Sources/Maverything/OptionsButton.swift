@@ -49,6 +49,7 @@ struct OptionsButton: NSViewRepresentable {
                   selected: RowDensity.allCases.firstIndex(of: model.density) ?? 0, cmd: "density")
             check(m, "Ascending", model.ascending, cmd: "asc")
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
+            check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
             m.addItem(.separator())
             check(m, "Include cloud storage (Google Drive, iCloud…)", model.includeCloud, cmd: "cloud")
             item(m, "Reindex Now", cmd: "reindex")
@@ -120,6 +121,7 @@ struct OptionsButton: NSViewRepresentable {
             case "density": model.density = RowDensity.allCases[i]
             case "asc":     model.ascending.toggle()
             case "ff":      model.foldersFirst.toggle()
+            case "hidden":  model.showHidden.toggle()
             case "ww":      model.wholeWord.toggle()
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()

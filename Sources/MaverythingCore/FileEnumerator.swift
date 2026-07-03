@@ -55,6 +55,7 @@ public final class FileEnumerator: @unchecked Sendable {
     private var excludePrefixes: [String] = []
     private var mountPoints: Set<String> = []   // other volumes' mount points → don't descend
     private var filePatterns: [[UInt8]] = []    // folded glob patterns — matching FILES are skipped
+    private var includeOnly: [[UInt8]] = []     // whitelist: when non-empty, ONLY matching files indexed
 
     /// Signals a running crawl to stop ASAP (workers drain and return).
     public func cancel() {
@@ -71,10 +72,10 @@ public final class FileEnumerator: @unchecked Sendable {
     @discardableResult
     public func crawl(roots: [String], restrictToVolume: Bool = false,
                       exclude: [String] = [], mountPoints: Set<String> = [],
-                      excludeFilePatterns: [[UInt8]] = []) -> Stats {
+                      excludeFilePatterns: [[UInt8]] = [], includeOnlyFiles: [[UInt8]] = []) -> Stats {
         crawl(roots: roots.map { CrawlRoot(fsPath: $0, displayPath: $0) },
               restrictToVolume: restrictToVolume, exclude: exclude, mountPoints: mountPoints,
-              excludeFilePatterns: excludeFilePatterns)
+              excludeFilePatterns: excludeFilePatterns, includeOnlyFiles: includeOnlyFiles)
     }
 
     /// Crawl the given roots. `restrictToVolume: true` refuses descent into
@@ -84,7 +85,7 @@ public final class FileEnumerator: @unchecked Sendable {
     @discardableResult
     public func crawl(roots: [CrawlRoot], restrictToVolume: Bool = false,
                       exclude: [String] = [], mountPoints: Set<String> = [],
-                      excludeFilePatterns: [[UInt8]] = []) -> Stats {
+                      excludeFilePatterns: [[UInt8]] = [], includeOnlyFiles: [[UInt8]] = []) -> Stats {
         let clock = ContinuousClock()
         let start = clock.now
         excludePrefixes = exclude
@@ -93,6 +94,7 @@ public final class FileEnumerator: @unchecked Sendable {
         // so keeping it in the set is harmless (children are always deeper).
         self.mountPoints = mountPoints
         self.filePatterns = excludeFilePatterns
+        self.includeOnly = includeOnlyFiles
 
         for r in roots {
             let rootIdx = index.appendRoot(path: r.displayPath)
@@ -252,6 +254,12 @@ public final class FileEnumerator: @unchecked Sendable {
                 // matching NON-directories entirely (folded, anchored glob).
                 if objType != VNODE_VDIR, !filePatterns.isEmpty,
                    Self.nameMatchesAny(nameBuf, patterns: filePatterns) {
+                    p = p + entryLen; continue
+                }
+                // Everything's "Include only files": non-empty whitelist → any file
+                // NOT matching a pattern is skipped (dirs always kept for structure).
+                if objType != VNODE_VDIR, !includeOnly.isEmpty,
+                   !Self.nameMatchesAny(nameBuf, patterns: includeOnly) {
                     p = p + entryLen; continue
                 }
 

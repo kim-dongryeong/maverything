@@ -258,6 +258,31 @@ check("exclude-files: *.tmp skipped by reconcile too", eP.search("later", limit:
 try? fm.removeItem(atPath: root + "/junky.tmp"); try? fm.removeItem(atPath: root + "/later.tmp")
 try? fm.removeItem(atPath: root + "/later.txt")
 
+// Everything's "Include only files" whitelist + live hide-hidden toggle
+write("music_a.mp3", bytes: 2); write("music_b.flac", bytes: 2); write("notes_w.txt", bytes: 2)
+let onlyPats = FileEnumerator.parseFilePatterns("*.mp3;*.flac")
+let idxW = FileIndex()
+_ = FileEnumerator(index: idxW).crawl(roots: [root], exclude: [], mountPoints: [], includeOnlyFiles: onlyPats)
+idxW.buildLiveIndexes()
+let eW = SearchEngine(index: idxW)
+check("include-only: whitelisted files indexed",
+      eW.search("music_a", limit: 5, now: now).total == 1 && eW.search("music_b", limit: 5, now: now).total == 1)
+check("include-only: non-matching file skipped", eW.search("notes_w", limit: 5, now: now).total == 0)
+check("include-only: folders still kept", eW.search("folder:dupA", limit: 5, now: now).total == 1)
+let recW = Reconciler(index: idxW, exclude: [], includeOnlyFiles: onlyPats)
+write("late_song.mp3", bytes: 2); write("late_note.txt", bytes: 2)
+_ = recW.reconcile(eventPaths: [root]); eW.invalidate()
+check("include-only: reconcile honors whitelist",
+      eW.search("late_song", limit: 5, now: now).total == 1 && eW.search("late_note", limit: 5, now: now).total == 0)
+for f in ["music_a.mp3","music_b.flac","notes_w.txt","late_song.mp3","late_note.txt"] {
+    try? fm.removeItem(atPath: root + "/" + f)
+}
+// hideHidden: instant result-level filter (index keeps everything)
+engine.hideHidden = true; engine.invalidate()
+check("hide-hidden: dotfile filtered from results", engine.search(".secret", limit: 5, now: now).total == 0)
+engine.hideHidden = false; engine.invalidate()
+check("hide-hidden: off restores dotfiles", engine.search(".secret", limit: 5, now: now).total >= 1)
+
 // Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
 check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
 check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))

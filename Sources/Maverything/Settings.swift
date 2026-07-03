@@ -296,6 +296,15 @@ struct SettingsView: View {
                 }
                 Text("Semicolon-separated name globs (* and ?), matched case-insensitively. Applying reindexes.")
                     .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    TextField("Include only files (whitelist): *.mp3;*.flac — empty = everything",
+                              text: $model.includeOnlyFilePatterns)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { model.applyExcludeFilePatterns() }
+                    Button("Apply") { model.applyExcludeFilePatterns() }
+                }
+                Text("When set, ONLY files matching these globs are indexed (folders are kept). Everything's 'Include only files'.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("Excluded folders are removed from the index immediately; removing an exclusion triggers a reindex.")
                     .font(.caption).foregroundStyle(.secondary)
             }

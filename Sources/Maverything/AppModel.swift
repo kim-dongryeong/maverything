@@ -118,6 +118,13 @@ final class AppModel: ObservableObject {
     }
     func applyExcludeFilePatterns() { beginIndexing() }   // commit action from Settings
     var parsedFilePatterns: [[UInt8]] { FileEnumerator.parseFilePatterns(excludeFilePatterns) }
+    /// Everything's "Include only files": non-empty whitelist → ONLY matching files
+    /// are indexed (folders always kept for structure). Empty = index everything.
+    @Published var includeOnlyFilePatterns: String =
+        UserDefaults.standard.string(forKey: "mv.includeOnlyFiles") ?? "" {
+        didSet { UserDefaults.standard.set(includeOnlyFilePatterns, forKey: "mv.includeOnlyFiles") }
+    }
+    var parsedIncludeOnly: [[UInt8]] { FileEnumerator.parseFilePatterns(includeOnlyFilePatterns) }
     /// User-added exclude folders (on top of the built-in exclusions).
     @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
         didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
@@ -149,7 +156,14 @@ final class AppModel: ObservableObject {
         (UserDefaults.standard.object(forKey: "mv.customRootRescan") as? Int) ?? 60 {
         didSet { UserDefaults.standard.set(customRootRescanMinutes, forKey: "mv.customRootRescan") }
     }
-    @Published var showHidden = true            // Everything-style: show everything
+    @Published var showHidden: Bool =
+        (UserDefaults.standard.object(forKey: "mv.showHidden") as? Bool) ?? true {
+        didSet {                                 // Everything's Exclude-hidden, but LIVE:
+            UserDefaults.standard.set(showHidden, forKey: "mv.showHidden")
+            engine.hideHidden = !showHidden      // result-level filter — no reindex
+            runSearch()
+        }
+    }
     @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
         didSet { UserDefaults.standard.set(enterRenames, forKey: "mv.enterRenames") }
     }
@@ -296,6 +310,7 @@ final class AppModel: ObservableObject {
         started = true
         engine.useFolderSizes = indexFolderSizes
         engine.foldersFirst = foldersFirst
+        engine.hideHidden = !showHidden
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess
@@ -411,7 +426,8 @@ final class AppModel: ObservableObject {
             let sinceId = FSEventsGetCurrentEventId()
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
                                  mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns)
+                                 excludeFilePatterns: self.parsedFilePatterns,
+                                 includeOnlyFiles: self.parsedIncludeOnly)
             if en.isCancelled { return }                     // superseded; skip extra work
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
@@ -446,7 +462,7 @@ final class AppModel: ObservableObject {
         watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
         let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
-                             excludeFilePatterns: parsedFilePatterns)
+                             excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
         reconciler = rec
         let q = reconcileQueue
         watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, rootChanged, batchMax in
@@ -553,7 +569,8 @@ final class AppModel: ObservableObject {
             if let en = dynamicEnumerator {
                 let stats = en.crawl(roots: additions, restrictToVolume: false, exclude: exclude,
                                      mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns)
+                                 excludeFilePatterns: self.parsedFilePatterns,
+                                 includeOnlyFiles: self.parsedIncludeOnly)
                 if !en.isCancelled {
                     self.index.buildLiveIndexes()
                     // A stale reconciler racing the mount may have indexed the volume AGAIN
@@ -681,7 +698,8 @@ final class AppModel: ObservableObject {
             }
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
                                  mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns)
+                                 excludeFilePatterns: self.parsedFilePatterns,
+                                 includeOnlyFiles: self.parsedIncludeOnly)
             if !en.isCancelled { self.index.buildLiveIndexes() }
             let cancelled = en.isCancelled
 

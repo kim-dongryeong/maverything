@@ -58,14 +58,23 @@ struct SearchCommands: Commands {
                 .keyboardShortcut("i", modifiers: .control)
             Toggle("Match Whole Word", isOn: $model.wholeWord)
                 .keyboardShortcut("b", modifiers: .control)
+            Divider()
+            // Mode shortcuts: each is a to-mode/back toggle (Everything's ⌃R
+            // regex semantics, extended to the whole trio) + a ⌃M cycler.
+            Toggle("Exact Match", isOn: Binding(
+                get: { model.matchMode == .exact },
+                set: { _ in model.matchMode = .exact }))
+                .keyboardShortcut("e", modifiers: .control)
+            Toggle("Fuzzy Match", isOn: Binding(
+                get: { model.matchMode == .fuzzy },
+                set: { model.matchMode = $0 ? .fuzzy : .exact }))
+                .keyboardShortcut("f", modifiers: .control)
             Toggle("Enable Regex", isOn: Binding(
                 get: { model.matchMode == .regex },
                 set: { model.matchMode = $0 ? .regex : .exact }))
                 .keyboardShortcut("r", modifiers: .control)
-            Divider()
-            Picker("Match Mode", selection: $model.matchMode) {
-                ForEach(MatchMode.uiModes, id: \.self) { Text($0.label).tag($0) }
-            }
+            Button("Cycle Match Mode") { model.cycleMatchMode() }
+                .keyboardShortcut("m", modifiers: .control)
             Divider()
             Button("Reindex Now") { model.reindex() }
                 .keyboardShortcut("r", modifiers: [.command, .option])   // ⌥⌘R — frees ⌘R for Reveal in Finder

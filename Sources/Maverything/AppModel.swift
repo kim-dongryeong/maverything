@@ -825,6 +825,13 @@ final class AppModel: ObservableObject {
 
     func openFDASettings() { Permissions.openFullDiskAccessSettings() }
 
+    /// ⌃M: rotate Exact → Fuzzy → Regex → Exact.
+    func cycleMatchMode() {
+        let modes = MatchMode.uiModes
+        let i = modes.firstIndex(of: matchMode) ?? 0
+        matchMode = modes[(i + 1) % modes.count]
+    }
+
     /// Finder-faithful Open: a NON-package directory (plain folder, .framework,
     /// .sdk…) navigates INTO the folder; everything else goes through Launch-
     /// Services (launch .app, open file/package with its app). Plain

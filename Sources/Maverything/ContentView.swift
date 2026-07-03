@@ -150,7 +150,9 @@ struct ContentView: View {
             // too). The label always shows the live state, e.g. "Exact · Path".
             Menu {
                 Picker("Match Mode", selection: $model.matchMode) {
-                    ForEach(MatchMode.uiModes, id: \.self) { Text($0.label).tag($0) }
+                    Text("Exact  (⌃E)").tag(MatchMode.exact)
+                    Text("Fuzzy  (⌃F)").tag(MatchMode.fuzzy)
+                    Text("Regex  (⌃R)").tag(MatchMode.regex)
                 }
                 .pickerStyle(.inline)
                 Divider()
@@ -165,7 +167,7 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Matching: Exact / Fuzzy / Wildcard / Regex · Path ⌃U · Case ⌃I · Whole Word ⌃B")
+            .help("Mode: Exact ⌃E · Fuzzy ⌃F · Regex ⌃R · cycle ⌃M — Path ⌃U · Case ⌃I · Whole Word ⌃B")
 
             OptionsButton(model: model)
                 .frame(width: 22, height: 22)

@@ -204,6 +204,27 @@ final class ThumbCache: @unchecked Sendable {
     private let cache = NSCache<NSString, NSImage>()
     private init() { cache.countLimit = 3_000 }
 
+    private var inflight = Set<String>()
+    private let flightLock = NSLock()
+
+    /// Synchronous cache peek for table cells (no I/O, safe on the main thread).
+    func cachedSync(for path: String, side: CGFloat) -> NSImage? {
+        cache.object(forKey: "\(path)|\(Int(side))" as NSString)
+    }
+    /// Fire-and-forget generation for table cells; onReady runs on main once cached.
+    func prefetch(for path: String, side: CGFloat, onReady: @escaping () -> Void) {
+        let key = "\(path)|\(Int(side))"
+        flightLock.lock()
+        let dup = !inflight.insert(key).inserted
+        flightLock.unlock()
+        if dup { return }
+        Task.detached(priority: .utility) { [self] in
+            _ = await thumbnail(for: path, side: side)
+            flightLock.lock(); inflight.remove(key); flightLock.unlock()
+            await MainActor.run { onReady() }
+        }
+    }
+
     func thumbnail(for path: String, side: CGFloat) async -> NSImage? {
         let key = "\(path)|\(Int(side))" as NSString
         if let hit = cache.object(forKey: key) { return hit }

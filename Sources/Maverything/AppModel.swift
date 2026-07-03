@@ -824,6 +824,14 @@ final class AppModel: ObservableObject {
     }
 
     // Help surfaces (⌘/ syntax, ⇧⌘/ shortcuts) — menu items drive these flags.
+    /// Finder's "Show icon preview" for the table: media rows show mini thumbnails.
+    @Published var iconPreview: Bool =
+        (UserDefaults.standard.object(forKey: "mv.iconPreview") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(iconPreview, forKey: "mv.iconPreview")
+            resultsVersion &+= 1                       // repaint visible rows
+        }
+    }
     /// Icon-grid thumbnail edge (pt) — Everything's Medium/Large/Extra Large Icons.
     @Published var thumbSize: CGFloat =
         CGFloat((UserDefaults.standard.object(forKey: "mv.thumbSize") as? Double) ?? 112) {

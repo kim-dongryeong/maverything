@@ -1,5 +1,6 @@
 import AppKit
 import MaverythingCore
+import Quartz
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -31,6 +32,21 @@ struct CompactResults: View {
             .onKeyPress(.downArrow) { move(+1, ids, proxy); return .handled }
             .onKeyPress(.upArrow) { move(-1, ids, proxy); return .handled }
             .onKeyPress(.return) { if let s = model.selectedID { open(s) }; return .handled }
+            .onKeyPress(.space) {                       // Quick Look, same as the table
+                guard let s = model.selectedID else { return .ignored }
+                GridQL.shared.paths = [model.path(s)]
+                if let panel = QLPreviewPanel.shared() {
+                    panel.dataSource = GridQL.shared
+                    panel.reloadData()
+                    panel.makeKeyAndOrderFront(nil)
+                }
+                return .handled
+            }
+            .onKeyPress(.tab) { model.focusNonce &+= 1; return .handled }
+            .onKeyPress(phases: .down) { press in
+                if press.characters == "/" { model.focusNonce &+= 1; return .handled }
+                return .ignored
+            }
             .onChange(of: model.focusResultsNonce) {
                 listFocused = true
                 if model.selectedID == nil, let first = ids.first { model.selectedID = first }

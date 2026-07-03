@@ -49,6 +49,7 @@ struct OptionsButton: NSViewRepresentable {
             check(m, "Ascending", model.ascending, cmd: "asc", key: "0", mask: [.control, .command])
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
             check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
+            check(m, "Icon Preview in List", model.iconPreview, cmd: "iconprev")
             m.addItem(.separator())
             check(m, "Include cloud storage (Google Drive, iCloud…)", model.includeCloud, cmd: "cloud")
             item(m, "Reindex Now", cmd: "reindex")
@@ -122,6 +123,7 @@ struct OptionsButton: NSViewRepresentable {
             case "asc":     model.ascending.toggle()
             case "ff":      model.foldersFirst.toggle()
             case "hidden":  model.showHidden.toggle()
+            case "iconprev": model.iconPreview.toggle()
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()
             case "fda":     model.showOnboarding = true

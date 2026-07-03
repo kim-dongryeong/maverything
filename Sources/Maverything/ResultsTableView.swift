@@ -364,6 +364,10 @@ struct ResultsTableView: NSViewRepresentable {
     }
 
     @MainActor
+    static let previewableExts: Set<String> = [
+        "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "icns",
+        "pdf", "mov", "mp4", "m4v", "avi", "mkv", "webm"]
+
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate,
                              QLPreviewPanelDataSource, QLPreviewPanelDelegate, NSTextFieldDelegate {
         var model: AppModel
@@ -445,8 +449,19 @@ struct ResultsTableView: NSViewRepresentable {
                     if let dots { base.append(dots) }
                     cell.textField?.attributedStringValue = base
                 }
-                cell.imageView?.image = IconCache.icon(for: r.path, isDir: r.isDir,
-                                                       isLink: r.isLink, onReady: refreshName)
+                // Finder's "Show icon preview": tiny QL thumbnails for media rows
+                // (Everything's Details view shows only icons — this one's for Finder
+                // muscle memory). Cached sync peek; miss = icon now, refresh when ready.
+                var rowIcon = IconCache.icon(for: r.path, isDir: r.isDir,
+                                             isLink: r.isLink, onReady: refreshName)
+                if model.iconPreview, !r.isDir, ResultsTableView.previewableExts.contains(r.ext.lowercased()) {
+                    if let t = ThumbCache.shared.cachedSync(for: r.path, side: 32) {
+                        rowIcon = t
+                    } else {
+                        ThumbCache.shared.prefetch(for: r.path, side: 32, onReady: refreshName)
+                    }
+                }
+                cell.imageView?.image = rowIcon
             case "kind":
                 cell.textField?.stringValue = KindCache.kind(for: r.path, isDir: r.isDir, isLink: r.isLink)
                 cell.textField?.textColor = .secondaryLabelColor

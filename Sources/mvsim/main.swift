@@ -283,6 +283,19 @@ check("hide-hidden: dotfile filtered from results", engine.search(".secret", lim
 engine.hideHidden = false; engine.invalidate()
 check("hide-hidden: off restores dotfiles", engine.search(".secret", limit: 5, now: now).total >= 1)
 
+// Folders First must use the SAME Finder semantics: .bundle sinks to the files half
+engine.foldersFirst = true; engine.invalidate()
+let ffR = engine.search("pkgtest", limit: 50, now: now)
+var sawRealDirEnd = -1, pkgPos = -1
+for (i, id) in ffR.ids.enumerated() {
+    let nm = index.name(Int(id))
+    if nm == "pkgtest.bundle" { pkgPos = i }
+    if index.isDir(Int(id)) && nm != "pkgtest.bundle" { sawRealDirEnd = max(sawRealDirEnd, i) }
+}
+check("folders-first: package sorts with FILES not folders",
+      pkgPos >= 0 && (sawRealDirEnd == -1 || pkgPos > sawRealDirEnd))
+engine.foldersFirst = false; engine.invalidate()
+
 // Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
 check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
 check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))

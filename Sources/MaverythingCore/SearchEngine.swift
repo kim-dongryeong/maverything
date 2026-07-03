@@ -101,11 +101,16 @@ public final class SearchEngine: @unchecked Sendable {
             // objType is captured under the lock as a COW snapshot (appends may
             // reallocate, our reference keeps the old buffer alive — race-free).
             let ot = index.withReadLock { index.objType }
+            // Finder semantics, same as folder:/file: — a package dir (.app/.bundle)
+            // is a FILE for grouping purposes, so it never floats up among folders.
+            let pkg = packageDirBitmap()
             var dirs: [Int32] = []; var files: [Int32] = []
             dirs.reserveCapacity(res.ids.count); files.reserveCapacity(res.ids.count)
             for id in res.ids {
                 let i = Int(id)
-                if i < ot.count, ot[i] == VNODE_VDIR { dirs.append(id) } else { files.append(id) }
+                if i < ot.count, ot[i] == VNODE_VDIR, !(i < pkg.count && pkg[i]) {
+                    dirs.append(id)
+                } else { files.append(id) }
             }
             var merged = dirs; merged.append(contentsOf: files)
             let capped = merged.count > limit ? Array(merged[0..<limit]) : merged

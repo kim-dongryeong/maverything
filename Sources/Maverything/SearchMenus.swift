@@ -131,7 +131,7 @@ struct ShortcutsSheet: View {
             ("⌥⌘R", "reindex now"),
             ("⌘,", "settings"),
             ("⇧Space", "summon from anywhere (configurable)"),
-            ("⇧⌘/", "this sheet"),
+            ("⌥⌘/", "this sheet"),
         ]),
     ]
     var body: some View {

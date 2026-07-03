@@ -304,6 +304,14 @@ check("wildcard-whole OFF: '?ata.json' finds data.json", has("?ata.json", "data.
 engine.wholeNameWildcards = true; engine.invalidate()
 check("wildcard-whole restored: anchored again", !has("port*", "report.txt"))
 
+// wildcard-whole toggle must be a NO-OP in fuzzy/regex modes (was corrupting them)
+engine.wholeNameWildcards = false; engine.invalidate()
+check("wildcard-whole OFF: regex anchors survive (^…$ not star-wrapped)",
+      engine.search("^report\\.txt$", mode: .regex, limit: 10, now: now).total == 1)
+check("wildcard-whole OFF: fuzzy unaffected by glob chars",
+      engine.search("rprt", mode: .fuzzy, limit: 10_000, now: now).ids.contains { index.name(Int($0)) == "report.txt" })
+engine.wholeNameWildcards = true; engine.invalidate()
+
 // Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
 check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
 check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))

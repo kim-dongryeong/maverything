@@ -24,6 +24,12 @@ struct MaverythingApp: App {
         .commands {
             SearchCommands(model: model)   // Everything's Search menu (⌃U/⌃I/⌃B/⌃R live here)
             ViewCommands(model: model)     // layouts ⌘1/2/3 in the View menu
+            CommandGroup(replacing: .help) {
+                Button("Search Syntax") { model.showSyntax = true }
+                    .keyboardShortcut("/")
+                Button("Keyboard Shortcuts") { model.showShortcuts = true }
+                    .keyboardShortcut("/", modifiers: [.command, .option])
+            }
         }
 
         Settings {
@@ -82,7 +88,7 @@ struct SearchCommands: Commands {
             Button("Search Syntax") { model.showSyntax = true }
                 .keyboardShortcut("/")                                    // ⌘/
             Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                .keyboardShortcut("/", modifiers: [.command, .shift])     // ⇧⌘/ (⌘?)
+                .keyboardShortcut("/", modifiers: [.command, .option])    // ⌥⌘/ — ⇧⌘/ is macOS's Help-search
         }
     }
 }

@@ -738,7 +738,8 @@ public final class SearchEngine: @unchecked Sendable {
         for (gi, g) in parsed.termGroups.enumerated() {
             for t in g {
                 var bytes = t.bytes
-                if !wholeNameWildcards, t.isGlob || mode == .wildcard, !bytes.isEmpty {
+                let willGlob = (t.isGlob && mode == .exact) || mode == .wildcard
+                if !wholeNameWildcards, willGlob, !bytes.isEmpty {
                     if bytes.first != star { bytes.insert(star, at: 0) }
                     if bytes.last != star { bytes.append(star) }
                 }

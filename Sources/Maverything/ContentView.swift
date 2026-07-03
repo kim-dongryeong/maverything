@@ -164,6 +164,7 @@ struct ContentView: View {
                 Toggle("Match Whole Word  (⌃B)", isOn: $model.wholeWord)
                 Divider()
                 Toggle("Wildcards Match Whole Name", isOn: $model.wildcardWholeName)
+                    .disabled(model.matchMode != .exact)   // wildcards only engage in Exact
             } label: {
                 HStack(spacing: 3) {
                     Text(modeSummary).font(.system(size: 12))

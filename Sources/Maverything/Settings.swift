@@ -225,7 +225,7 @@ struct SettingsView: View {
             }
             Section("Search & Appearance") {
                 Picker("Match mode", selection: $model.matchMode) {
-                    ForEach(MatchMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                    ForEach(MatchMode.uiModes, id: \.self) { Text($0.label).tag($0) }
                 }
                 Picker("Layout", selection: $model.layout) {
                     ForEach(UILayout.allCases) { Text($0.label).tag($0) }

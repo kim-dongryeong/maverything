@@ -363,11 +363,11 @@ struct ResultsTableView: NSViewRepresentable {
         table.addTableColumn(col)
     }
 
-    @MainActor
     static let previewableExts: Set<String> = [
         "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "icns",
         "pdf", "mov", "mp4", "m4v", "avi", "mkv", "webm"]
 
+    @MainActor
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate,
                              QLPreviewPanelDataSource, QLPreviewPanelDelegate, NSTextFieldDelegate {
         var model: AppModel

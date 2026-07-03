@@ -108,6 +108,16 @@ final class AppModel: ObservableObject {
     @Published var customRoots: [String] = UserDefaults.standard.stringArray(forKey: "mv.customRoots") ?? [] {
         didSet { UserDefaults.standard.set(customRoots, forKey: "mv.customRoots") }
     }
+    /// Everything's "Exclude files": semicolon-separated glob patterns (*.tmp;*.log)
+    /// removed from the index at crawl AND live-update time. Changing it reindexes.
+    @Published var excludeFilePatterns: String =
+        UserDefaults.standard.string(forKey: "mv.excludeFiles") ?? "" {
+        didSet {
+            UserDefaults.standard.set(excludeFilePatterns, forKey: "mv.excludeFiles")
+        }
+    }
+    func applyExcludeFilePatterns() { beginIndexing() }   // commit action from Settings
+    var parsedFilePatterns: [[UInt8]] { FileEnumerator.parseFilePatterns(excludeFilePatterns) }
     /// User-added exclude folders (on top of the built-in exclusions).
     @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
         didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
@@ -400,7 +410,8 @@ final class AppModel: ObservableObject {
             // crawl are replayed once the stream starts (not lost).
             let sinceId = FSEventsGetCurrentEventId()
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
-                                 mountPoints: Volumes.allMountPoints())
+                                 mountPoints: Volumes.allMountPoints(),
+                                 excludeFilePatterns: self.parsedFilePatterns)
             if en.isCancelled { return }                     // superseded; skip extra work
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
@@ -434,7 +445,8 @@ final class AppModel: ObservableObject {
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
         watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
-        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints())
+        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
+                             excludeFilePatterns: parsedFilePatterns)
         reconciler = rec
         let q = reconcileQueue
         watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, rootChanged, batchMax in
@@ -540,7 +552,8 @@ final class AppModel: ObservableObject {
             var seconds = 0.0
             if let en = dynamicEnumerator {
                 let stats = en.crawl(roots: additions, restrictToVolume: false, exclude: exclude,
-                                     mountPoints: Volumes.allMountPoints())
+                                     mountPoints: Volumes.allMountPoints(),
+                                 excludeFilePatterns: self.parsedFilePatterns)
                 if !en.isCancelled {
                     self.index.buildLiveIndexes()
                     // A stale reconciler racing the mount may have indexed the volume AGAIN
@@ -667,7 +680,8 @@ final class AppModel: ObservableObject {
                 removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
             }
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
-                                 mountPoints: Volumes.allMountPoints())
+                                 mountPoints: Volumes.allMountPoints(),
+                                 excludeFilePatterns: self.parsedFilePatterns)
             if !en.isCancelled { self.index.buildLiveIndexes() }
             let cancelled = en.isCancelled
 

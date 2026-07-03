@@ -54,6 +54,7 @@ public final class FileEnumerator: @unchecked Sendable {
     private var stat = Stats()
     private var excludePrefixes: [String] = []
     private var mountPoints: Set<String> = []   // other volumes' mount points → don't descend
+    private var filePatterns: [[UInt8]] = []    // folded glob patterns — matching FILES are skipped
 
     /// Signals a running crawl to stop ASAP (workers drain and return).
     public func cancel() {
@@ -69,9 +70,11 @@ public final class FileEnumerator: @unchecked Sendable {
     /// Convenience: crawl plain paths (fsPath == displayPath).
     @discardableResult
     public func crawl(roots: [String], restrictToVolume: Bool = false,
-                      exclude: [String] = [], mountPoints: Set<String> = []) -> Stats {
+                      exclude: [String] = [], mountPoints: Set<String> = [],
+                      excludeFilePatterns: [[UInt8]] = []) -> Stats {
         crawl(roots: roots.map { CrawlRoot(fsPath: $0, displayPath: $0) },
-              restrictToVolume: restrictToVolume, exclude: exclude, mountPoints: mountPoints)
+              restrictToVolume: restrictToVolume, exclude: exclude, mountPoints: mountPoints,
+              excludeFilePatterns: excludeFilePatterns)
     }
 
     /// Crawl the given roots. `restrictToVolume: true` refuses descent into
@@ -80,7 +83,8 @@ public final class FileEnumerator: @unchecked Sendable {
     /// not descend into (cloud storage etc.). Blocks until complete.
     @discardableResult
     public func crawl(roots: [CrawlRoot], restrictToVolume: Bool = false,
-                      exclude: [String] = [], mountPoints: Set<String> = []) -> Stats {
+                      exclude: [String] = [], mountPoints: Set<String> = [],
+                      excludeFilePatterns: [[UInt8]] = []) -> Stats {
         let clock = ContinuousClock()
         let start = clock.now
         excludePrefixes = exclude
@@ -88,6 +92,7 @@ public final class FileEnumerator: @unchecked Sendable {
         // root). A root's own fsPath is added directly, never via the child loop,
         // so keeping it in the set is harmless (children are always deeper).
         self.mountPoints = mountPoints
+        self.filePatterns = excludeFilePatterns
 
         for r in roots {
             let rootIdx = index.appendRoot(path: r.displayPath)
@@ -168,6 +173,29 @@ public final class FileEnumerator: @unchecked Sendable {
         cond.unlock()
     }
 
+    /// Folded-glob match of a raw name against any exclude pattern.
+    static func nameMatchesAny(_ name: UnsafeBufferPointer<UInt8>, patterns: [[UInt8]]) -> Bool {
+        var folded = [UInt8](repeating: 0, count: name.count)
+        for i in 0..<name.count { folded[i] = asciiLower(name[i]) }
+        return folded.withUnsafeBufferPointer { nb in
+            for pat in patterns {
+                let hit = pat.withUnsafeBufferPointer { pb in
+                    Matcher.wildcard(nb.baseAddress!, nb.count, pb.baseAddress!, pb.count).matched
+                }
+                if hit { return true }
+            }
+            return false
+        }
+    }
+
+    /// Parse Everything-style "a;b;c" exclude-file patterns into folded byte globs.
+    public static func parseFilePatterns(_ raw: String) -> [[UInt8]] {
+        raw.split(separator: ";").compactMap {
+            let t = $0.trimmingCharacters(in: .whitespaces).precomposedStringWithCanonicalMapping
+            return t.isEmpty ? nil : Array(t.utf8).map(asciiLower)
+        }
+    }
+
     private func isExcluded(_ path: String) -> Bool {
         for p in excludePrefixes where path == p || path.hasPrefix(p + "/") { return true }
         return false
@@ -218,6 +246,13 @@ public final class FileEnumerator: @unchecked Sendable {
                     let childName = String(decoding: nameBuf, as: UTF8.self).precomposedStringWithCanonicalMapping
                     let childFs = dir == "/" ? "/" + childName : dir + "/" + childName
                     if mountPoints.contains(childFs) { p = p + entryLen; continue }
+                }
+
+                // Everything-style "Exclude files" patterns (*.tmp;*.log) — skip
+                // matching NON-directories entirely (folded, anchored glob).
+                if objType != VNODE_VDIR, !filePatterns.isEmpty,
+                   Self.nameMatchesAny(nameBuf, patterns: filePatterns) {
+                    p = p + entryLen; continue
                 }
 
                 let mtime = modSec &* 1_000_000_000 &+ modNsec

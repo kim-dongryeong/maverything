@@ -105,11 +105,14 @@ public final class Reconciler: @unchecked Sendable {
     private let index: FileIndex
     private let exclude: [String]
     private let baseMountPoints: Set<String>   // other volumes' mounts — each is its OWN crawl root
+    private let filePatterns: [[UInt8]]        // Everything-style exclude-file globs
 
-    public init(index: FileIndex, exclude: [String], mountPoints: Set<String> = []) {
+    public init(index: FileIndex, exclude: [String], mountPoints: Set<String> = [],
+                excludeFilePatterns: [[UInt8]] = []) {
         self.index = index
         self.exclude = exclude
         self.baseMountPoints = mountPoints
+        self.filePatterns = excludeFilePatterns
     }
 
     /// Reconcile the dirty directories implied by these event paths. Returns the
@@ -151,6 +154,13 @@ public final class Reconciler: @unchecked Sendable {
                     let nm = String(decoding: e.name, as: UTF8.self)
                     let cp = d == "/" ? "/" + nm : d + "/" + nm
                     return mountPoints.contains(cp)
+                }
+            }
+            if !filePatterns.isEmpty {
+                current.removeAll { e in
+                    e.objType != VNODE_VDIR && e.name.withUnsafeBufferPointer {
+                        FileEnumerator.nameMatchesAny($0, patterns: filePatterns)
+                    }
                 }
             }
             let r = index.applyDirDiff(dirIdx: di, displayPath: d, current: current, expectedEpoch: epoch)

@@ -287,6 +287,15 @@ struct SettingsView: View {
             Section("Excluded folders") {
                 pathList(model.customExcludes, remove: { model.removeCustomExclude($0) })
                 Button("Add Exclusion…") { pickFolder { model.addCustomExclude($0) } }
+                HStack {
+                    TextField("Exclude files (patterns): *.tmp;*.log;.DS_Store",
+                              text: $model.excludeFilePatterns)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { model.applyExcludeFilePatterns() }
+                    Button("Apply") { model.applyExcludeFilePatterns() }
+                }
+                Text("Semicolon-separated name globs (* and ?), matched case-insensitively. Applying reindexes.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("Excluded folders are removed from the index immediately; removing an exclusion triggers a reindex.")
                     .font(.caption).foregroundStyle(.secondary)
             }

@@ -241,6 +241,23 @@ if let dataDir = index.dirIndex(forPath: root + "/data") {
           names.first == root)   // the crawl root's name IS its absolute path
 }
 
+// Everything's "Exclude files" patterns (crawl + reconcile)
+write("junky.tmp", bytes: 2)
+write("keepme.txt", bytes: 2)
+let pats = FileEnumerator.parseFilePatterns("*.tmp; *.log")
+let idxP = FileIndex()
+_ = FileEnumerator(index: idxP).crawl(roots: [root], exclude: [], mountPoints: [], excludeFilePatterns: pats)
+idxP.buildLiveIndexes()
+let eP = SearchEngine(index: idxP)
+check("exclude-files: *.tmp skipped at crawl", eP.search("junky", limit: 10, now: now).total == 0)
+check("exclude-files: other files kept", eP.search("keepme", limit: 10, now: now).total == 1)
+let recP = Reconciler(index: idxP, exclude: [], excludeFilePatterns: pats)
+write("later.tmp", bytes: 2); write("later.txt", bytes: 2)
+_ = recP.reconcile(eventPaths: [root]); eP.invalidate()
+check("exclude-files: *.tmp skipped by reconcile too", eP.search("later", limit: 10, now: now).total == 1)
+try? fm.removeItem(atPath: root + "/junky.tmp"); try? fm.removeItem(atPath: root + "/later.tmp")
+try? fm.removeItem(atPath: root + "/later.txt")
+
 // Finder semantics: package dirs (.bundle) are FILES for folder:/file: filters
 check("package: 'file:' includes pkgtest.bundle", has("file:pkgtest", "pkgtest.bundle"))
 check("package: 'folder:' excludes pkgtest.bundle", !has("folder:pkgtest", "pkgtest.bundle"))

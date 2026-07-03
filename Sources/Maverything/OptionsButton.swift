@@ -35,12 +35,8 @@ struct OptionsButton: NSViewRepresentable {
             let m = NSMenu()
             group(m, "Layout", UILayout.allCases.map(\.label),
                   selected: UILayout.allCases.firstIndex(of: model.layout) ?? 0, cmd: "layout")
-            group(m, "Match mode", MatchMode.uiModes.map(\.label),
-                  selected: MatchMode.uiModes.firstIndex(of: model.matchMode) ?? 0, cmd: "mode")
-            // Everything's search-toggle set (same shortcuts as the original)
-            check(m, "Match Path", model.scope == .fullPath, cmd: "scope", key: "u", mask: [.control])
-            check(m, "Match Case", model.matchCase, cmd: "case", key: "i", mask: [.control])
-            check(m, "Match Whole Word", model.wholeWord, cmd: "ww", key: "b", mask: [.control])
+            // (Matching lives in the search bar's match menu + menu-bar Search —
+            // the gear is VIEW & APP options only, so nothing is listed twice.)
             group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
                   selected: sortIndex(model.sortKey), cmd: "sort")
             group(m, "Appearance", Appearance.allCases.map(\.label),
@@ -50,7 +46,6 @@ struct OptionsButton: NSViewRepresentable {
             check(m, "Ascending", model.ascending, cmd: "asc")
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
             check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
-            check(m, "Wildcards Match Whole Name", model.wildcardWholeName, cmd: "wcwhole")
             m.addItem(.separator())
             check(m, "Include cloud storage (Google Drive, iCloud…)", model.includeCloud, cmd: "cloud")
             item(m, "Reindex Now", cmd: "reindex")
@@ -113,18 +108,13 @@ struct OptionsButton: NSViewRepresentable {
             // so re-selecting the current value would needlessly reset scroll/selection.
             switch cmd {
             case "layout":  if model.layout != UILayout.allCases[i] { model.layout = UILayout.allCases[i] }
-            case "mode":    if model.matchMode != MatchMode.uiModes[i] { model.matchMode = MatchMode.uiModes[i] }
             case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
                             if model.sortKey != k { model.sortKey = k }
-            case "scope":   model.toggleScope()          // Match Path check toggle (⌃U)
-            case "case":    model.matchCase.toggle()     // Match Case (⌃I)
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
             case "asc":     model.ascending.toggle()
             case "ff":      model.foldersFirst.toggle()
             case "hidden":  model.showHidden.toggle()
-            case "wcwhole": model.wildcardWholeName.toggle()
-            case "ww":      model.wholeWord.toggle()
             case "cloud":   model.setIncludeCloud(!model.includeCloud)
             case "reindex": model.reindex()
             case "fda":     model.showOnboarding = true
@@ -133,11 +123,7 @@ struct OptionsButton: NSViewRepresentable {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(s, forType: .string)
             case "export":  exportCSV()
-            case "settings":
-                NSApp.activate(ignoringOtherApps: true)
-                if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-                    NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-                }
+            case "settings": model.requestOpenSettings()
             default: break
             }
         }

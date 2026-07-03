@@ -823,6 +823,20 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // Help surfaces (⌘/ syntax, ⇧⌘/ shortcuts) — menu items drive these flags.
+    @Published var showSyntax = false
+    @Published var showShortcuts = false
+    /// Set by OpenSettingsBridge with SwiftUI's openSettings environment action —
+    /// the sendAction(showSettingsWindow:) path silently no-ops from an NSMenu.
+    var openSettingsAction: (() -> Void)?
+    func requestOpenSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let a = openSettingsAction { a(); return }
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        }
+    }
+
     func openFDASettings() { Permissions.openFullDiskAccessSettings() }
 
     /// ⌃M: rotate Exact → Fuzzy → Regex → Exact.

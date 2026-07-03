@@ -175,6 +175,9 @@ struct SettingsView: View {
             general.tabItem { Label("General", systemImage: "gearshape") }
             indexing.tabItem { Label("Indexing", systemImage: "externaldrive") }
         }
+        .onExitCommand {   // ESC closes Settings (macOS default is ⌘W only)
+            NSApp.keyWindow?.performClose(nil)
+        }
         .frame(width: 500, height: 480)
         .environmentObject(model)
     }

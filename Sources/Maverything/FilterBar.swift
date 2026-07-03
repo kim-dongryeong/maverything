@@ -21,7 +21,7 @@ struct FilterBar: View {
             }
             .scrollBounceBehavior(.basedOnSize)
 
-            SyntaxHelpButton()
+            SyntaxHelpButton(model: model)
                 .padding(.trailing, 12)
                 .padding(.leading, 4)
         }

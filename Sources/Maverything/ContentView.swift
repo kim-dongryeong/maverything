@@ -27,6 +27,8 @@ struct ContentView: View {
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView().environmentObject(model)
         }
+        .sheet(isPresented: $model.showShortcuts) { ShortcutsSheet() }
+        .background(OpenSettingsBridge(model: model))
     }
 
     @ViewBuilder private var layoutBody: some View {
@@ -160,6 +162,8 @@ struct ContentView: View {
                                                          set: { model.scope = $0 ? .fullPath : .nameOnly }))
                 Toggle("Match Case  (⌃I)", isOn: $model.matchCase)
                 Toggle("Match Whole Word  (⌃B)", isOn: $model.wholeWord)
+                Divider()
+                Toggle("Wildcards Match Whole Name", isOn: $model.wildcardWholeName)
             } label: {
                 HStack(spacing: 3) {
                     Text(modeSummary).font(.system(size: 12))

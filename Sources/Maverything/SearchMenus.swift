@@ -73,16 +73,89 @@ struct BookmarksMenu: View {
 }
 
 /// A "?" button that pops a compact cheat-sheet of the query syntax.
+/// Driven by model.showSyntax so the ⌘/ menu item opens the same popover.
 struct SyntaxHelpButton: View {
-    @State private var show = false
+    @ObservedObject var model: AppModel
     var body: some View {
-        Button { show.toggle() } label: {
+        Button { model.showSyntax.toggle() } label: {
             Image(systemName: "questionmark.circle")
         }
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
-        .help("Search syntax")
-        .popover(isPresented: $show, arrowEdge: .bottom) { SyntaxHelpView() }
+        .help("Search syntax (⌘/)")
+        .popover(isPresented: $model.showSyntax, arrowEdge: .bottom) { SyntaxHelpView() }
+    }
+}
+
+/// Invisible helper: captures SwiftUI's openSettings action for AppKit callers
+/// (the gear menu) — sendAction(showSettingsWindow:) no-ops from an NSMenu.
+struct OpenSettingsBridge: View {
+    @Environment(\.openSettings) private var openSettings
+    let model: AppModel
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .onAppear { model.openSettingsAction = { openSettings() } }
+    }
+}
+
+/// ⇧⌘/ — every shortcut in the app, one glanceable sheet.
+struct ShortcutsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    private let sections: [(String, [(String, String)])] = [
+        ("Search", [
+            ("⌘F", "focus the search field"),
+            ("⎋", "clear query · then hide the window"),
+            ("⌘↑ / ⌘↓", "cycle recent searches"),
+            ("↓", "jump from the field into the results"),
+            ("⌘/", "search-syntax cheat sheet"),
+        ]),
+        ("Matching", [
+            ("⌃U", "match path"),
+            ("⌃I", "match case"),
+            ("⌃B", "match whole word"),
+            ("⌃E / ⌃F / ⌃R", "Exact / Fuzzy / Regex (⌃F·⌃R toggle back)"),
+            ("⌃M", "cycle match mode"),
+        ]),
+        ("Results", [
+            ("Space", "Quick Look"),
+            ("Return", "open (or rename, per Settings)"),
+            ("F2", "rename"),
+            ("⌘R", "reveal in Finder"),
+            ("⌘I", "Get Info"),
+            ("⌘⌫", "move to Trash"),
+            ("⌘C / ⌘⌥C", "copy file / copy pathname"),
+            ("PgUp·PgDn·Home·End", "move the selection (Everything-style)"),
+        ]),
+        ("App", [
+            ("⌘1 / ⌘2 / ⌘3", "Table · Compact · Two-Pane layout"),
+            ("⌥⌘R", "reindex now"),
+            ("⌘,", "settings"),
+            ("⇧Space", "summon from anywhere (configurable)"),
+            ("⇧⌘/", "this sheet"),
+        ]),
+    ]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Keyboard Shortcuts").font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            ForEach(sections, id: \.0) { sec in
+                Text(sec.0).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                ForEach(sec.1, id: \.0) { r in
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(r.0)
+                            .font(.system(.caption, design: .monospaced).weight(.medium))
+                            .frame(width: 150, alignment: .leading)
+                        Text(r.1).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
     }
 }
 

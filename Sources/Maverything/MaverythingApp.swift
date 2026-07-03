@@ -78,6 +78,11 @@ struct SearchCommands: Commands {
             Divider()
             Button("Reindex Now") { model.reindex() }
                 .keyboardShortcut("r", modifiers: [.command, .option])   // ⌥⌘R — frees ⌘R for Reveal in Finder
+            Divider()
+            Button("Search Syntax") { model.showSyntax = true }
+                .keyboardShortcut("/")                                    // ⌘/
+            Button("Keyboard Shortcuts") { model.showShortcuts = true }
+                .keyboardShortcut("/", modifiers: [.command, .shift])     // ⇧⌘/ (⌘?)
         }
     }
 }

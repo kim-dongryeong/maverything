@@ -28,7 +28,7 @@ struct MaverythingApp: App {
                 Button("Search Syntax") { model.showSyntax = true }
                     .keyboardShortcut("/")
                 Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                    .keyboardShortcut("/", modifiers: [.command, .option])
+                    .keyboardShortcut("/", modifiers: [.command, .control])
             }
         }
 
@@ -88,7 +88,7 @@ struct SearchCommands: Commands {
             Button("Search Syntax") { model.showSyntax = true }
                 .keyboardShortcut("/")                                    // ⌘/
             Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                .keyboardShortcut("/", modifiers: [.command, .option])    // ⌥⌘/ — ⇧⌘/ is macOS's Help-search
+                .keyboardShortcut("/", modifiers: [.command, .control])   // ⌃⌘/ — ⇧⌘/ is macOS's Help-search
         }
     }
 }

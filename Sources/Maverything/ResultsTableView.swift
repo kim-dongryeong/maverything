@@ -39,6 +39,8 @@ final class MVTableView: NSTableView {
             coordinator?.getInfo(); return
         }
         switch event.keyCode {
+        case 44 where mods.isEmpty:   // "/" → jump to the search field (vim/GitHub style)
+            coordinator?.focusSearch()
         case 48:            // Tab → hand focus back to the search field (Everything-style)
             coordinator?.focusSearch()
         case 120:           // F2 → rename

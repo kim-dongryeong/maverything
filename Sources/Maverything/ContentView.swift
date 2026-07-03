@@ -121,8 +121,10 @@ struct ContentView: View {
                         model.recordRecentQuery(model.query)
                         model.focusResultsNonce &+= 1
                     }
-                    .onExitCommand {                         // ESC: clear, then dismiss
-                        if model.query.isEmpty { model.requestHide?() } else { model.query = "" }
+                    .onExitCommand {                         // ESC: close help → clear → dismiss
+                        if model.showSyntax { model.showSyntax = false }
+                        else if model.query.isEmpty { model.requestHide?() }
+                        else { model.query = "" }
                     }
 
                 if !model.query.isEmpty {

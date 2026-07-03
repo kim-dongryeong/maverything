@@ -103,8 +103,8 @@ struct ShortcutsSheet: View {
     @Environment(\.dismiss) private var dismiss
     private let sections: [(String, [(String, String)])] = [
         ("Search", [
-            ("⌘F", "focus the search field"),
-            ("⎋", "clear query · then hide the window"),
+            ("⌘F  or  /  or  Tab", "focus the search field"),
+            ("Esc (⎋)", "close help → clear query → hide the window"),
             ("⌘↑ / ⌘↓", "cycle recent searches"),
             ("↓", "jump from the field into the results"),
             ("⌘/", "search-syntax cheat sheet"),
@@ -131,31 +131,37 @@ struct ShortcutsSheet: View {
             ("⌥⌘R", "reindex now"),
             ("⌘,", "settings"),
             ("⇧Space", "summon from anywhere (configurable)"),
-            ("⌥⌘/", "this sheet"),
+            ("⌃⌘/", "this sheet"),
         ]),
     ]
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Keyboard Shortcuts").font(.headline)
+                Text("Keyboard Shortcuts").font(.title3.weight(.semibold))
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(.plain).frame(width: 0, height: 0).opacity(0)   // ESC closes too
             }
             ForEach(sections, id: \.0) { sec in
-                Text(sec.0).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    .padding(.top, 2)
+                Text(sec.0)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .padding(.top, 6)
                 ForEach(sec.1, id: \.0) { r in
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    HStack(alignment: .firstTextBaseline, spacing: 14) {
                         Text(r.0)
-                            .font(.system(.caption, design: .monospaced).weight(.medium))
-                            .frame(width: 150, alignment: .leading)
-                        Text(r.1).font(.caption).foregroundStyle(.secondary)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .frame(width: 170, alignment: .leading)
+                        Text(r.1).font(.system(size: 13)).foregroundStyle(.secondary)
                     }
+                    .padding(.vertical, 1)
                 }
             }
         }
-        .padding(16)
-        .frame(width: 420)
+        .padding(18)
+        .frame(width: 500)
     }
 }
 

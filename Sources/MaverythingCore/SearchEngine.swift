@@ -45,6 +45,11 @@ public final class SearchEngine: @unchecked Sendable {
     // "refresh now" that simply advances that counter.
     public func invalidate() { index.bumpMutation() }
 
+    /// Everything 1.5-style folder-size sorting: when on, the Size order ranks a
+    /// directory by its live subtree TOTAL (from FileIndex's cached bottom-up pass)
+    /// instead of 0. Set from the app's "Index folder sizes" toggle.
+    public var useFolderSizes = true
+
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
@@ -948,7 +953,16 @@ public final class SearchEngine: @unchecked Sendable {
         switch key {
         case .size:
             let size = index.size
-            ids.sort { size[Int($0)] != size[Int($1)] ? size[Int($0)] < size[Int($1)] : $0 < $1 }
+            if useFolderSizes {
+                let fs = index._folderSizes()   // under the read lock (orderArray path)
+                let ot = index.objType
+                @inline(__always) func eff(_ i: Int32) -> Int64 {
+                    ot[Int(i)] == VNODE_VDIR ? fs[Int(i)] : size[Int(i)]
+                }
+                ids.sort { eff($0) != eff($1) ? eff($0) < eff($1) : $0 < $1 }
+            } else {
+                ids.sort { size[Int($0)] != size[Int($1)] ? size[Int($0)] < size[Int($1)] : $0 < $1 }
+            }
         case .dateModified:
             let mt = index.mtime
             ids.sort { mt[Int($0)] != mt[Int($1)] ? mt[Int($0)] < mt[Int($1)] : $0 < $1 }

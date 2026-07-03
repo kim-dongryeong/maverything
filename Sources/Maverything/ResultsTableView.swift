@@ -460,19 +460,33 @@ struct ResultsTableView: NSViewRepresentable {
                 }
             case "size":
                 if r.isDir {
-                    if !r.ext.isEmpty {   // package/bundle (.app, .framework…) → total size, like Finder
-                        if let bytes = BundleSizeCache.size(path: r.path, dirIdx: id, index: model.index,
-                            onReady: { [weak tableView] in
-                                guard let tv = tableView else { return }
-                                let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("size"))
-                                if col >= 0, row < tv.numberOfRows {
-                                    tv.reloadData(forRowIndexes: IndexSet(integer: row),
-                                                  columnIndexes: IndexSet(integer: col))
-                                }
-                            }) {
+                    let reloadSize: () -> Void = { [weak tableView] in
+                        guard let tv = tableView else { return }
+                        let col = tv.column(withIdentifier: NSUserInterfaceItemIdentifier("size"))
+                        if col >= 0, row < tv.numberOfRows {
+                            tv.reloadData(forRowIndexes: IndexSet(integer: row),
+                                          columnIndexes: IndexSet(integer: col))
+                        }
+                    }
+                    if model.indexFolderSizes {
+                        // Everything 1.5-style: EVERY folder shows its live subtree total,
+                        // O(1) from the mutationGen-keyed cache (built off-main on miss).
+                        if let bytes = model.index.folderSizeIfReady(Int(id)) {
                             cell.textField?.stringValue = byteFormatter.string(fromByteCount: bytes)
                         } else {
-                            cell.textField?.stringValue = "…"   // computing
+                            cell.textField?.stringValue = "…"
+                            let idx = model.index
+                            DispatchQueue.global(qos: .utility).async {
+                                idx.buildFolderSizes()
+                                DispatchQueue.main.async { reloadSize() }
+                            }
+                        }
+                    } else if !r.ext.isEmpty {   // packages only (legacy per-bundle path)
+                        if let bytes = BundleSizeCache.size(path: r.path, dirIdx: id, index: model.index,
+                                                            onReady: reloadSize) {
+                            cell.textField?.stringValue = byteFormatter.string(fromByteCount: bytes)
+                        } else {
+                            cell.textField?.stringValue = "…"
                         }
                     } else {
                         cell.textField?.stringValue = "--"

@@ -216,6 +216,21 @@ check("wholeword: 'ww: report' matches report.txt", has("ww: report", "report.tx
 check("wholeword: 'ww: report' excludes reporting_x.txt", !has("ww: report", "reporting_x.txt"))
 check("wholeword: plain 'report' still matches reporting_x.txt", has("report", "reporting_x.txt"))
 
+// Everything 1.5-style folder sizes (sort & display by subtree totals)
+index.buildFolderSizes()
+if let imgDir = index.dirIndex(forPath: root + "/img") {
+    check("folder size: img/ == sum of its 20 images (2000 B)",
+          index.folderSizeIfReady(Int(imgDir)) == 20 * 100)
+}
+if let dataDir = index.dirIndex(forPath: root + "/data") {
+    let ds = index.folderSizeIfReady(Int(dataDir)) ?? 0
+    check("folder size: data/ >= big.bin + data.json (6 MB)", ds >= 6 * 1_048_576)
+    let top = engine.search("", sortKey: .size, ascending: false, limit: 3, now: now).ids
+    let names = top.map { index.name(Int($0)) }
+    check("size sort (desc) ranks the fixture root dir first (largest total)",
+          names.first == root)   // the crawl root's name IS its absolute path
+}
+
 // Everything's duplicate finder (dupe:)
 check("dupe: finds twin_name.txt (exists twice)", has("dupe: twin", "twin_name.txt"))
 check("dupe: excludes unique report.txt", !has("dupe: report", "report.txt"))

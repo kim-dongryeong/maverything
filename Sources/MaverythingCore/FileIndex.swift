@@ -292,6 +292,49 @@ public final class FileIndex: @unchecked Sendable {
         return h
     }
 
+    // MARK: - folder-size index (Everything 1.5's "Index folder sizes")
+
+    private var fsize: [Int64] = []
+    private var fsizeGen = -1
+    private let fsizeLock = NSLock()
+
+    /// Bottom-up folder totals for ALL entries, cached per mutationGen. Entries are
+    /// appended parent-before-child (crawl and reconcile both), so ONE reverse pass
+    /// accumulates each entry into its parent — O(n), ~15 ms per rebuild at 2M.
+    /// Caller must hold the read lock. Lock order: rwlock → fsizeLock (everywhere).
+    func _folderSizes() -> [Int64] {
+        fsizeLock.lock()
+        if fsizeGen == mutationGenLocked { let c = fsize; fsizeLock.unlock(); return c }
+        fsizeLock.unlock()
+        let n = nameOff.count
+        var out = [Int64](repeating: 0, count: n)
+        var i = n - 1
+        while i >= 0 {
+            if !deleted[i] {
+                let own = objType[i] == VNODE_VDIR ? out[i] : size[i]
+                let p = parent[i]
+                if p >= 0, Int(p) < n { out[Int(p)] &+= own }
+            }
+            i -= 1
+        }
+        fsizeLock.lock()
+        fsizeGen = mutationGenLocked; fsize = out
+        fsizeLock.unlock()
+        return out
+    }
+
+    /// Build (or refresh) the folder-size cache — call from a background queue.
+    public func buildFolderSizes() { rdlock(); defer { unlock() }; _ = _folderSizes() }
+
+    /// Non-blocking read for display: nil while the cache is stale (kick
+    /// buildFolderSizes() off-main and re-render when it lands).
+    public func folderSizeIfReady(_ i: Int) -> Int64? {
+        rdlock(); defer { unlock() }
+        fsizeLock.lock(); defer { fsizeLock.unlock() }
+        guard fsizeGen == mutationGenLocked, i >= 0, i < fsize.count else { return nil }
+        return fsize[i]
+    }
+
     /// Total size of everything inside a directory subtree — the "size" Finder shows
     /// for a package/bundle. Iterative DFS over childrenOf; hop-bounded for safety.
     public func subtreeSize(of dirIdx: Int32) -> Int64 {

@@ -254,6 +254,9 @@ struct SettingsView: View {
             Section("Index") {
                 Toggle("Include cloud storage (Google Drive, iCloud…)", isOn: Binding(
                     get: { model.includeCloud }, set: { model.setIncludeCloud($0) }))
+                Toggle("Show & sort real folder sizes", isOn: $model.indexFolderSizes)
+                Text("Folders sort and display by their total contents (Everything 1.5's folder-size indexing). Off = folders show -- and sort as 0.")
+                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Indexed items") {
                     Text(model.indexedCount.formatted()).monospacedDigit()
                 }

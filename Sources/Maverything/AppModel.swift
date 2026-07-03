@@ -109,6 +109,17 @@ final class AppModel: ObservableObject {
     @Published var customExcludes: [String] = UserDefaults.standard.stringArray(forKey: "mv.customExcludes") ?? [] {
         didSet { UserDefaults.standard.set(customExcludes, forKey: "mv.customExcludes") }
     }
+    /// Everything 1.5's "Index folder sizes": folders sort AND display by their live
+    /// subtree totals (mutationGen-cached bottom-up pass, ~15 ms per rebuild at 2M).
+    @Published var indexFolderSizes: Bool =
+        (UserDefaults.standard.object(forKey: "mv.folderSizes") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(indexFolderSizes, forKey: "mv.folderSizes")
+            engine.useFolderSizes = indexFolderSizes
+            engine.invalidate()          // size order must rebuild with/without folder totals
+            runSearch()
+        }
+    }
     /// Minutes between scheduled rescans of the custom index roots (0 = off).
     /// Network shares deliver no reliable FSEvents, so — like Everything's folder
     /// "Update" schedule — a periodic re-crawl is the only way to keep them fresh.
@@ -261,6 +272,7 @@ final class AppModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        engine.useFolderSizes = indexFolderSizes
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess

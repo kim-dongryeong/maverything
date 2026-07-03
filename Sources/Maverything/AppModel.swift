@@ -30,12 +30,13 @@ final class ResultsStore {
 /// Everything-style quick type filters. Each maps to a query clause that is
 /// AND-ed with whatever the user has typed (see `AppModel.effectiveQuery`).
 enum TypeFilter: String, CaseIterable, Identifiable {
-    case all, folders, documents, images, audio, video, archives, apps
+    case all, folders, files, documents, images, audio, video, archives, apps
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .all: return "All";             case .folders: return "Folders"
+        case .files: return "Files"
         case .documents: return "Documents"; case .images: return "Images"
         case .audio: return "Audio";         case .video: return "Video"
         case .archives: return "Archives";   case .apps: return "Apps"
@@ -45,6 +46,7 @@ enum TypeFilter: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .all: return "square.grid.2x2";  case .folders: return "folder"
+        case .files: return "doc"
         case .documents: return "doc.text";   case .images: return "photo"
         case .audio: return "music.note";     case .video: return "film"
         case .archives: return "archivebox";  case .apps: return "app.badge"
@@ -56,6 +58,7 @@ enum TypeFilter: String, CaseIterable, Identifiable {
         switch self {
         case .all:       return ""
         case .folders:   return "folder:"
+        case .files:     return "file:"
         case .documents: return "ext:pdf,doc,docx,txt,rtf,pages,md,markdown,odt,tex,epub,xls,xlsx,csv,ppt,pptx,key,numbers"
         case .images:    return "ext:jpg,jpeg,png,gif,bmp,tiff,tif,heic,heif,webp,svg,raw,cr2,nef,arw,dng,psd,ico"
         case .audio:     return "ext:mp3,wav,flac,aac,m4a,ogg,oga,aiff,aif,wma,alac,opus"

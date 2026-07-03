@@ -42,6 +42,8 @@ struct ContentView: View {
             }
         case .compact:
             CompactResults(model: model)
+        case .grid:
+            GridResults(model: model)
         }
     }
 

@@ -44,6 +44,8 @@ struct OptionsButton: NSViewRepresentable {
                   selected: Appearance.allCases.firstIndex(of: model.appearance) ?? 0, cmd: "appear")
             group(m, "Density", RowDensity.allCases.map(\.label),
                   selected: RowDensity.allCases.firstIndex(of: model.density) ?? 0, cmd: "density")
+            group(m, "Thumbnail Size", ["Medium", "Large", "Extra Large"],
+                  selected: model.thumbSize >= 176 ? 2 : (model.thumbSize >= 128 ? 1 : 0), cmd: "thumb")
             check(m, "Ascending", model.ascending, cmd: "asc", key: "0", mask: [.control, .command])
             check(m, "Folders First", model.foldersFirst, cmd: "ff")
             check(m, "Show Hidden Files", model.showHidden, cmd: "hidden")
@@ -116,6 +118,7 @@ struct OptionsButton: NSViewRepresentable {
                             if model.sortKey != k { model.sortKey = k }
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
+            case "thumb":   model.thumbSize = [112, 144, 192][i]
             case "asc":     model.ascending.toggle()
             case "ff":      model.foldersFirst.toggle()
             case "hidden":  model.showHidden.toggle()

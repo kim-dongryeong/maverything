@@ -23,6 +23,7 @@ enum UILayout: String, CaseIterable, Identifiable {
     case table       // B: full-window NSTableView grid (the original)
     case compact     // A: Spotlight/Alfred-style narrow bar + slim results
     case twoPane     // C: results + QuickLook preview/metadata pane
+    case grid        // D: Finder-style icon grid with QuickLook thumbnails
 
     var id: String { rawValue }
     var label: String {
@@ -30,6 +31,7 @@ enum UILayout: String, CaseIterable, Identifiable {
         case .table: return "Table"
         case .compact: return "Compact bar"
         case .twoPane: return "Preview pane"
+        case .grid: return "Icon Grid"
         }
     }
     var symbol: String {
@@ -37,6 +39,7 @@ enum UILayout: String, CaseIterable, Identifiable {
         case .table: return "tablecells"
         case .compact: return "magnifyingglass"
         case .twoPane: return "sidebar.right"
+        case .grid: return "square.grid.2x2"
         }
     }
 }

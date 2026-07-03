@@ -824,6 +824,11 @@ final class AppModel: ObservableObject {
     }
 
     // Help surfaces (⌘/ syntax, ⇧⌘/ shortcuts) — menu items drive these flags.
+    /// Icon-grid thumbnail edge (pt) — Everything's Medium/Large/Extra Large Icons.
+    @Published var thumbSize: CGFloat =
+        CGFloat((UserDefaults.standard.object(forKey: "mv.thumbSize") as? Double) ?? 112) {
+        didSet { UserDefaults.standard.set(Double(thumbSize), forKey: "mv.thumbSize") }
+    }
     @Published var showSyntax = false
     @Published var showShortcuts = false
     /// Set by OpenSettingsBridge with SwiftUI's openSettings environment action —

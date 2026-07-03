@@ -115,6 +115,7 @@ struct ViewCommands: Commands {
             Toggle("Table", isOn: layoutToggle(.table)).keyboardShortcut("1")
             Toggle("Compact Bar", isOn: layoutToggle(.compact)).keyboardShortcut("2")
             Toggle("Two-Pane Preview", isOn: layoutToggle(.twoPane)).keyboardShortcut("3")
+            Toggle("Icon Grid", isOn: layoutToggle(.grid)).keyboardShortcut("4")
             Divider()
             // Sort By — Finder's ⌃⌘n convention (Everything uses Ctrl+n on Windows)
             Toggle("Sort by Name", isOn: sortToggle(.name))

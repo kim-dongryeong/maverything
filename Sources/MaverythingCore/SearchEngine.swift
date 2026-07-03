@@ -625,11 +625,11 @@ public final class SearchEngine: @unchecked Sendable {
         // Refs are laid out group-by-group; `group` marks OR-group membership (all refs
         // of a group share the same negated/isPath, matching the parser's guarantee).
         var termBlob: [UInt8] = []
-        var termRefs: [(off: Int, len: Int, group: Int, negated: Bool, isPath: Bool)] = []
+        var termRefs: [(off: Int, len: Int, group: Int, negated: Bool, isPath: Bool, isGlob: Bool)] = []
         termRefs.reserveCapacity(parsed.termGroups.reduce(0) { $0 + $1.count })
         for (gi, g) in parsed.termGroups.enumerated() {
             for t in g {
-                termRefs.append((termBlob.count, t.bytes.count, gi, t.negated, t.scope == .path))
+                termRefs.append((termBlob.count, t.bytes.count, gi, t.negated, t.scope == .path, t.isGlob))
                 termBlob.append(contentsOf: t.bytes)
             }
         }
@@ -732,6 +732,10 @@ public final class SearchEngine: @unchecked Sendable {
                             let tr = trefsB[ti]
                             let needlePtr = tblobBase! + tr.off
                             let out: MatchOutcome
+                            // Everything-style auto-wildcard: an unquoted term with * or ?
+                            // is matched as an anchored glob even in Exact mode.
+                            let effMode: MatchMode = (tr.isGlob && mode == .exact) ? .wildcard : mode
+                            let effWW = wholeWord && effMode == .exact
                             if tr.isPath {
                                 if pathLen < 0 {
                                     if caseSensitive {
@@ -748,18 +752,18 @@ public final class SearchEngine: @unchecked Sendable {
                                 }
                                 out = self.matchTerm(hay: psb.baseAddress!, hayLen: pathLen,
                                                      needle: needlePtr, needleLen: tr.len,
-                                                     mode: mode, wholeWord: wholeWord)
+                                                     mode: effMode, wholeWord: effWW)
                             } else if caseSensitive {
                                 out = self.matchTerm(hay: nbBase + o, hayLen: l,
                                                      needle: needlePtr, needleLen: tr.len,
-                                                     mode: mode, wholeWord: wholeWord)
+                                                     mode: effMode, wholeWord: effWW)
                             } else {
                                 out = self.matchFoldedName(id: id, asciiBase: fbBase,
                                                            offB: offB, lenB: lenB,
                                                            unicodeBase: unicodeBase,
                                                            unicodeOffB: uOffB, unicodeLenB: uLenB,
                                                            needle: needlePtr, needleLen: tr.len,
-                                                           mode: mode, wholeWord: wholeWord)
+                                                           mode: effMode, wholeWord: effWW)
                             }
                             if tr.negated {
                                 // negated group: NO alternative may match

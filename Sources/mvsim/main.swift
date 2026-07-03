@@ -38,6 +38,7 @@ func writeAbs(_ p: String, bytes: Int = 16, mtime: TimeInterval? = nil) {
 let oldTime = now - 200 * 86_400   // ~200 days ago
 write("report.txt", bytes: 200, mtime: now)
 write("reporting_x.txt", bytes: 4)                     // whole-word (ww:) negative case
+write("star*name.txt", bytes: 4)                       // literal * in a real filename
 write("dupA/twin_name.txt", bytes: 6)                 // dupe: fixture (same name, two dirs)
 write("dupB/twin_name.txt", bytes: 7)
 write("Report.PNG", bytes: 300, mtime: oldTime)        // case-insensitivity
@@ -215,6 +216,14 @@ check("type: '-file:report' excludes report.txt but keeps data.json",
 check("wholeword: 'ww: report' matches report.txt", has("ww: report", "report.txt"))
 check("wholeword: 'ww: report' excludes reporting_x.txt", !has("ww: report", "reporting_x.txt"))
 check("wholeword: plain 'report' still matches reporting_x.txt", has("report", "reporting_x.txt"))
+
+// Everything-style AUTO-WILDCARD in Exact mode (+ "quoted" literal escape)
+check("auto-glob: 'image_0*.png' works in Exact mode", has("image_0*.png", "image_001.png"))
+check("auto-glob: anchored — 'report*' matches report.txt", has("report*", "report.txt"))
+check("auto-glob: 'repo*' does NOT match notes.md", !has("repo*", "notes.md"))
+check("quoted literal: '\"*\"' finds the file with a real star", has("\"*\"", "star*name.txt"))
+check("quoted literal: quotes suppress filter parsing", has("\"star*name\"", "star*name.txt"))
+check("plain substring still works alongside a glob term", has("image_0??.png ext:png", "image_001.png"))
 
 // Everything 1.5-style folder sizes (sort & display by subtree totals)
 index.buildFolderSizes()

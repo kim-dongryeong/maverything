@@ -7,6 +7,9 @@ public struct QueryTerm: Sendable {
     public var bytes: [UInt8]     // folded unless the query is case-sensitive
     public var negated: Bool
     public var scope: TermScope
+    /// Everything-style AUTO-WILDCARD: an unquoted term containing * or ? is matched
+    /// as an anchored glob even in Exact mode; a "quoted" term is always literal.
+    public var isGlob: Bool = false
 }
 
 /// An Everything-style parsed query: AND-ed OR-groups of terms + structured
@@ -57,7 +60,7 @@ public struct ParsedQuery: Sendable {
     public var simpleName: [UInt8]? {
         guard !hasFilters, termGroups.count == 1, let g = termGroups.first,
               g.count == 1, let t = g.first,
-              !t.negated, t.scope == .name else { return nil }
+              !t.negated, t.scope == .name, !t.isGlob else { return nil }
         return t.bytes
     }
 }
@@ -70,14 +73,27 @@ public enum QueryParser {
         var q = ParsedQuery()
         let tokens = tokenize(raw)
 
-        // pass 1: case sensitivity flag
-        for t in tokens where t.lowercased() == "case:on" || t.lowercased() == "case:" { q.caseSensitive = true }
+        // pass 1: case sensitivity flag (unquoted tokens only)
+        for t in tokens where !t.quoted && (t.text.lowercased() == "case:on" || t.text.lowercased() == "case:") {
+            q.caseSensitive = true
+        }
 
-        for tokRaw in tokens {
-            var tok = tokRaw
+        for tokEntry in tokens {
+            var tok = tokEntry.text
+            let quoted = tokEntry.quoted
             if tok.isEmpty { continue }
             var negated = false
-            if tok.count > 1, let f = tok.first, f == "-" || f == "!" { negated = true; tok.removeFirst() }
+            if !quoted, tok.count > 1, let f = tok.first, f == "-" || f == "!" { negated = true; tok.removeFirst() }
+
+            // A quoted token is a LITERAL phrase: no filter parsing, no OR-split,
+            // no auto-wildcard — Everything's "…" escape (search a real * with "*").
+            if quoted {
+                let body = tok.precomposedStringWithCanonicalMapping
+                if body.isEmpty { continue }
+                let bytes = q.caseSensitive ? Array(body.utf8) : searchFoldedBytes(body)
+                q.termGroups.append([QueryTerm(bytes: bytes, negated: negated, scope: defaultScope)])
+                continue
+            }
 
             if let colon = tok.firstIndex(of: ":"), colon != tok.startIndex {
                 let key = String(tok[..<colon]).lowercased()
@@ -99,7 +115,9 @@ public enum QueryParser {
                 let alt = String(part).precomposedStringWithCanonicalMapping  // NFC to match index
                 if alt.isEmpty { continue }
                 let bytes = q.caseSensitive ? Array(alt.utf8) : searchFoldedBytes(alt)
-                group.append(QueryTerm(bytes: bytes, negated: negated, scope: scope))
+                // Everything-style auto-wildcard: * / ? in an unquoted term = glob term.
+                let glob = alt.contains("*") || alt.contains("?")
+                group.append(QueryTerm(bytes: bytes, negated: negated, scope: scope, isGlob: glob))
             }
             if !group.isEmpty { q.termGroups.append(group) }
         }
@@ -279,16 +297,18 @@ public enum QueryParser {
         }
     }
 
-    /// Split on whitespace but keep "quoted phrases" together.
-    static func tokenize(_ s: String) -> [String] {
-        var out: [String] = []; var cur = ""; var inQuote = false
+    /// Split on whitespace but keep "quoted phrases" together. The `quoted` flag
+    /// marks tokens that contained quotes — those are LITERAL (no filter parsing,
+    /// no OR-split, no auto-wildcard), exactly like Everything's "…" escape.
+    static func tokenize(_ s: String) -> [(text: String, quoted: Bool)] {
+        var out: [(String, Bool)] = []; var cur = ""; var inQuote = false; var sawQuote = false
         for ch in s {
-            if ch == "\"" { inQuote.toggle(); continue }
+            if ch == "\"" { inQuote.toggle(); sawQuote = true; continue }
             if ch == " " && !inQuote {
-                if !cur.isEmpty { out.append(cur); cur = "" }
+                if !cur.isEmpty { out.append((cur, sawQuote)); cur = ""; sawQuote = false }
             } else { cur.append(ch) }
         }
-        if !cur.isEmpty { out.append(cur) }
+        if !cur.isEmpty { out.append((cur, sawQuote)) }
         return out
     }
 }

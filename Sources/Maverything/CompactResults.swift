@@ -52,7 +52,7 @@ struct CompactResults: View {
         proxy.scrollTo(ids[clamped], anchor: .center)
     }
 
-    private func open(_ id: Int32) { NSWorkspace.shared.open(URL(fileURLWithPath: model.path(id))) }
+    private func open(_ id: Int32) { AppModel.finderOpen(model.path(id)) }
 
     struct Row: View {
         @ObservedObject var model: AppModel

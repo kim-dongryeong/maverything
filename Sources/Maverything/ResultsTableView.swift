@@ -830,7 +830,7 @@ struct ResultsTableView: NSViewRepresentable {
         @objc func openItem() {
             let paths = selectedPaths()
             if !paths.isEmpty { model.recordRecentQuery(model.query) }
-            for p in paths { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
+            for p in paths { AppModel.finderOpen(p) }
         }
 
         @objc func revealItem() {

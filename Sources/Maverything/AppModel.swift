@@ -815,6 +815,25 @@ final class AppModel: ObservableObject {
 
     func openFDASettings() { Permissions.openFullDiskAccessSettings() }
 
+    /// Finder-faithful Open: a NON-package directory (plain folder, .framework,
+    /// .sdk…) navigates INTO the folder; everything else goes through Launch-
+    /// Services (launch .app, open file/package with its app). Plain
+    /// NSWorkspace.open on a .framework errors — com.apple.framework has no
+    /// registered opener even though Finder happily browses it.
+    static func finderOpen(_ path: String) {
+        var st = stat()
+        let isDir = stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+        if isDir {
+            let u = URL(fileURLWithPath: path, isDirectory: true)
+            let pkg = (try? u.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
+            if !pkg {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+                return
+            }
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
     func reindex() { beginIndexing() }
 
     func setIncludeCloud(_ on: Bool) {

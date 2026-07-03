@@ -30,7 +30,7 @@ struct PreviewPane: View {
                             Text(info.path).font(.system(.caption, design: .monospaced))
                                 .textSelection(.enabled).foregroundStyle(.secondary)
                             HStack(spacing: 8) {
-                                Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: info.path)) }
+                                Button("Open") { AppModel.finderOpen(info.path) }
                                 Button("Reveal") {
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: info.path)])
                                 }

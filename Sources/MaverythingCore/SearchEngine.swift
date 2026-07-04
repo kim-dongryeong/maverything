@@ -603,6 +603,9 @@ public final class SearchEngine: @unchecked Sendable {
             let nChunks = max(1, min(workerCount, n / 16_000 + 1))
             let chunkSize = (n + nChunks - 1) / nChunks
             var chunkIDs = [[Int32]](repeating: [], count: nChunks)
+            // Character bloom prefilter for the cold full scan (a single exact needle):
+            // reject names that can't contain the needle's chars before the byte scan.
+            let needleMask = FileIndex.maskOf(needle)
 
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
@@ -611,6 +614,7 @@ public final class SearchEngine: @unchecked Sendable {
             index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
             index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
             index.deleted.withUnsafeBufferPointer { delB in
+            index.nameMask.withUnsafeBufferPointer { maskB in
             order.withUnsafeBufferPointer { ordB in
             needle.withUnsafeBufferPointer { nd in
                 let hayBase = fb.baseAddress!
@@ -625,6 +629,7 @@ public final class SearchEngine: @unchecked Sendable {
                         for k in lo..<hi {
                             let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                             if delB[id] { continue }   // defensive tombstone skip
+                            if needleMask & maskB[id] != needleMask { continue }   // bloom reject
                             if self.foldedNameContains(id: id, asciiBase: hayBase,
                                                        offB: offB, lenB: lenB,
                                                        unicodeBase: unicodeBase,
@@ -636,7 +641,7 @@ public final class SearchEngine: @unchecked Sendable {
                         outIDs[c] = ids
                     }
                 }
-            }}}}}}}}}
+            }}}}}}}}}}
             // chunks each keep ALL their matches (no per-chunk cap) → concat = full set in order
             var merged = [Int32](); merged.reserveCapacity(chunkIDs.reduce(0) { $0 + $1.count })
             for c in 0..<chunkIDs.count { merged.append(contentsOf: chunkIDs[c]) }
@@ -748,6 +753,41 @@ public final class SearchEngine: @unchecked Sendable {
             }
         }
         let termCount = termRefs.count
+
+        // --- Character bloom prefilter -------------------------------------------------
+        // A name can only match a term if it CONTAINS every (folded) character of the
+        // needle, so `(nameMask & needleMask) == needleMask` rejects most non-matches
+        // before any byte scan. Gate only POSITIVE, NAME-scope, non-regex groups whose
+        // every alternative has ≥1 literal char: negation (absence isn't a bloom test),
+        // path terms (may match the parent path, not the name), regex, and pure-wildcard
+        // terms are never gated — their match doesn't imply the needle's chars are in the
+        // name. AND groups fold into one `requiredMask`; multi-alternative OR groups
+        // (`jpg|png`) keep their own alt-mask list. See FileIndex.nameMask.
+        var requiredMask: UInt64 = 0
+        var orGates: [[UInt64]] = []
+        if mode != .regex {
+            let starB = UInt8(ascii: "*"), qmB = UInt8(ascii: "?")
+            for g in parsed.termGroups {
+                guard let first = g.first, !first.negated, first.scope != .path else { continue }
+                var altMasks: [UInt64] = []
+                var gateable = true
+                for t in g {
+                    let isGlobTerm = t.isGlob || mode == .wildcard
+                    var lm: UInt64 = 0, lit = 0
+                    for b in t.bytes {
+                        if isGlobTerm && (b == starB || b == qmB) { continue }
+                        lm |= (1 << UInt64(FileIndex.charBit(b))); lit += 1
+                    }
+                    if lit == 0 { gateable = false; break }   // e.g. bare "*" matches anything
+                    altMasks.append(lm)
+                }
+                guard gateable, !altMasks.isEmpty else { continue }
+                if altMasks.count == 1 { requiredMask |= altMasks[0] } else { orGates.append(altMasks) }
+            }
+        }
+        let hasOrGates = !orGates.isEmpty
+        // -------------------------------------------------------------------------------
+
         // Hoist filter presence out of the loop (avoid per-candidate array access + ARC).
         let hasExts = !parsed.exts.isEmpty, hasSizes = !parsed.sizes.isEmpty
         let hasNotExts = !parsed.notExts.isEmpty, hasNotSizes = !parsed.notSizes.isEmpty
@@ -783,6 +823,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.deleted.withUnsafeBufferPointer { delB in
         index.objType.withUnsafeBufferPointer { otB in
         index.parent.withUnsafeBufferPointer { parB in
+        index.nameMask.withUnsafeBufferPointer { maskB in
         order.withUnsafeBufferPointer { ordB in
         termBlob.withUnsafeBufferPointer { tblobB in
         termRefs.withUnsafeBufferPointer { trefsB in
@@ -816,6 +857,22 @@ public final class SearchEngine: @unchecked Sendable {
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
+                        // character bloom prefilter: reject before any byte scan when the
+                        // name can't possibly contain the needle's characters (cheapest,
+                        // most-selective gate for text queries — esp. fuzzy).
+                        if requiredMask != 0 || hasOrGates {
+                            let nm = maskB[id]
+                            if requiredMask & nm != requiredMask { continue }
+                            if hasOrGates {
+                                var pass = true
+                                for alts in orGates {
+                                    var any = false
+                                    for am in alts where nm & am == am { any = true; break }
+                                    if !any { pass = false; break }
+                                }
+                                if !pass { continue }
+                            }
+                        }
                         // folder scope: only entries under the chosen directory subtree
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         // type filters (folder: / file:) — Finder semantics: a PACKAGE
@@ -943,7 +1000,7 @@ public final class SearchEngine: @unchecked Sendable {
                     }}
                 }
             }}}
-        }}}}}}}}}}}}}}}
+        }}}}}}}}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]

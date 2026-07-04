@@ -572,6 +572,70 @@ check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
       && corruptV5Idx.count == 1
       && corruptV5Idx.name(0) == "/sentinel5")
 
+// ---- character bloom prefilter: A/B equivalence (gate ON must equal brute scan) ----
+// The gate is a NECESSARY-condition prefilter; if it ever drops a real match that's a
+// false negative. Build a controlled tree, then assert the gated engine returns EXACTLY
+// the same result set as the same engine with masks forced all-bits (full scan).
+do {
+    let broot = root + "/bloomAB"
+    mkdir(broot)
+    for (p, _) in [("Report_Final.txt", 0), ("café_menu.txt", 0), ("한글파일.txt", 0),
+                   ("photo_2024.jpg", 0), ("photo_2025.png", 0), ("MixedCase.SWIFT", 0),
+                   ("data.json", 0), ("draft report.md", 0), ("twin.txt", 0),
+                   ("sub/twin.txt", 0), ("sub/RESUME.pdf", 0), ("émigré.doc", 0),
+                   ("naïve_test.txt", 0), ("UPPER.TXT", 0), ("mix3d_battery.app", 0)] {
+        write("bloomAB/" + p, bytes: 4)
+    }
+    let bIdx = FileIndex()
+    _ = FileEnumerator(index: bIdx).crawl(roots: [broot])
+    bIdx.buildLiveIndexes()
+    let bEng = SearchEngine(index: bIdx)
+    // Battery spans every gate-relevant shape: exact/fuzzy/wildcard/regex, case:on,
+    // diacritics (café/cafe), Korean NFC, OR-groups, negation, path scope, affixes.
+    let battery: [(String, MatchMode, SearchScope)] = [
+        ("report", .exact, .nameOnly), ("REPORT", .exact, .nameOnly),
+        ("cafe", .exact, .nameOnly), ("café", .exact, .nameOnly),
+        ("emigre", .exact, .nameOnly), ("naive", .exact, .nameOnly),
+        ("한글", .exact, .nameOnly), ("파일", .exact, .nameOnly),
+        ("rpt", .fuzzy, .nameOnly), ("phto", .fuzzy, .nameOnly), ("mixcase", .fuzzy, .nameOnly),
+        ("rprt", .fuzzy, .nameOnly), ("3dbat", .fuzzy, .nameOnly),
+        ("photo_202?.*", .exact, .nameOnly), ("*.txt", .exact, .nameOnly),
+        ("re*rt", .exact, .nameOnly), ("*café*", .exact, .nameOnly),
+        ("jpg|png", .exact, .nameOnly), ("report|resume", .exact, .nameOnly),
+        ("report -final", .exact, .nameOnly), ("twin -sub", .exact, .nameOnly),
+        ("case:on Report", .exact, .nameOnly), ("case:on report", .exact, .nameOnly),
+        ("case:on SWIFT", .exact, .nameOnly), ("case:on UPPER", .exact, .nameOnly),
+        ("sub", .exact, .fullPath), ("bloomAB/sub", .exact, .fullPath),
+        ("path:sub twin", .exact, .nameOnly), ("startwith:photo", .exact, .nameOnly),
+        ("endwith:.txt", .exact, .nameOnly), ("^report.*", .regex, .nameOnly),
+        ("[cé]af", .regex, .nameOnly), ("ext:jpg", .exact, .nameOnly),
+        ("twin", .exact, .nameOnly), ("data json", .exact, .nameOnly),
+    ]
+    func idset(_ q: String, _ m: MatchMode, _ s: SearchScope) -> Set<Int32> {
+        Set(bEng.search(q, mode: m, scope: s, limit: 10_000, now: now).ids)
+    }
+    var gated: [Set<Int32>] = []
+    for (q, m, s) in battery { gated.append(idset(q, m, s)) }
+    bIdx._debugSetAllMasksAllBits()      // gate OFF → full brute scan = ground truth
+    bEng.invalidate()
+    var mismatches: [String] = []
+    for (i, (q, m, s)) in battery.enumerated() {
+        let brute = idset(q, m, s)
+        if brute != gated[i] { mismatches.append("\(q) [\(m)]: gate=\(gated[i].count) brute=\(brute.count)") }
+    }
+    check("bloom A/B: gated results == brute scan across all query shapes (no false negatives)",
+          mismatches.isEmpty, mismatches.joined(separator: "; "))
+    // restore authoritative masks (in case later code reuses bIdx)
+    bIdx.buildLiveIndexes(); bEng.invalidate()
+
+    // masks must actually PRUNE something (else the gate is a silent no-op)
+    let needleM = FileIndex.maskOf(Array("zzqx".utf8))
+    var pruned = 0
+    for i in 0..<bIdx.count where (bIdx.nameMask[i] & needleM) != needleM { pruned += 1 }
+    check("bloom: mask rejects non-matching candidates (gate is live, not a no-op)", pruned > 0,
+          "pruned \(pruned)/\(bIdx.count) for needle 'zzqx'")
+}
+
 // ---- latency pass (small tree; real-scale perf is in mvtest on /usr) ----
 let qs = ["a", "re", "png", "swift", "image_0", " amdl", "*.md", "ext:png", "size:>1mb"]
 var times: [Double] = []

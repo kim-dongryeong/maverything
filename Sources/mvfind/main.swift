@@ -78,6 +78,11 @@ let now = Date().timeIntervalSince1970
 // isolates WARM engine latency from snapshot load + first-query sort-order build
 // (the honest number to compare against a resident app queried over IPC).
 if let benchN = ProcessInfo.processInfo.environment["MVFIND_BENCH"].flatMap(Int.init), benchN > 0 {
+    // MVFIND_NOBLOOM=1: disable the character-bloom prefilter to measure its speedup.
+    if ProcessInfo.processInfo.environment["MVFIND_NOBLOOM"] == "1" {
+        index._debugSetAllMasksAllBits()
+        FileHandle.standardError.write(Data("bench: bloom prefilter DISABLED\n".utf8))
+    }
     for i in 1...benchN {
         let b = engine.search(query, mode: mode, scope: scope, sortKey: sort,
                               ascending: sort != .relevance, limit: limit, now: now)

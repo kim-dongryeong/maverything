@@ -213,6 +213,9 @@ extension FileIndex {
             flags = loadedFlags
             hidden = loadedHiddenBytes.map { $0 != 0 }
             deleted = [Bool](repeating: false, count: count)
+            // Mask is never persisted (format-stable); all-bits = safe scan until the
+            // caller's buildLiveIndexes() fills the authoritative values.
+            nameMask = [UInt64](repeating: .max, count: count)
             childrenOf.removeAll(); dirIndexByHash.removeAll()
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }

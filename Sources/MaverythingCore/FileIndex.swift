@@ -23,6 +23,17 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var unicodeFoldOff: [UInt64] = []
     public internal(set) var unicodeFoldLen: [UInt32] = []
 
+    // Character bloom mask (one UInt64 per entry): a case-folded set of which
+    // characters appear anywhere in the name. A search term can only match a name
+    // if every character of the (folded) needle is present, so `(nameMask & needleMask)
+    // == needleMask` is a cheap NECESSARY-condition prefilter — it rejects most
+    // non-matches before the byte scan (biggest win for fuzzy + cold first queries).
+    // Never persisted (recomputed in buildLiveIndexes after crawl/snapshot-load, so the
+    // snapshot format is untouched). `.max` (all bits) = "unknown, scan me" — the safe
+    // default for freshly-appended entries before the authoritative rebuild, so a
+    // half-built mask can only cost a scan, never drop a real match.
+    public internal(set) var nameMask: [UInt64] = []
+
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
     public internal(set) var size: [Int64] = []       // logical bytes (0 for dirs)
@@ -80,6 +91,27 @@ public final class FileIndex: @unchecked Sendable {
 
     public var count: Int { nameOff.count }
 
+    // MARK: - Character bloom mask
+
+    /// The bloom bit for one byte, CASE-FOLDED (A-Z and a-z share a bit) so a
+    /// case-sensitive query ("Report") and the folded blobs agree — the mask is a
+    /// pure existence set, case discrimination is left to the byte scan.
+    /// Layout: a-z → 0..25, 0-9 → 26..35, everything else → 36 + (b % 28) buckets
+    /// (covers UTF-8 continuation bytes; collisions only ever cost extra scans).
+    @inline(__always) public static func charBit(_ b: UInt8) -> Int {
+        if b >= 65, b <= 90 { return Int(b - 65) }         // A-Z
+        if b >= 97, b <= 122 { return Int(b - 97) }        // a-z → same bits as A-Z
+        if b >= 48, b <= 57 { return 26 + Int(b - 48) }    // 0-9
+        return 36 + Int(b % 28)                            // 36..63
+    }
+
+    /// The bloom mask for a byte sequence (used for both entry names and query needles).
+    @inline(__always) public static func maskOf<S: Sequence>(_ bytes: S) -> UInt64 where S.Element == UInt8 {
+        var m: UInt64 = 0
+        for b in bytes { m |= (1 << UInt64(charBit(b))) }
+        return m
+    }
+
     /// Lock-safe count for live progress polling while a crawl is appending.
     public func safeCount() -> Int { rdlock(); defer { unlock() }; return nameOff.count }
 
@@ -109,6 +141,7 @@ public final class FileIndex: @unchecked Sendable {
         unicodeFoldBlob.removeAll(keepingCapacity: false)
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
         unicodeFoldOff.removeAll(keepingCapacity: false); unicodeFoldLen.removeAll(keepingCapacity: false)
+        nameMask.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
@@ -122,6 +155,7 @@ public final class FileIndex: @unchecked Sendable {
         wrlock(); defer { unlock() }   // reallocation must not race a concurrent reader
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
         unicodeFoldOff.reserveCapacity(n); unicodeFoldLen.reserveCapacity(n)
+        nameMask.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
         crtime.reserveCapacity(n)
         objType.reserveCapacity(n); flags.reserveCapacity(n); hidden.reserveCapacity(n)
@@ -147,6 +181,7 @@ public final class FileIndex: @unchecked Sendable {
         parent.append(-1)
         size.append(0); mtime.append(0); crtime.append(0)
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
+        nameMask.append(.max)   // authoritative value filled by buildLiveIndexes (safe passthrough meanwhile)
         return idx   // live-update maps are built in bulk post-crawl (buildLiveIndexes)
     }
 
@@ -178,6 +213,7 @@ public final class FileIndex: @unchecked Sendable {
         hidden.append(contentsOf: batch.hidden)
         let n = batch.len.count
         for _ in 0..<n { parent.append(parentIdx); deleted.append(false) }
+        nameMask.append(contentsOf: repeatElement(.max, count: n))   // filled by buildLiveIndexes
         return base
     }
 
@@ -192,6 +228,7 @@ public final class FileIndex: @unchecked Sendable {
         let n = nameOff.count
         childrenOf.removeAll(keepingCapacity: true)
         dirIndexByHash.removeAll(keepingCapacity: true)
+        computeNameMasksLocked(n)
         var dirHash = [UInt64](repeating: 0, count: n)   // FNV state of each dir's display path
         nameBlob.withUnsafeBufferPointer { blob in
             // Feed entry i's name bytes into FNV state h. Blob bytes are NFC (normalized
@@ -225,6 +262,38 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Authoritative bloom-mask pass. Each entry's mask = the folded characters of
+    /// its ASCII fold blob (covers original + case:on via case-folded bits) OR'd with
+    /// its Unicode fold blob (covers diacritic folds, e.g. café↔cafe) — so whichever
+    /// representation `matchFoldedName` matches, the needle's chars are guaranteed
+    /// present in the mask (no false negative). Caller holds the write lock.
+    private func computeNameMasksLocked(_ n: Int) {
+        nameMask = [UInt64](repeating: 0, count: n)
+        foldBlob.withUnsafeBufferPointer { fb in
+        unicodeFoldBlob.withUnsafeBufferPointer { ub in
+        nameMask.withUnsafeMutableBufferPointer { mb in
+            for i in 0..<n {
+                var m: UInt64 = 0
+                let o = Int(nameOff[i]), e = o + Int(nameLen[i])
+                for k in o..<e { m |= (1 << UInt64(Self.charBit(fb[k]))) }
+                if unicodeFoldOff[i] != noUnicodeFoldOffset {
+                    let uo = Int(unicodeFoldOff[i]), ue = uo + Int(unicodeFoldLen[i])
+                    for k in uo..<ue { m |= (1 << UInt64(Self.charBit(ub[k]))) }
+                }
+                mb[i] = m
+            }
+        }}}
+    }
+
+    /// TEST-ONLY: force every bloom mask to all-bits, disabling the prefilter so a
+    /// search performs the full ground-truth scan. Used by mvsim to prove the gate
+    /// (masks on) returns exactly the same results as the brute scan (masks off).
+    public func _debugSetAllMasksAllBits() {
+        wrlock(); defer { unlock() }
+        for i in nameMask.indices { nameMask[i] = .max }
+        bumpMut()   // invalidate search caches so the next query rescans
     }
 
     // MARK: - Reading  (public = takes the lock; `_`-prefixed = caller holds it)
@@ -513,6 +582,15 @@ public final class FileIndex: @unchecked Sendable {
         parent.append(p); size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
         hidden.append((name.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0)
         deleted.append(false)
+        // Reconcile-inserted (live FS change): compute the real mask now from the name's
+        // fold + unicode-fold bytes so this entry is accelerated immediately (buildLiveIndexes
+        // isn't re-run after reconcile). Both representations OR'd → no diacritic false-negative.
+        var m = Self.maskOf(name.lazy.map(asciiLower))
+        let uo = Int(unicodeFoldOff[Int(idx)]), ul = Int(unicodeFoldLen[Int(idx)])
+        if unicodeFoldOff[Int(idx)] != noUnicodeFoldOffset {
+            m |= Self.maskOf(unicodeFoldBlob[uo..<uo+ul])
+        }
+        nameMask.append(m)
         return idx
     }
 

@@ -3,12 +3,15 @@ import Foundation
 import MaverythingCore
 
 // mv-mcp — a Model Context Protocol server exposing Maverything's instant, system-wide
-// file search to any MCP client (Claude Desktop, IDE agents, etc.). It's a thin bridge:
-// each `search` tool call goes to the running app's LIVE index over the Unix socket, and
-// falls back to the saved snapshot when the app is closed — so an agent gets real-time
-// results, never a stale index. Speaks newline-delimited JSON-RPC 2.0 over stdio.
+// file search. MCP is an OPEN, vendor-neutral standard, so this works with ANY MCP
+// client — Claude Desktop, Cline, Continue, Zed, Cursor, custom agents — not just one.
+// It's a thin bridge: each `search` tool call goes to the running app's LIVE index over
+// the Unix socket, and falls back to the saved snapshot when the app is closed — so an
+// agent gets real-time results, never a stale index. Newline-delimited JSON-RPC 2.0 over
+// stdio.
 //
-// Register (Claude Desktop ~/Library/Application Support/Claude/claude_desktop_config.json):
+// Register (any MCP client; Claude Desktop config path shown):
+//   ~/Library/Application Support/Claude/claude_desktop_config.json
 //   { "mcpServers": { "maverything": { "command": "/usr/local/bin/mv-mcp" } } }
 
 let protocolVersion = "2024-11-05"

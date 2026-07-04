@@ -70,5 +70,16 @@ mvfind 'report' -0 | xargs -0 ls -la                # pipe to other tools (NUL-d
   tell the user to install/open the Maverything app once so it can build the index.
 - Results are the LIVE index when the app is running; if closed, `mvfind` uses the last
   saved snapshot (stderr says which). Either way it's complete and instant.
-- An MCP server (`mv-mcp`) exposes the same `search` tool if you'd rather call it as a
-  structured tool than a shell command.
+
+## Using this from any agent
+
+This `SKILL.md` uses Anthropic's Agent Skills format, so it drops into Claude Code,
+Claude Desktop, or the Claude Agent SDK directly — but nothing here is Claude-specific.
+The capability is just the `mvfind` command, which **any** agent or automation can shell
+out to. Two agent-agnostic entry points:
+
+- **CLI** — run `mvfind …` as a shell command (this skill's examples). Works anywhere.
+- **MCP** — `mv-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+  server (an open standard) exposing a structured `search` tool. Any MCP-compatible
+  client — Claude Desktop, Cline, Continue, Zed, Cursor, custom agents — can call it:
+  `{ "mcpServers": { "maverything": { "command": "mv-mcp" } } }`.

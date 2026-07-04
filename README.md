@@ -149,18 +149,20 @@ open most/recently first.
 ## AI / MCP — give an agent instant search over your Mac
 
 `mv-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that
-exposes a `search` tool backed by the same live index, so an AI assistant (Claude
-Desktop, IDE agents, …) can find any file on your Mac — hidden and system files
-included — in milliseconds. Register it:
+exposes a `search` tool backed by the same live index, so an AI assistant can find any
+file on your Mac — hidden and system files included — in milliseconds. MCP is an **open
+standard**, so this works with *any* MCP-compatible client — Claude Desktop, Cline,
+Continue, Zed, Cursor, custom agents — not just one vendor. Register it (Claude Desktop
+shown; other clients use the same `command`):
 
 ```jsonc
 // ~/Library/Application Support/Claude/claude_desktop_config.json
 { "mcpServers": { "maverything": { "command": "/usr/local/bin/mv-mcp" } } }
 ```
 
-A ready-to-share Claude **skill** lives at
-`packaging/claude-skill/maverything-search/` for agents that call `mvfind` as a shell
-command instead.
+For agents that prefer a shell command over MCP, a ready-to-share **agent skill** lives
+at `packaging/agent-skill/maverything-search/` (Anthropic Agent Skills format, but its
+content — how to drive `mvfind` — works for any agent).
 
 ## Development
 

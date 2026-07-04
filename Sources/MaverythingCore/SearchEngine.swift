@@ -109,6 +109,20 @@ public final class SearchEngine: @unchecked Sendable {
         (k == .relevance || k == .runCount) ? .name : k
     }
 
+    /// Precompute the expensive per-generation caches (sort order + package bitmap) so
+    /// the next interactive query is WARM. Call on a BACKGROUND queue after the index
+    /// settles: on a live Mac, FSEvents bump the mutation generation and invalidate
+    /// these, so without warming a type-chip click pays a cold ~170-430ms rebuild.
+    /// Cheap to skip if already warm (orderArray/packageDirBitmap are gen-keyed).
+    public func warmCaches(sortKey: SortKey) {
+        index.withReadLock {
+            _ = orderArray(for: .name)                    // base order for name/relevance/runCount/fuzzy
+            let sk = scanOrderKey(sortKey)
+            if sk != .name { _ = orderArray(for: sk) }    // the user's active sort, if different
+            _ = packageDirBitmap()                        // file:/folder: chips + Folders First
+        }
+    }
+
     /// Everything's "Match whole filename when using wildcards" (default ON there
     /// and here). OFF = a wildcard pattern matches ANYWHERE in the name: mic?o
     /// behaves like *mic?o* and now finds "microsoft". Implemented by star-

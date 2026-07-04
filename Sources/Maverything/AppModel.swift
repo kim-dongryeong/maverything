@@ -795,6 +795,22 @@ final class AppModel: ObservableObject {
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()
+            self.warmCachesInBackground()                // keep type-chip clicks instant
+        }
+    }
+
+    private let warmQueue = DispatchQueue(label: "maverything.warm", qos: .utility)
+    private var warmScheduled = false
+    /// Rebuild the gen-keyed sort-order + package caches off the main thread so the next
+    /// type-chip click (which issues a fresh query) finds them warm instead of paying a
+    /// cold ~170-430ms rebuild. Debounced/coalesced; only warms while the app is active.
+    func warmCachesInBackground() {
+        guard NSApp.isActive, !isIndexing, !warmScheduled else { return }
+        warmScheduled = true
+        let engine = self.engine, sk = self.sortKey
+        warmQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            engine.warmCaches(sortKey: sk)
+            DispatchQueue.main.async { self?.warmScheduled = false }
         }
     }
 
@@ -1147,6 +1163,7 @@ final class AppModel: ObservableObject {
             for k in [SortKey.name, .size, .dateModified] {
                 _ = engine.search("", sortKey: k, ascending: true, limit: 1)
             }
+            engine.warmCaches(sortKey: .name)   // also builds packageDirBitmap (file:/folder: chips)
         }
         runSearch()
     }

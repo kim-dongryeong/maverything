@@ -19,7 +19,8 @@ public final class QueryServer: @unchecked Sendable {
     }
 
     private let index: FileIndex
-    private let engine: SearchEngine                 // dedicated engine: per-request options
+    private let engine: SearchEngine                 // dedicated engine
+    private let engineLock = NSLock()                // serializes the option-set + search
     private let indexing: () -> Bool                 // app tells us if a crawl is in progress
     private let socketPath: String
     private let cfg: Config
@@ -103,6 +104,11 @@ public final class QueryServer: @unchecked Sendable {
             let cfd = accept(listenFD, nil, nil)
             if cfd < 0 {
                 if running && (errno == EINTR || errno == ECONNABORTED) { continue }
+                // fd/mem exhaustion is TRANSIENT — backoff and keep serving rather than
+                // letting the whole server die permanently (Codex + red-team).
+                if running && (errno == EMFILE || errno == ENFILE || errno == ENOMEM) {
+                    usleep(20_000); continue
+                }
                 break                                  // listener closed → exit
             }
             // getpeereid: only answer the SAME user (defense in depth beyond 0600).
@@ -180,49 +186,65 @@ public final class QueryServer: @unchecked Sendable {
     }
 
     private func runQuery(_ req: Request) -> Data {
-        let mode: MatchMode = {
+        // Strict protocol: reject an unknown version or enum rather than silently
+        // guessing (a future MCP client should get a clear error — Codex + red-team).
+        if let v = req.v, v != 1 {
+            return errorLine(code: "unsupported_version", msg: "protocol v\(v) not supported")
+        }
+        let modeOpt: MatchMode? = {
             switch (req.mode ?? "exact").lowercased() {
+            case "exact": return .exact
             case "fuzzy": return .fuzzy
             case "wildcard", "glob": return .wildcard
             case "regex": return .regex
-            default: return .exact
+            default: return nil
             }
         }()
+        guard let mode = modeOpt else { return errorLine(code: "bad_request", msg: "unknown mode") }
         let scope: SearchScope = (req.scope ?? "name").lowercased() == "path" ? .fullPath : .nameOnly
-        let sort: SortKey = {
+        let sortOpt: SortKey? = {
             switch (req.sort ?? "name").lowercased() {
+            case "name": return .name
             case "path": return .path
             case "size": return .size
             case "date", "dm", "datemodified": return .dateModified
             case "created", "datecreated": return .dateCreated
             case "relevance", "rel": return .relevance
             case "runcount", "run", "frecency": return .runCount
-            default: return .name
+            default: return nil
             }
         }()
+        guard let sort = sortOpt else { return errorLine(code: "bad_request", msg: "unknown sort") }
         // "best-first" sorts default descending unless the caller says otherwise.
         let defaultAsc = !(sort == .relevance || sort == .runCount || sort == .size
                            || sort == .dateModified || sort == .dateCreated)
         let asc = req.asc ?? defaultAsc
         let limit = min(max(1, req.limit ?? 200), cfg.maxResults)
 
-        // per-request engine options (dedicated engine — never mutates the app's).
-        engine.foldersFirst = req.foldersFirst ?? false
-        engine.hideHidden = req.hideHidden ?? false
-        engine.useFolderSizes = req.useFolderSizes ?? false
-        engine.wholeNameWildcards = req.wholeNameWildcards ?? true
-
         // resolve a folder-scope root path → id, if given
         var rootId: Int32? = nil
         if let rp = req.scopeRoot, !rp.isEmpty {
             let nfc = rp.precomposedStringWithCanonicalMapping
             rootId = index.resolveIds(forPaths: [nfc])[nfc]
+            // A requested scope that can't be resolved must NOT silently become a
+            // whole-disk search (Codex + red-team: the app returns empty here too).
+            if rootId == nil { return emptyResult(req.requestId) }
         }
 
         let now = Date().timeIntervalSince1970
         let countOnly = req.countOnly ?? false
+        // Serialize the option-set + search: the option properties are shared engine
+        // state, so concurrent requests with different options would otherwise interleave
+        // and return each other's flags (Codex + red-team CRITICAL). Socket read/write/
+        // JSON of OTHER connections still overlap outside this lock.
+        engineLock.lock()
+        engine.foldersFirst = req.foldersFirst ?? false
+        engine.hideHidden = req.hideHidden ?? false
+        engine.useFolderSizes = req.useFolderSizes ?? false
+        engine.wholeNameWildcards = req.wholeNameWildcards ?? true
         let res = engine.search(req.q, mode: mode, scope: scope, sortKey: sort, ascending: asc,
                                 limit: countOnly ? 5_000_000 : limit, now: now, scopeRoot: rootId)
+        engineLock.unlock()
 
         var resp = Response(v: 1, requestId: req.requestId, ok: true, error: nil,
                             total: res.total, truncated: res.truncated,
@@ -260,6 +282,11 @@ public final class QueryServer: @unchecked Sendable {
 
     private func encode(_ r: Response) -> Data {
         (try? JSONEncoder().encode(r)) ?? Data("{\"v\":1,\"ok\":false}".utf8)
+    }
+    private func emptyResult(_ requestId: String?) -> Data {
+        encode(Response(v: 1, requestId: requestId, ok: true, error: nil, total: 0, truncated: false,
+                        queryMillis: 0, indexCount: index.safeCount(), indexing: indexing(),
+                        paths: [], results: nil))
     }
     private func errorLine(code: String, msg: String) -> Data {
         let r = Response(v: 1, requestId: nil, ok: false, error: ErrObj(code: code, msg: msg),

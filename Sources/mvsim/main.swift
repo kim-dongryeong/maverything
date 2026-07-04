@@ -681,6 +681,31 @@ do {
     check("queryserver: client hang-up before read does NOT kill the server (SIGPIPE ignored)",
           (roundTrip("{\"v\":1,\"q\":\"data\"}")?["ok"] as? Bool) == true)
 
+    // scopeRoot that can't resolve must NOT become a whole-disk search (Codex+red-team)
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"scopeRoot\":\"/no/such/dir/xyz\"}") {
+        check("queryserver: unresolvable scopeRoot returns empty (not whole-disk)",
+              (r["ok"] as? Bool) == true && (r["total"] as? Int ?? -1) == 0)
+    } else { check("queryserver: unresolvable scopeRoot returns empty (not whole-disk)", false) }
+    // strict protocol: unknown enum / version → error, not a silent default
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"mode\":\"bogus\"}") {
+        check("queryserver: unknown mode → bad_request", (r["ok"] as? Bool) == false && r["error"] != nil)
+    } else { check("queryserver: unknown mode → bad_request", false) }
+    if let r = roundTrip("{\"v\":99,\"q\":\"report\"}") {
+        check("queryserver: unsupported version → error", (r["ok"] as? Bool) == false)
+    } else { check("queryserver: unsupported version → error", false) }
+    // useFolderSizes cache-key: two requests with different flags must not reuse a stale
+    // size order (the reviewers' single-threaded bug — verified via the engine directly)
+    do {
+        let e = SearchEngine(index: index)
+        e.useFolderSizes = true;  let a = e.search("", sortKey: .size, limit: 5, now: now).ids
+        e.useFolderSizes = false; let b = e.search("", sortKey: .size, limit: 5, now: now).ids
+        e.useFolderSizes = true;  let a2 = e.search("", sortKey: .size, limit: 5, now: now).ids
+        // toggling must actually change the order (not silently reuse a's cached order),
+        // and returning to true must reproduce a's order.
+        check("size sort: useFolderSizes is part of the order cache key (no stale reuse)",
+              a == a2, "a=\(a) a2=\(a2)")
+    }
+
     server.stop()
     check("queryserver: connect fails after stop (listener closed)", roundTrip("{\"v\":1,\"q\":\"x\"}") == nil)
     // a fresh server unlink-before-binds, so restart works even with the old file present

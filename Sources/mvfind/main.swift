@@ -117,9 +117,17 @@ func socketQuery() -> [String: Any]? {
     if jsonOut { req["fields"] = ["path", "name", "size", "mtime", "isDir"] }
     guard var line = try? JSONSerialization.data(withJSONObject: req) else { qslog("encode failed"); return nil }
     line.append(0x0A)
-    let wrote = line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-    qslog("wrote=\(wrote) of \(line.count) errno=\(errno)")
-    if wrote <= 0 { return nil }
+    let sentOK = line.withUnsafeBytes { (raw) -> Bool in
+        var off = 0
+        while off < raw.count {
+            let w = write(fd, raw.baseAddress!.advanced(by: off), raw.count - off)
+            if w <= 0 { return false }
+            off += w
+        }
+        return true
+    }
+    qslog("sent=\(sentOK)")
+    if !sentOK { return nil }
     var out = Data(); var buf = [UInt8](repeating: 0, count: 65536)
     while true {
         let n = read(fd, &buf, buf.count)
@@ -132,7 +140,17 @@ func socketQuery() -> [String: Any]? {
 }
 
 if !forceSnapshot && !bench {
-    if let r = socketQuery(), (r["ok"] as? Bool) == true {
+    let sr = socketQuery()
+    if let r = sr, (r["ok"] as? Bool) != true {
+        // The app answered but rejected the request (bad enum, unresolvable scope, etc.).
+        // Distinguish this from "app not running" instead of silently falling back.
+        let err = (r["error"] as? [String: Any])
+        let msg = (err?["msg"] as? String) ?? "server error"
+        FileHandle.standardError.write(Data("mvfind: live query rejected: \(msg)\n".utf8))
+        if jsonOut { print(String(decoding: (try? JSONSerialization.data(withJSONObject: r)) ?? Data(), as: UTF8.self)) }
+        exit(2)
+    }
+    if let r = sr, (r["ok"] as? Bool) == true {
         let indexing = (r["indexing"] as? Bool) ?? false
         if jsonOut {
             let s = String(decoding: (try? JSONSerialization.data(withJSONObject: r,
@@ -151,7 +169,7 @@ if !forceSnapshot && !bench {
         exit(0)
     }
     if forceLive {
-        FileHandle.standardError.write(Data("mvfind: --live requested but the app isn't running (no socket)\n".utf8))
+        FileHandle.standardError.write(Data("mvfind: --live requested but the app isn't reachable (no socket)\n".utf8))
         exit(1)
     }
 }

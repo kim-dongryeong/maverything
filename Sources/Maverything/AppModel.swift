@@ -3,6 +3,7 @@ import Combine
 import CoreServices
 import Foundation
 import MaverythingCore
+import os
 
 /// Lightweight file logger so we can verify the in-app engine pipeline headlessly.
 enum Diag {
@@ -108,7 +109,13 @@ final class AppModel: ObservableObject {
     @Published var recentQueries: [String] = AppModel.loadRecents()
     @Published var savedSearches: [SavedSearch] = AppModel.loadSaved()
     @Published var scopeRoot: String? = nil        // "Search in This Folder" — restrict to a subtree
-    @Published var isIndexing = true
+    @Published var isIndexing = true {
+        didSet { let v = isIndexing; AppModel.indexingMirror.withLock { $0 = v } }   // thread-safe mirror for QueryServer
+    }
+    /// Lock-protected mirror of `isIndexing` so the background socket-server thread can
+    /// read it without touching @MainActor state (Codex + red-team: reading the
+    /// @Published Bool off-main is a data race / Swift-6 break).
+    static let indexingMirror = OSAllocatedUnfairLock(initialState: true)
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
     @Published var includeCloud = false        // index ~/Library/CloudStorage etc.
@@ -337,7 +344,7 @@ final class AppModel: ObservableObject {
         // is non-fatal (mvfind falls back to the snapshot).
         let qs = QueryServer(index: index, runStats: AppModel.sharedRunStats,
                              socketPath: QueryServer.defaultSocketPath(),
-                             indexing: { [weak self] in self?.isIndexing ?? false })
+                             indexing: { AppModel.indexingMirror.withLock { $0 } })
         qs.start()
         queryServer = qs
 

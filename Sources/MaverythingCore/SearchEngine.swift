@@ -22,7 +22,12 @@ public final class SearchEngine: @unchecked Sendable {
     private let index: FileIndex
     private let workerCount: Int
 
-    private var orderCache: [SortKey: [Int32]] = [:]
+    // The `.size` order depends on `useFolderSizes` (folder-subtree totals vs raw size),
+    // so the cache key includes it — otherwise toggling folder-sizes without an index
+    // mutation reuses a stale size order (Codex + red-team review: a real bug even
+    // single-threaded, e.g. two socket requests with different useFolderSizes).
+    private struct OrderKey: Hashable { let sort: SortKey; let folderSizes: Bool }
+    private var orderCache: [OrderKey: [Int32]] = [:]
     private var cacheGen: Int = -1     // the FileIndex.mutationGen the orderCache was built at
     private let cacheLock = NSLock()
 
@@ -182,8 +187,9 @@ public final class SearchEngine: @unchecked Sendable {
             // Stable dir/file partition. NOTE: this runs AFTER the run-count reorder, so
             // with both on, folders group above files and frecency ordering holds only
             // WITHIN each group — Folders First is an explicit override (red-team review).
-            let ot = index.withReadLock { index.objType }
-            let pkg = packageDirBitmap()   // Finder semantics: a package dir counts as a FILE
+            // objType AND packageDirBitmap read index arrays, so both must be under ONE
+            // read lock (Codex: packageDirBitmap outside the lock raced live reconcile).
+            let (ot, pkg): ([UInt8], [Bool]) = index.withReadLock { (index.objType, packageDirBitmap()) }
             var dirs: [Int32] = []; var files: [Int32] = []
             dirs.reserveCapacity(ids.count); files.reserveCapacity(ids.count)
             for id in ids {
@@ -1201,13 +1207,15 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func orderArray(for key: SortKey) -> [Int32] {
         let gen = index.mutationGenLocked   // safe: called inside the index read lock
+        // only .size varies with useFolderSizes; other keys ignore it (folderSizes:false).
+        let ck = OrderKey(sort: key, folderSizes: key == .size && useFolderSizes)
         cacheLock.lock()
         if cacheGen != gen { orderCache.removeAll(); cacheGen = gen }
-        if let cached = orderCache[key] { cacheLock.unlock(); return cached }
+        if let cached = orderCache[ck] { cacheLock.unlock(); return cached }
         cacheLock.unlock()
         let order = computeOrder(key)
         cacheLock.lock()
-        if cacheGen == gen { orderCache[key] = order }
+        if cacheGen == gen { orderCache[ck] = order }
         cacheLock.unlock()
         return order
     }

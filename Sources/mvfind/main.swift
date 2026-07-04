@@ -74,6 +74,9 @@ if let data = try? Data(contentsOf: snapURL), index.loadSnapshot(data) != nil {
 }
 
 let engine = SearchEngine(index: index)
+// Share the app's run-history so `--sort runcount` / relevance frecency work from the CLI.
+engine.runStats = RunStats(url: Snapshot.defaultURL().deletingLastPathComponent()
+    .appendingPathComponent("runstats.json"))
 let now = Date().timeIntervalSince1970
 // MVFIND_BENCH=N: run the query N times in-process and report each engine ms —
 // isolates WARM engine latency from snapshot load + first-query sort-order build

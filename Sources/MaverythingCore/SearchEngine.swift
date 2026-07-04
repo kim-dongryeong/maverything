@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 import UniformTypeIdentifiers
 
-// `runCount` MUST stay last — rawValue is persisted in UserDefaults/SavedSearch.
+// Append-only (keep `runCount` last): the raw values feed switches/lookup arrays and
+// may be serialized later, so reordering would silently remap old sorts.
 public enum SortKey: Int, Sendable { case name, path, size, dateModified, dateCreated, relevance, runCount }
 public enum SearchScope: Int, Sendable { case nameOnly, fullPath }
 
@@ -66,26 +67,29 @@ public final class SearchEngine: @unchecked Sendable {
     /// `.runCount` sort floats most-run-first and `.relevance` gets a frecency boost.
     public var runStats: RunStats?
     // Resolved tracked-path → id → frecency-score, cached by (index mutationGen,
-    // runStats.generation): ids change on reindex, scores change on every open, so
-    // both must key the cache (Codex review: mutationGen alone would go stale on a
-    // buildLiveIndexes that doesn't bump the mutation counter).
+    // runStats.generation, hour-bucket). buildLiveIndexes bumps mutationGen after it
+    // repopulates childrenOf/dirIndexByHash, so a map resolved while those maps were
+    // still empty (during crawl / right after snapshot load) is cached under the OLD
+    // gen and re-resolved once the live maps exist (Codex + red-team review).
     private let frecencyLock = NSLock()
     private var frecencyCache: [Int32: Double] = [:]
     private var frecencyCacheKey: (gen: Int, runGen: Int, now: Int) = (-1, -1, -1)
 
-    /// tracked id → frecency score for the current index generation (empty if no runStats).
-    private func frecencyMap(now: TimeInterval) -> [Int32: Double] {
+    /// tracked id → frecency score, resolved WITH THE INDEX READ LOCK ALREADY HELD so
+    /// the ids line up atomically with the search that uses them (Codex review: a split
+    /// resolve/scan let a reconcile renumber ids in between). Empty if no runStats.
+    private func resolveFrecencyLocked(now: TimeInterval) -> [Int32: Double] {
         guard let rs = runStats else { return [:] }
-        let gen = index.withReadLock { index.mutationGenLocked }
+        let gen = index.mutationGenLocked                // safe: caller holds the read lock
         let runGen = rs.generation
-        let nowBucket = Int(now / 3600)   // re-decay at most hourly (cache-friendly)
+        let nowBucket = Int(now / 3600)                  // re-decay at most hourly (cache-friendly)
         frecencyLock.lock()
         if frecencyCacheKey == (gen, runGen, nowBucket) {
             let c = frecencyCache; frecencyLock.unlock(); return c
         }
         frecencyLock.unlock()
         let scored = rs.scoredPaths(now: now)            // path → score
-        let resolved = index.resolveIds(forPaths: Array(scored.keys))   // path → id
+        let resolved = index.resolveIdsLocked(forPaths: Array(scored.keys))   // no nested lock
         var map = [Int32: Double](minimumCapacity: resolved.count)
         for (path, id) in resolved { if let s = scored[path], s > 0 { map[id] = s } }
         frecencyLock.lock()
@@ -117,78 +121,82 @@ public final class SearchEngine: @unchecked Sendable {
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
-        // Run-history: resolve tracked paths→ids once (cached) for the frecency boost
-        // (.relevance) and the run-count reorder (.runCount).
-        let frecency: [Int32: Double] = (sortKey == .relevance || sortKey == .runCount)
-            ? frecencyMap(now: now) : [:]
+        // needFull: any post-filter or reorder below needs the WHOLE match set, not a
+        // limit-capped prefix — the display `limit` is applied ONCE at the very end
+        // (both reviewers: capping between stages dropped a most-run file past `limit`
+        // before the run-count reorder could float it up).
         let needFull = post != nil || foldersFirst || hideHidden || sortKey == .runCount
-        let innerLimit = needFull ? 5_000_000 : limit
         // Run Count scans in a STABLE name-ascending base; the `ascending` flag then
         // orders only the tracked prefix (most-run ↔ least), leaving the untracked tail
         // in a fixed a→z order rather than flipping it with the frecency direction.
         let innerAscending = sortKey == .runCount ? true : ascending
-        var res = index.withReadLock {
-            _search(query, mode: mode, scope: scope, sortKey: sortKey,
-                    ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
-                    frecency: frecency)
+        // Resolve the frecency map and run the scan in the SAME read-lock acquisition
+        // so the tracked ids line up with the exact index the scan saw (Codex review).
+        var frecency: [Int32: Double] = [:]
+        var res = index.withReadLock { () -> SearchResults in
+            if sortKey == .relevance || sortKey == .runCount {
+                frecency = resolveFrecencyLocked(now: now)
+            }
+            // "all matches" ≈ every live entry (the true ceiling), read under the lock
+            // so it can't undercount vs the order array the scan walks.
+            let innerLimit = needFull ? max(limit, index.count) : limit
+            return _search(query, mode: mode, scope: scope, sortKey: sortKey,
+                           ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
+                           frecency: frecency)
         }
+        // From here every stage works on the FULL set; `total` tracks live match count.
+        var ids = res.ids
+        var total = res.total
+        var extraMillis = 0.0
         if let p = post {
             let clock = ContinuousClock(); let t0 = clock.now
-            var ids = res.ids
             if !p.tagGroups.isEmpty { ids = Self.filterByTags(ids, groups: p.tagGroups, index: index) }
             if let needle = p.contentNeedle {
                 ids = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive, index: index)
             }
-            let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
-            res = SearchResults(ids: capped, total: ids.count, truncated: ids.count > capped.count,
-                                queryMillis: res.queryMillis + secondsBetween(t0, clock.now) * 1000)
+            total = ids.count
+            extraMillis += secondsBetween(t0, clock.now) * 1000
         }
         if hideHidden {
             let hid = index.withReadLock { index.hidden }   // COW snapshot, race-free
-            let kept = res.ids.filter { Int($0) < hid.count && !hid[Int($0)] }
-            let capped = kept.count > limit ? Array(kept[0..<limit]) : kept
-            res = SearchResults(ids: capped, total: kept.count, truncated: kept.count > capped.count,
-                                queryMillis: res.queryMillis)
+            ids = ids.filter { Int($0) < hid.count && !hid[Int($0)] }
+            total = ids.count
         }
         if sortKey == .runCount {
             // Everything's Run Count sort: tracked (opened-before) matches float to the
             // front in frecency order; everything else keeps the underlying name order.
-            // A stable partition on the FULL set (needFull above guaranteed no pre-cap
-            // loss — Codex review), then cap. `ascending` flips most-run-first ↔ least.
-            var tracked: [(id: Int32, score: Double)] = []
+            // Ordinal tiebreak keeps equal-frecency ties in stable name order (Swift's
+            // sort isn't stable — Codex review).
+            var tracked: [(id: Int32, score: Double, ord: Int)] = []
             var rest: [Int32] = []
-            rest.reserveCapacity(res.ids.count)
-            for id in res.ids {
-                if let s = frecency[id] { tracked.append((id, s)) } else { rest.append(id) }
+            rest.reserveCapacity(ids.count)
+            for (ord, id) in ids.enumerated() {
+                if let s = frecency[id] { tracked.append((id, s, ord)) } else { rest.append(id) }
             }
-            tracked.sort { ascending ? $0.score < $1.score : $0.score > $1.score }
-            var merged = tracked.map(\.id); merged.append(contentsOf: rest)
-            let capped = merged.count > limit ? Array(merged[0..<limit]) : merged
-            res = SearchResults(ids: capped, total: res.total, truncated: res.total > capped.count,
-                                queryMillis: res.queryMillis)
+            tracked.sort { a, b in
+                a.score != b.score ? (ascending ? a.score < b.score : a.score > b.score) : a.ord < b.ord
+            }
+            ids = tracked.map(\.id); ids.append(contentsOf: rest)
         }
         if foldersFirst {
-            // Stable partition: dirs keep their relative order, then files keep theirs.
-            // objType is captured under the lock as a COW snapshot (appends may
-            // reallocate, our reference keeps the old buffer alive — race-free).
+            // Stable dir/file partition. NOTE: this runs AFTER the run-count reorder, so
+            // with both on, folders group above files and frecency ordering holds only
+            // WITHIN each group — Folders First is an explicit override (red-team review).
             let ot = index.withReadLock { index.objType }
-            // Finder semantics, same as folder:/file: — a package dir (.app/.bundle)
-            // is a FILE for grouping purposes, so it never floats up among folders.
-            let pkg = packageDirBitmap()
+            let pkg = packageDirBitmap()   // Finder semantics: a package dir counts as a FILE
             var dirs: [Int32] = []; var files: [Int32] = []
-            dirs.reserveCapacity(res.ids.count); files.reserveCapacity(res.ids.count)
-            for id in res.ids {
+            dirs.reserveCapacity(ids.count); files.reserveCapacity(ids.count)
+            for id in ids {
                 let i = Int(id)
-                if i < ot.count, ot[i] == VNODE_VDIR, !(i < pkg.count && pkg[i]) {
-                    dirs.append(id)
-                } else { files.append(id) }
+                if i < ot.count, ot[i] == VNODE_VDIR, !(i < pkg.count && pkg[i]) { dirs.append(id) }
+                else { files.append(id) }
             }
-            var merged = dirs; merged.append(contentsOf: files)
-            let capped = merged.count > limit ? Array(merged[0..<limit]) : merged
-            res = SearchResults(ids: capped, total: res.total, truncated: res.total > capped.count,
-                                queryMillis: res.queryMillis)
+            ids = dirs; ids.append(contentsOf: files)
         }
-        return res
+        // single final cap
+        let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
+        return SearchResults(ids: capped, total: total, truncated: total > capped.count,
+                             queryMillis: res.queryMillis + extraMillis)
     }
 
     // MARK: - post-lock filters (content: / tag:) — Everything 1.4-style on-demand

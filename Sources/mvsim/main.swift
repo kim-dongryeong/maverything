@@ -583,6 +583,86 @@ check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
       && corruptV5Idx.count == 1
       && corruptV5Idx.name(0) == "/sentinel5")
 
+// ---- Unix-socket query server (mvfind/MCP backend) round-trip ----
+do {
+    let sockPath = root + "/qs.sock"
+    let server = QueryServer(index: index, runStats: nil, socketPath: sockPath,
+                             indexing: { false })
+    let ok = server.start()
+    check("queryserver: starts and binds the socket", ok && fm.fileExists(atPath: sockPath))
+
+    // minimal blocking client: connect, send one JSON line, read one JSON line.
+    func roundTrip(_ json: String, path: String = sockPath) -> [String: Any]? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 { return nil }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pb = Array(path.utf8)
+        withUnsafeMutablePointer(to: &addr.sun_path) { p in
+            p.withMemoryRebound(to: UInt8.self, capacity: pb.count) { d in
+                for (i, b) in pb.enumerated() { d[i] = b }
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let conn = withUnsafePointer(to: &addr) { ap in
+            ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
+        }
+        if conn != 0 { return nil }
+        var line = json; line.append("\n")
+        _ = line.utf8CString.withUnsafeBufferPointer { _ in }
+        let sent = Array(line.utf8)
+        _ = sent.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        var out = Data(); var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n <= 0 { break }
+            out.append(contentsOf: buf[0..<n])
+            if buf[0..<n].contains(0x0A) { break }
+        }
+        return (try? JSONSerialization.jsonObject(with: out)) as? [String: Any]
+    }
+
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"limit\":50}") {
+        let paths = (r["paths"] as? [String]) ?? []
+        check("queryserver: valid query returns matching paths + meta",
+              (r["ok"] as? Bool) == true && (r["total"] as? Int ?? 0) > 0
+              && paths.contains { ($0 as NSString).lastPathComponent == "report.txt" }
+              && (r["indexCount"] as? Int ?? 0) == index.count)
+    } else { check("queryserver: valid query returns matching paths + meta", false, "no response") }
+
+    // countOnly returns total, no paths
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"countOnly\":true}") {
+        check("queryserver: countOnly returns total without paths",
+              (r["ok"] as? Bool) == true && r["paths"] == nil && (r["total"] as? Int ?? 0) > 0)
+    } else { check("queryserver: countOnly returns total without paths", false) }
+
+    // structured fields
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"limit\":5,\"fields\":[\"path\",\"size\",\"isDir\"]}"),
+       let results = r["results"] as? [[String: Any]], let first = results.first {
+        check("queryserver: fields=[…] returns structured rows",
+              first["path"] != nil && first["name"] != nil && first["isDir"] != nil)
+    } else { check("queryserver: fields=[…] returns structured rows", false) }
+
+    // malformed JSON → explicit error, not a crash / silent stale
+    if let r = roundTrip("{ this is not json ") {
+        check("queryserver: malformed request → ok:false with error",
+              (r["ok"] as? Bool) == false && r["error"] != nil)
+    } else { check("queryserver: malformed request → ok:false with error", false) }
+
+    // concurrency: two simultaneous connections both answered
+    let g = DispatchGroup(); var a: [String: Any]? = nil; var b: [String: Any]? = nil
+    g.enter(); DispatchQueue.global().async { a = roundTrip("{\"v\":1,\"q\":\"data\"}"); g.leave() }
+    g.enter(); DispatchQueue.global().async { b = roundTrip("{\"v\":1,\"q\":\"src\"}"); g.leave() }
+    g.wait()
+    check("queryserver: concurrent connections both answered",
+          (a?["ok"] as? Bool) == true && (b?["ok"] as? Bool) == true)
+
+    server.stop()
+    check("queryserver: stop() removes the socket", !fm.fileExists(atPath: sockPath))
+    check("queryserver: connect fails after stop", roundTrip("{\"v\":1,\"q\":\"x\"}") == nil)
+}
+
 // ---- RunHistory frecency (Run Count sort + relevance boost) ----
 do {
     let rroot = root + "/runAB"
@@ -647,6 +727,26 @@ do {
     check("runstats: clear resets to plain name order",
           afterClear == ["alpha_report.txt", "beta_report.txt", "delta_report.txt",
                          "gamma_report.txt", "nested_report.txt"], afterClear.joined(separator: ","))
+
+    // REGRESSION (both reviewers, highest-impact): a most-run file that sorts
+    // alphabetically LAST must survive a small display limit AND hideHidden — the old
+    // code capped to `limit` in name order BEFORE the run-count reorder, dropping it.
+    // Reconcile a real new file into the index (also exercises the _appendOne mask path).
+    let zPath = rroot + "/zzz_report.txt"
+    write("runAB/zzz_report.txt", bytes: 4)
+    _ = Reconciler(index: rIdx, exclude: []).reconcile(eventPaths: [rroot])
+    for _ in 0..<9 { rStats.record(path: zPath, now: rnow) }          // most-run of all
+    rEng.invalidate()
+    let topHot = rEng.search("report", sortKey: .runCount, ascending: false, limit: 2, now: rnow)
+                    .ids.map { rIdx.name(Int($0)) }
+    check("runcount: alphabetically-last most-run file survives a small limit (no pre-cap drop)",
+          topHot.first == "zzz_report.txt", topHot.joined(separator: ","))
+    rEng.hideHidden = true
+    let topHotHidden = rEng.search("report", sortKey: .runCount, ascending: false, limit: 2, now: rnow)
+                          .ids.map { rIdx.name(Int($0)) }
+    check("runcount: survives limit + hideHidden together (cap applied once, at the end)",
+          topHotHidden.first == "zzz_report.txt", topHotHidden.joined(separator: ","))
+    rEng.hideHidden = false
 }
 
 // ---- character bloom prefilter: A/B equivalence (gate ON must equal brute scan) ----

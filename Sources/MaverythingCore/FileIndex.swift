@@ -262,6 +262,12 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         }
+        // Bump the generation so every gen-keyed cache (order, incremental narrowing,
+        // the engine's frecency-id map) rebuilds AGAINST the freshly-built live maps.
+        // Without this a frecency map resolved while childrenOf was still empty (during
+        // crawl / right after snapshot load) would be cached under an unchanged gen and
+        // never re-resolve (Codex review).
+        bumpMut()
     }
 
     /// Authoritative bloom-mask pass. Each entry's mask = the folded characters of
@@ -360,15 +366,25 @@ public final class FileIndex: @unchecked Sendable {
     /// blow up). Unresolved paths (deleted / moved / not indexed) are simply omitted.
     public func resolveIds(forPaths paths: [String]) -> [String: Int32] {
         rdlock(); defer { unlock() }
+        return resolveIdsLocked(forPaths: paths)
+    }
+
+    /// Caller-holds-the-lock variant, so the frecency map can be resolved in the SAME
+    /// read-lock acquisition as the search that uses it (Codex review: resolving under
+    /// a separate lock let a reconcile change ids between resolve and scan).
+    func resolveIdsLocked(forPaths paths: [String]) -> [String: Int32] {
+        var out = [String: Int32](minimumCapacity: paths.count)
         var byParent: [String: [(full: String, base: Substring)]] = [:]
         for p in paths {
+            // A tracked path may itself BE a directory (incl. a crawl root, parent == -1);
+            // resolve it directly first so opened folders count too (Codex review).
+            if let did = _dirIndexVerified(p) { out[p] = did; continue }
             guard let slash = p.lastIndex(of: "/") else { continue }
             let parent = slash == p.startIndex ? "/" : String(p[..<slash])
             let base = p[p.index(after: slash)...]
             if base.isEmpty { continue }
             byParent[parent, default: []].append((p, base))
         }
-        var out = [String: Int32](minimumCapacity: paths.count)
         for (parent, kids) in byParent {
             guard let pid = _dirIndexVerified(parent), let childIdxs = childrenOf[pid] else { continue }
             var nameToId = [String: Int32](minimumCapacity: childIdxs.count)

@@ -882,18 +882,22 @@ final class AppModel: ObservableObject {
     }()
 
     static func finderOpen(_ path: String) {
-        sharedRunStats.record(path: path, now: Date().timeIntervalSince1970)   // count this "run"
         var st = stat()
         let isDir = stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+        var opened = false
         if isDir {
             let u = URL(fileURLWithPath: path, isDirectory: true)
             let pkg = (try? u.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
             if !pkg {
-                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+                opened = NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+                if opened { sharedRunStats.record(path: path, now: Date().timeIntervalSince1970) }
                 return
             }
         }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        opened = NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        // Record the "run" only when the open actually succeeded (Codex review) — a
+        // failed open (missing file, no handler) shouldn't inflate the run count.
+        if opened { sharedRunStats.record(path: path, now: Date().timeIntervalSince1970) }
     }
 
     func reindex() { beginIndexing() }

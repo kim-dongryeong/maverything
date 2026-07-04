@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import MaverythingCore
 import Quartz
 import SwiftUI
@@ -313,5 +314,36 @@ enum IconCache {
         let img = NSWorkspace.shared.icon(for: dir ? .folder : .data)
         img.size = NSSize(width: 16, height: 16)
         return img
+    }
+
+    // Finder tints a TAGGED FOLDER's icon with the tag color (files get a dot; folders
+    // get recolored). We match it: grayscale the generic folder and re-tint to the tag
+    // color via CIColorMonochrome, which preserves the folder's 3D shading. Cached by
+    // color so the tint is computed once per color, not per row.
+    private static var folderTintCache: [String: NSImage] = [:]
+    static func tintedFolder(_ color: NSColor) -> NSImage {
+        let rgb = color.usingColorSpace(.sRGB) ?? color
+        let key = String(format: "%.2f,%.2f,%.2f", rgb.redComponent, rgb.greenComponent, rgb.blueComponent)
+        lock.lock()
+        if let c = folderTintCache[key] { lock.unlock(); return c }
+        lock.unlock()
+        let base = NSWorkspace.shared.icon(for: .folder)
+        base.size = NSSize(width: 64, height: 64)   // tint at higher res, then downsize
+        var out = base
+        if let tiff = base.tiffRepresentation, let ci = CIImage(data: tiff),
+           let f = CIFilter(name: "CIColorMonochrome") {
+            f.setValue(ci, forKey: kCIInputImageKey)
+            f.setValue(CIColor(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent),
+                       forKey: kCIInputColorKey)
+            f.setValue(1.0, forKey: kCIInputIntensityKey)
+            if let result = f.outputImage {
+                let rep = NSCIImageRep(ciImage: result)
+                let img = NSImage(size: rep.size); img.addRepresentation(rep)
+                img.size = NSSize(width: 16, height: 16)
+                out = img
+            }
+        }
+        lock.lock(); if folderTintCache.count < 32 { folderTintCache[key] = out }; lock.unlock()
+        return out
     }
 }

@@ -474,6 +474,12 @@ struct ResultsTableView: NSViewRepresentable {
                 // against cell reuse racing the generation.
                 var rowIcon = IconCache.icon(for: r.path, isDir: r.isDir,
                                              isLink: r.isLink, onReady: refreshName)
+                // Finder tints a TAGGED plain folder's icon with the tag color (Downloads
+                // with an Orange tag shows an orange folder). Bundles keep their own icon.
+                if r.isDir, !r.isLink, r.ext.isEmpty,
+                   let cols = TagCache.colors(forPath: r.path, onReady: refreshName), let c = cols.last {
+                    rowIcon = IconCache.tintedFolder(c)
+                }
                 (cell.imageView as? MVRowImageView)?.expectedPath = r.path
                 if model.iconPreview, !r.isDir, ResultsTableView.previewableExts.contains(r.ext.lowercased()) {
                     if let t = ThumbCache.shared.cachedSync(for: r.path, side: 32) {

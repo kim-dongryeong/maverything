@@ -28,6 +28,11 @@ let package = Package(
             dependencies: ["MaverythingCore"],
             swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         ),
+        .executableTarget(
+            name: "mv-mcp",
+            dependencies: ["MaverythingCore"],
+            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

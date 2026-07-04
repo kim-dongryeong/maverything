@@ -73,7 +73,7 @@ CLI: `mvfind 'xcode' --live` (force socket), `mvfind 'xcode' --snapshot` (force 
 ## Running the checks
 
 ```bash
-swift run -c release mvsim          # all 174 scenarios (this doc's "mvsim:" rows)
+swift run -c release mvsim          # all 181 scenarios (this doc's "mvsim:" rows)
 MVFIND_BENCH=5 mvfind 'swift' --fuzzy         # warm fuzzy latency (bloom on)
 MVFIND_BENCH=5 MVFIND_NOBLOOM=1 mvfind 'swift' --fuzzy   # baseline (bloom off)
 mvfind 'report' --sort runcount --live        # live run-count sort over the socket

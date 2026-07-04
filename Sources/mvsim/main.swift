@@ -681,6 +681,40 @@ do {
     check("queryserver: client hang-up before read does NOT kill the server (SIGPIPE ignored)",
           (roundTrip("{\"v\":1,\"q\":\"data\"}")?["ok"] as? Bool) == true)
 
+    // CONCURRENT DIFFERING-OPTIONS (the engineLock CRITICAL fix, completeness review F3):
+    // fire many folders-first=true / =false requests at once; every true response MUST
+    // have all directories before any file. Under the pre-fix shared-property race a
+    // true request could pick up a concurrent false and interleave dirs among files.
+    func foldersFirstHonored(_ r: [String: Any]?) -> Bool {
+        guard let rows = r?["results"] as? [[String: Any]] else { return true }   // nil = skip (connection saturation, not an ordering fact)
+        var sawFile = false
+        for row in rows {
+            let isDir = (row["isDir"] as? Bool) ?? false
+            if isDir && sawFile { return false }     // a dir AFTER a file → NOT folders-first
+            if !isDir { sawFile = true }
+        }
+        return true
+    }
+    let ffReq = "{\"v\":1,\"q\":\"a\",\"foldersFirst\":true,\"fields\":[\"path\",\"isDir\"],\"limit\":200}"
+    let plainReq = "{\"v\":1,\"q\":\"a\",\"foldersFirst\":false,\"fields\":[\"path\",\"isDir\"],\"limit\":200}"
+    let cg = DispatchGroup()
+    var ffOK = true; var ffChecked = 0
+    let vlock = NSLock()
+    for k in 0..<8 {   // < listen backlog (16); alternating options exercise the shared-property race
+        cg.enter()
+        DispatchQueue.global().async {
+            let r = roundTrip(k % 2 == 0 ? ffReq : plainReq)
+            if k % 2 == 0, r != nil {
+                let ok = foldersFirstHonored(r)
+                vlock.lock(); ffChecked += 1; if !ok { ffOK = false }; vlock.unlock()
+            }
+            cg.leave()
+        }
+    }
+    cg.wait()
+    check("queryserver: concurrent differing options don't cross-contaminate (foldersFirst honored)",
+          ffOK && ffChecked > 0, "checked \(ffChecked)")
+
     // scopeRoot that can't resolve must NOT become a whole-disk search (Codex+red-team)
     if let r = roundTrip("{\"v\":1,\"q\":\"report\",\"scopeRoot\":\"/no/such/dir/xyz\"}") {
         check("queryserver: unresolvable scopeRoot returns empty (not whole-disk)",
@@ -697,13 +731,13 @@ do {
     // size order (the reviewers' single-threaded bug — verified via the engine directly)
     do {
         let e = SearchEngine(index: index)
-        e.useFolderSizes = true;  let a = e.search("", sortKey: .size, limit: 5, now: now).ids
-        e.useFolderSizes = false; let b = e.search("", sortKey: .size, limit: 5, now: now).ids
-        e.useFolderSizes = true;  let a2 = e.search("", sortKey: .size, limit: 5, now: now).ids
-        // toggling must actually change the order (not silently reuse a's cached order),
-        // and returning to true must reproduce a's order.
-        check("size sort: useFolderSizes is part of the order cache key (no stale reuse)",
-              a == a2, "a=\(a) a2=\(a2)")
+        // full order (not top-5) so a difference anywhere in the folder ranking shows.
+        e.useFolderSizes = true;  let a = e.search("", sortKey: .size, limit: 1_000_000, now: now).ids
+        e.useFolderSizes = false; let b = e.search("", sortKey: .size, limit: 1_000_000, now: now).ids
+        e.useFolderSizes = true;  let a2 = e.search("", sortKey: .size, limit: 1_000_000, now: now).ids
+        // Pre-fix (cache ignores useFolderSizes) b would equal a and this a!=b fails.
+        check("size sort: useFolderSizes actually changes the order (cache key is live)", a != b)
+        check("size sort: returning to useFolderSizes reproduces the same order (no stale reuse)", a == a2)
     }
 
     server.stop()
@@ -801,6 +835,21 @@ do {
     check("runcount: survives limit + hideHidden together (cap applied once, at the end)",
           topHotHidden.first == "zzz_report.txt", topHotHidden.joined(separator: ","))
     rEng.hideHidden = false
+
+    // REINDEX SURVIVAL (buildLiveIndexes gen-bump fix, completeness review F4): a full
+    // re-crawl churns entry ids; run history is path-keyed and re-resolves. If
+    // buildLiveIndexes didn't bump the gen, a frecency map resolved while childrenOf was
+    // empty (during the crawl) would be cached stale and run-count would silently break.
+    // Resolve frecency BEFORE the rebuild completes to exercise exactly that window.
+    rIdx.clear()
+    _ = FileEnumerator(index: rIdx).crawl(roots: [rroot])
+    _ = rEng.search("report", sortKey: .runCount, ascending: false, limit: 5, now: rnow)  // resolve pre-buildLiveIndexes
+    rIdx.buildLiveIndexes()
+    rEng.invalidate()
+    let afterReindex = rEng.search("report", sortKey: .runCount, ascending: false, limit: 5, now: rnow)
+                          .ids.map { rIdx.name(Int($0)) }
+    check("runcount: run history survives a full reindex (path-keyed, gen-bump re-resolve)",
+          afterReindex.first == "zzz_report.txt", afterReindex.joined(separator: ","))
 }
 
 // ---- character bloom prefilter: A/B equivalence (gate ON must equal brute scan) ----

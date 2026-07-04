@@ -240,7 +240,7 @@ public final class QueryServer: @unchecked Sendable {
         engineLock.lock()
         engine.foldersFirst = req.foldersFirst ?? false
         engine.hideHidden = req.hideHidden ?? false
-        engine.useFolderSizes = req.useFolderSizes ?? false
+        engine.useFolderSizes = req.useFolderSizes ?? true   // matches the app's default
         engine.wholeNameWildcards = req.wholeNameWildcards ?? true
         let res = engine.search(req.q, mode: mode, scope: scope, sortKey: sort, ascending: asc,
                                 limit: countOnly ? 5_000_000 : limit, now: now, scopeRoot: rootId)

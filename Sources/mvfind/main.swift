@@ -7,14 +7,16 @@ import MaverythingCore
 // instant search from the command line. Falls back to a live crawl if there's no
 // snapshot yet.
 //
-//   mvfind <query…> [--fuzzy|--wildcard] [--path] [--sort name|size|date|relevance]
-//                   [--limit N] [-0] [--count]
+//   mvfind <query…> [--fuzzy|--wildcard] [--path]
+//                   [--sort name|path|size|date|created|relevance|runcount]
+//                   [--limit N] [-0] [--count] [--live|--snapshot] [--json]
 //   mvfind "*.swift" --wildcard --sort size --limit 20
 //   mvfind report ext:pdf size:>1mb
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
-    usage: mvfind <query…> [--fuzzy|--wildcard] [--path] [--sort name|size|date|relevance|runcount]
+    usage: mvfind <query…> [--fuzzy|--wildcard] [--path]
+                           [--sort name|path|size|date|created|relevance|runcount]
                            [--limit N] [--count] [-0] [--live|--snapshot] [--json]
       query supports: terms (AND), "phrases", -not, ext:swift, size:>1mb, dm:today, path:foo, name:foo
       by default queries the running app's LIVE index over a socket, falling back to the
@@ -53,7 +55,8 @@ while i < args.count {
         i += 1
         switch (i < args.count ? args[i] : "") {
         case "size": sort = .size
-        case "date", "dm": sort = .dateModified
+        case "date", "dm", "modified": sort = .dateModified
+        case "created": sort = .dateCreated
         case "relevance", "rel": sort = .relevance
         case "runcount", "run", "frecency": sort = .runCount
         case "path": sort = .path
@@ -68,6 +71,12 @@ if terms.isEmpty && !countOnly { usage() }
 let query = terms.joined(separator: " ")
 
 let bench = ProcessInfo.processInfo.environment["MVFIND_BENCH"].flatMap(Int.init).map { $0 > 0 } ?? false
+
+// "best-first" default direction, identical for the socket and snapshot paths so
+// `mvfind --sort size` ranks the same whether the app is open or not (completeness
+// review F1): size/date/created/relevance/runcount descend, name/path ascend.
+let ascending = !(sort == .relevance || sort == .runCount || sort == .size
+                  || sort == .dateModified || sort == .dateCreated)
 
 // --- try the resident app's LIVE index over the socket first (real-time, never
 //     stale). --snapshot forces the file; bench measures the LOCAL engine so it skips. ---
@@ -205,14 +214,14 @@ if let benchN = ProcessInfo.processInfo.environment["MVFIND_BENCH"].flatMap(Int.
     }
     for i in 1...benchN {
         let b = engine.search(query, mode: mode, scope: scope, sortKey: sort,
-                              ascending: sort != .relevance && sort != .runCount, limit: limit, now: now)
+                              ascending: ascending, limit: limit, now: now)
         FileHandle.standardError.write(Data(String(
             format: "bench[%d]: %d matches in %.2f ms\n", i, b.total, b.queryMillis).utf8))
     }
     exit(0)
 }
 let r = engine.search(query, mode: mode, scope: scope, sortKey: sort,
-                      ascending: sort != .relevance && sort != .runCount, limit: countOnly ? 5_000_000 : limit, now: now)
+                      ascending: ascending, limit: countOnly ? 5_000_000 : limit, now: now)
 
 if countOnly {
     print(r.total)

@@ -36,16 +36,17 @@ public final class RunStats: @unchecked Sendable {
 
     /// Frecency = count × 2^(−age/halfLife). Monotone in count, decays with age —
     /// a file opened 100× a month ago can still outrank one opened twice today,
-    /// which is the point (habitual files stay near the top).
-    public static func frecency(count: Int32, lastRun: TimeInterval, now: TimeInterval) -> Double {
+    /// which is the point (habitual files stay near the top). Both the static and
+    /// instance forms funnel here so a non-default half-life can't make them disagree
+    /// (completeness review F8).
+    public static func frecency(count: Int32, lastRun: TimeInterval, now: TimeInterval,
+                                halfLifeDays: Double = 14) -> Double {
         guard count > 0 else { return 0 }
         let age = max(0, now - lastRun)
-        return Double(count) * pow(2.0, -age / (14 * 86_400))
+        return Double(count) * pow(2.0, -age / (halfLifeDays * 86_400))
     }
     private func frecencyLocked(_ e: Entry, now: TimeInterval) -> Double {
-        guard e.count > 0 else { return 0 }
-        let age = max(0, now - e.lastRun)
-        return Double(e.count) * pow(2.0, -age / halfLife)
+        Self.frecency(count: e.count, lastRun: e.lastRun, now: now, halfLifeDays: halfLife / 86_400)
     }
 
     // MARK: - mutation

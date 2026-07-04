@@ -399,6 +399,17 @@ let rec = Reconciler(index: index, exclude: [])
 write("live_new.txt", bytes: 42, mtime: now)
 _ = rec.reconcile(eventPaths: [root]); engine.invalidate()
 check("live: created file is found", has("live_new", "live_new.txt"))
+// bloom regression (Codex review): reconcile-insert of an ASCII name must not trap on
+// Int(noUnicodeFoldOffset), and a NON-ASCII name must OR its unicode fold into the mask
+// so a diacritic-folded query still finds it via the live-append mask path.
+write("café_live.txt", bytes: 8, mtime: now)
+write("한글_live.txt", bytes: 8, mtime: now)
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+check("live: reconcile-inserted diacritic name found by folded query (mask path)",
+      has("cafe_live", "café_live.txt"))
+check("live: reconcile-inserted Korean name found (mask path)", has("한글", "한글_live.txt"))
+try? fm.removeItem(atPath: root + "/café_live.txt"); try? fm.removeItem(atPath: root + "/한글_live.txt")
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
 try? fm.removeItem(atPath: root + "/live_new.txt")
 _ = rec.reconcile(eventPaths: [root]); engine.invalidate()
 check("live: deleted file is gone", !has("live_new", "live_new.txt"))

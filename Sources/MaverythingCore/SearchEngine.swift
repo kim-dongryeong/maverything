@@ -786,6 +786,7 @@ public final class SearchEngine: @unchecked Sendable {
             }
         }
         let hasOrGates = !orGates.isEmpty
+        let useBloomGate = requiredMask != 0 || hasOrGates   // hoisted: pure-filter queries skip it entirely
         // -------------------------------------------------------------------------------
 
         // Hoist filter presence out of the loop (avoid per-candidate array access + ARC).
@@ -860,7 +861,7 @@ public final class SearchEngine: @unchecked Sendable {
                         // character bloom prefilter: reject before any byte scan when the
                         // name can't possibly contain the needle's characters (cheapest,
                         // most-selective gate for text queries — esp. fuzzy).
-                        if requiredMask != 0 || hasOrGates {
+                        if useBloomGate {
                             let nm = maskB[id]
                             if requiredMask & nm != requiredMask { continue }
                             if hasOrGates {

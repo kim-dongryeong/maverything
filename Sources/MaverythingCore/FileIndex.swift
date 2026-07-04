@@ -586,8 +586,11 @@ public final class FileIndex: @unchecked Sendable {
         // fold + unicode-fold bytes so this entry is accelerated immediately (buildLiveIndexes
         // isn't re-run after reconcile). Both representations OR'd → no diacritic false-negative.
         var m = Self.maskOf(name.lazy.map(asciiLower))
-        let uo = Int(unicodeFoldOff[Int(idx)]), ul = Int(unicodeFoldLen[Int(idx)])
+        // ASCII names store noUnicodeFoldOffset (UInt64.max) — Int(UInt64.max) TRAPS,
+        // so the sentinel check MUST gate the conversion (Codex review: crash on live
+        // ASCII reconcile-insert). Non-ASCII names have a real unicode fold to OR in.
         if unicodeFoldOff[Int(idx)] != noUnicodeFoldOffset {
+            let uo = Int(unicodeFoldOff[Int(idx)]), ul = Int(unicodeFoldLen[Int(idx)])
             m |= Self.maskOf(unicodeFoldBlob[uo..<uo+ul])
         }
         nameMask.append(m)

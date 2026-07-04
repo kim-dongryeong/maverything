@@ -10,3 +10,13 @@ prototype/offsetcheck
 logs/
 docs/worklog.md
 SIMULATION-REPORT.md
+# secrets / signing material — never commit (kept outside git regardless of license)
+*.keychain-db
+*.p12
+*.cer
+*.provisionprofile
+notarization-credentials*
+sparkle_priv*
+*_ed25519_priv*
+.env
+.env.*

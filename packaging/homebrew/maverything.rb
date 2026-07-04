@@ -23,6 +23,11 @@ cask "maverything" do
 
   app "Maverything.app"
 
+  # CLI + MCP tools bundled inside the app (build.sh copies them to Contents/Helpers);
+  # symlink onto PATH so `mvfind` works in a terminal and `mv-mcp` works as an MCP server.
+  binary "#{appdir}/Maverything.app/Contents/Helpers/mvfind"
+  binary "#{appdir}/Maverything.app/Contents/Helpers/mv-mcp"
+
   # The saved index snapshot + app data. UserDefaults (com.maverything.app) are
   # left alone by design; add "~/Library/Preferences/com.maverything.app.plist"
   # here if a scorched-earth zap is preferred.

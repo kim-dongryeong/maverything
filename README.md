@@ -34,8 +34,10 @@ in ~26–40 s, warm relaunch from snapshot ~1 s, per-keystroke search ~0.1–3 m
 ## Features
 
 - **Search as you type** over every indexed file name — hidden and system files included.
-- **4 match modes**: **Exact substring** (Everything's default — fastest), **Fuzzy**
-  (fzf/Sublime-style with scoring), **Wildcard** (`*`/`?` glob), **Regex**.
+  A per-file character bloom prefilter makes even fuzzy search over ~2M files run in a
+  few milliseconds.
+- **3 match modes**: **Exact substring** (Everything's default — fastest; `*`/`?`
+  auto-glob as you type), **Fuzzy** (fzf/Sublime-style with scoring), **Regex**.
 - **Everything query syntax** (combine freely, e.g. `photo ext:jpg dm:week size:>1mb`):
 
   | Syntax | Meaning |
@@ -68,6 +70,8 @@ in ~26–40 s, warm relaunch from snapshot ~1 s, per-keystroke search ~0.1–3 m
 - **Finder integration**: Quick Look (`Space`) · rename in place (`F2`, or `Enter` if
   you prefer) · Move to Trash (`⌘⌫`) · Finder **tags** · Get Info (`⌘I`) · drag files
   straight out of the results.
+- **Run Count sort** (`⌃7`) — the files you open most/recently float to the top, and
+  Relevance factors it in (Everything's Run Count, path-keyed so it survives reindexes).
 - **Saved searches** — name a query and recall it from the menu.
 - **CSV export** of the current results (Name, Path, Size, Dates).
 - **Global hotkey** — summon the window from anywhere; default `⌥Space`, rebindable
@@ -122,26 +126,52 @@ cert so the grant sticks (`MAVERYTHING_SIGN_ID="Maverything Dev Cert" ./build.sh
 
 ## mvfind — the same search, in your terminal
 
-`mvfind` loads the app's saved snapshot (instant, no crawl; falls back to a live
-crawl if there is none) and searches it with the same engine and query syntax:
+`mvfind` queries the **running app's live index over a local socket** (real-time,
+never stale), falling back to the saved snapshot when the app is closed. Same engine,
+same query syntax:
 
 ```bash
 swift build -c release   # builds mvfind alongside the app
 mvfind report ext:pdf size:>1mb
 mvfind "*.swift" --wildcard --sort size --limit 20
+mvfind 'ext:jpg dm:month' --sort date --limit 20
 mvfind config --path --count
-# flags: [--fuzzy|--wildcard] [--path] [--sort name|size|date|relevance] [--limit N] [-0] [--count]
+mvfind '*.log' -0 | xargs -0 rm        # NUL-delimited, pipe to other tools
+# flags: [--fuzzy|--wildcard] [--path]
+#        [--sort name|path|size|date|created|relevance|runcount]
+#        [--limit N] [-0] [--count] [--live|--snapshot] [--json]
 ```
+
+`--live` forces the socket (errors if the app isn't running), `--snapshot` forces the
+saved file, `--json` emits structured results. `--sort runcount` ranks the files you
+open most/recently first.
+
+## AI / MCP — give an agent instant search over your Mac
+
+`mv-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that
+exposes a `search` tool backed by the same live index, so an AI assistant (Claude
+Desktop, IDE agents, …) can find any file on your Mac — hidden and system files
+included — in milliseconds. Register it:
+
+```jsonc
+// ~/Library/Application Support/Claude/claude_desktop_config.json
+{ "mcpServers": { "maverything": { "command": "/usr/local/bin/mv-mcp" } } }
+```
+
+A ready-to-share Claude **skill** lives at
+`packaging/claude-skill/maverything-search/` for agents that call `mvfind` as a shell
+command instead.
 
 ## Development
 
 ```
 Sources/
-  MaverythingCore/   # engine: enumerator, index, search, FSEvents watcher, snapshot
+  MaverythingCore/   # engine: enumerator, index, search, FSEvents watcher, snapshot, socket server
   Maverything/       # the app: SwiftUI shell + AppKit NSTableView results
-  mvfind/            # CLI over the same core + snapshot
+  mvfind/            # CLI over the live socket (snapshot fallback)
+  mv-mcp/            # Model Context Protocol server (search tool over the live index)
   mvtest/            # headless engine test/benchmark harness
-  mvsim/             # simulation harness
+  mvsim/             # simulation harness (180+ scenarios)
 ```
 
 `mvsim` builds a synthetic file tree and drives the engine through dozens of
@@ -166,4 +196,8 @@ swift run -c release mvsim
 
 ## License
 
-TBD by the author. Until a license is added, all rights reserved.
+**GPL-3.0** — see [LICENSE](LICENSE). Free to use, study, share, and modify; if you
+distribute a modified version you must share your source under the same license. This
+keeps Maverything (and any fork) open, which matters for a tool that asks for Full Disk
+Access: the code is auditable, and you can verify for yourself that it never sends
+anything anywhere.

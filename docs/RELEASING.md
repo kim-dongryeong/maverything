@@ -1,6 +1,9 @@
 # Releasing Maverything
 
-Short checklist for cutting a release.
+Short checklist for cutting a release. Licensed **GPL-3.0** (`LICENSE`). The DMG
+bundles the `mvfind` and `mv-mcp` helpers in `Maverything.app/Contents/Helpers/`
+(build.sh copies them); the Homebrew cask symlinks those onto PATH. Never commit
+signing/notarization/Sparkle keys — they're gitignored and live outside the repo.
 
 1. **Bump the version** in `Resources/Info.plist`:
    - `CFBundleShortVersionString` (marketing version, e.g. `0.2`)

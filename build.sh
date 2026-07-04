@@ -32,8 +32,18 @@ echo "▸ slices: $(lipo -archs "$BIN" 2>/dev/null || echo native)"
 
 echo "▸ assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 cp "$BIN" "$APP/Contents/MacOS/Maverything"
+# Bundle the CLI + MCP helpers so a Homebrew cask can symlink them onto PATH.
+if [ "$ARCH" = "universal" ]; then
+    HELPDIR=".build/apple/Products/$(tr '[:lower:]' '[:upper:]' <<< "${CONFIG:0:1}")${CONFIG:1}"
+else
+    HELPDIR=".build/$CONFIG"
+fi
+for tool in mvfind mv-mcp; do
+    [ -x "$HELPDIR/$tool" ] && cp "$HELPDIR/$tool" "$APP/Contents/Helpers/$tool" || \
+        echo "  (note: $tool not built — run swift build -c $CONFIG)"
+done
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/" || true
 printf 'APPL????' > "$APP/Contents/PkgInfo"

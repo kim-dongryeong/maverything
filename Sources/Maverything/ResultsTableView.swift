@@ -627,17 +627,28 @@ struct ResultsTableView: NSViewRepresentable {
                 }
                 return found ? attr : nil
             case .fuzzy:
-                let lowerQ = Array(q.lowercased())
-                var qi = 0
-                var s = name.startIndex
-                while s < name.endIndex && qi < lowerQ.count {
-                    if String(name[s]).lowercased().first == lowerQ[qi] {
-                        attr.addAttributes(hl, range: NSRange(s..<name.index(after: s), in: name))
-                        qi += 1
+                // The engine matches a multi-term fuzzy query as INDEPENDENT subsequences
+                // (AND), so highlight each term separately. Walking the whole query —
+                // including the space — as one subsequence never completes on a spaceless
+                // name, which is why "xcode a" lost its highlight (user-reported).
+                let terms = q.split(separator: " ").map(String.init)
+                    .filter { !$0.contains(":") && !$0.hasPrefix("-") && !$0.hasPrefix("!") && !$0.isEmpty }
+                guard !terms.isEmpty else { return nil }
+                var anyHit = false
+                for term in terms {
+                    let lowerT = Array(term.lowercased())
+                    var qi = 0
+                    var s = name.startIndex
+                    while s < name.endIndex && qi < lowerT.count {
+                        if String(name[s]).lowercased().first == lowerT[qi] {
+                            attr.addAttributes(hl, range: NSRange(s..<name.index(after: s), in: name))
+                            qi += 1
+                        }
+                        s = name.index(after: s)
                     }
-                    s = name.index(after: s)
+                    if qi == lowerT.count { anyHit = true }
                 }
-                return qi == lowerQ.count ? attr : nil
+                return anyHit ? attr : nil
             default:
                 return nil   // wildcard / regex: no inline highlight
             }

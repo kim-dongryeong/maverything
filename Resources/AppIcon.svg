@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Maverything app icon — indigo→navy squircle, white magnifier over 3 result bars -->
+  <defs>
+    <linearGradient id="mvBg" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#636991"/>
+      <stop offset="0.5" stop-color="#373C5B"/>
+      <stop offset="1" stop-color="#1F212E"/>
+    </linearGradient>
+    <filter id="mvShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="20" flood-color="#0A0A16" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="180" fill="url(#mvBg)" filter="url(#mvShadow)"/>
+  <g fill="#BBBDC8">
+    <rect x="343" y="368" width="213" height="34" rx="17"/>
+    <rect x="343" y="436" width="173" height="34" rx="17"/>
+    <rect x="343" y="504" width="133" height="34" rx="17"/>
+  </g>
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+    <circle cx="448" cy="448" r="196" stroke-width="61"/>
+    <line x1="600" y1="600" x2="770" y2="778" stroke-width="60"/>
+  </g>
+</svg>

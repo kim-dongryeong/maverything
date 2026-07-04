@@ -65,7 +65,8 @@ struct PreviewPane: View {
                 Image(nsImage: thumb).resizable().scaledToFit().padding(8)
                     .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
             } else if let info {
-                Image(nsImage: IconCache.icon(for: info.path, isDir: info.kind == "Folder"))
+                Image(nsImage: IconCache.icon(for: info.path,
+                                              isDir: model.selectedID.map { model.isDir($0) } ?? false))
                     .resizable().scaledToFit().frame(width: 64, height: 64)
                     .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
             }

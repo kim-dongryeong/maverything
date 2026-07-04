@@ -55,8 +55,8 @@ struct GridResults: View {
         .onAppear {
             // Carry over the selection from the previous layout; only steal focus
             // when there IS one (cold launch: selectedID nil → field keeps focus).
-            if let sel = selected, ids.contains(sel) { focused = true }
-            else if selected != nil { model.selectedID = ids.first; focused = true }
+            if selected != nil, !ids.contains(selected!) { model.selectedID = ids.first }
+            if selected != nil { DispatchQueue.main.async { focused = true } }
         }
         .onChange(of: model.focusResultsNonce) {           // ↓ / Enter from the field
             focused = true

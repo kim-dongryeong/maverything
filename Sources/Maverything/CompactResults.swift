@@ -63,8 +63,8 @@ struct CompactResults: View {
             }
             .onAppear {                       // selection carried over from another layout
                 if let s = model.selectedID, ids.contains(s) {
-                    listFocused = true
                     proxy.scrollTo(s, anchor: .center)
+                    DispatchQueue.main.async { listFocused = true }   // focus lands post-attach
                 }
             }
         }
@@ -264,7 +264,11 @@ enum IconCache {
         if key == "\u{1}dir" || key == "\u{1}file" {
             img = genericIcon(dir: isDir)
         } else {
-            img = NSWorkspace.shared.icon(forFile: path)
+            // BY TYPE, never by path: icon(forFile:) here let one mislabeled row
+            // (a DIRECTORY passed with isDir=false, e.g. via a localized kind-string
+            // check) poison the shared ext key with a FOLDER icon for every jpg.
+            img = UTType(filenameExtension: key).map { NSWorkspace.shared.icon(for: $0) }
+                  ?? genericIcon(dir: false)
         }
         img.size = NSSize(width: 16, height: 16)
         lock.lock()

@@ -725,6 +725,10 @@ struct ResultsTableView: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 guard let self, let tv = self.tableView else { return }
                 self.selectionPublishPending = false
+                // Layout switch tears the table down and AppKit emits a final
+                // empty selectionDidChange — publishing THAT wiped selectedID,
+                // which is exactly what the other layouts need to inherit.
+                if tv.window == nil { return }
                 self.publishSelection(tv)
             }
         }
@@ -839,9 +843,16 @@ struct ResultsTableView: NSViewRepresentable {
 
         // MARK: - Actions
 
-        func restoreSelectionFromModel() {
-            guard let tv = tableView, let sel = model.selectedID,
-                  let row = ids.firstIndex(of: sel) else { return }
+        func restoreSelectionFromModel(attempt: Int = 0) {
+            guard let tv = tableView, let sel = model.selectedID else { return }
+            guard tv.window != nil, let row = ids.firstIndex(of: sel) else {
+                if attempt < 4 {                 // ids/window can lag one runloop tick
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                        self?.restoreSelectionFromModel(attempt: attempt + 1)
+                    }
+                }
+                return
+            }
             tv.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             tv.scrollRowToVisible(row)
             tv.window?.makeFirstResponder(tv)   // arrows work immediately

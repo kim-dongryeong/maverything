@@ -61,6 +61,14 @@ if [ "$SIGN_ID" != "-" ] && [ -f "$SIGNKC" ]; then
     [ -n "$H" ] && SIGN_ID="$H"
     KCARG=(--keychain "$SIGNKC")
 fi
+# Nested helper executables (Contents/Helpers/*) are auxiliary Mach-O and must be
+# signed BEFORE the outer bundle — codesign refuses to seal a bundle that contains
+# an unsigned nested code object.
+for helper in "$APP/Contents/Helpers/"*; do
+    [ -f "$helper" ] || continue
+    codesign --force --options runtime --sign "$SIGN_ID" "${KCARG[@]}" "$helper" 2>&1 | sed 's/^/   /' || \
+    codesign --force --sign "$SIGN_ID" "${KCARG[@]}" "$helper" 2>&1 | sed 's/^/   /' || true
+done
 codesign --force --options runtime \
     --entitlements Resources/Maverything.entitlements \
     --sign "$SIGN_ID" "${KCARG[@]}" \

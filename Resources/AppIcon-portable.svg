@@ -29,12 +29,12 @@
       <feGaussianBlur in="irim" stdDeviation="4" result="irimb"/>
       <feFlood xmlns="http://www.w3.org/2000/svg" result="icol" flood-opacity="0.55" flood-color="#0A4A3E"/>
       <feComposite in="icol" in2="irimb" operator="in" result="lowlight"/>
-      <!-- emboss highlight: bright specular along the top edges -->
-      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="beb"/>
-      <feSpecularLighting in="beb" surfaceScale="6" specularConstant="0.95" specularExponent="22" lighting-color="#ffffff" result="spec">
-        <feDistantLight azimuth="235" elevation="58"/>
-      </feSpecularLighting>
-      <feComposite in="spec" in2="SourceAlpha" operator="in" result="specClip"/>
+      <!-- emboss highlight (portable, no feSpecularLighting): bright rim on the upper-left -->
+      <feOffset in="SourceAlpha" dx="6" dy="6" result="hoff"/>
+      <feComposite in="SourceAlpha" in2="hoff" operator="out" result="hrim"/>
+      <feGaussianBlur in="hrim" stdDeviation="4" result="hrimb"/>
+      <feFlood flood-color="#FFFFFF" flood-opacity="0.85" result="hcol"/>
+      <feComposite in="hcol" in2="hrimb" operator="in" result="specClip"/>
       <feMerge>
         <feMergeNode in="shadow"/>
         <feMergeNode in="glow"/>

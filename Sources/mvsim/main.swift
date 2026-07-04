@@ -658,9 +658,38 @@ do {
     check("queryserver: concurrent connections both answered",
           (a?["ok"] as? Bool) == true && (b?["ok"] as? Bool) == true)
 
+    // SIGPIPE regression: a client that sends a request then hangs up WITHOUT reading
+    // must not kill the server (a write to the closed socket would raise SIGPIPE, whose
+    // default action terminates the process — this killed the app when mvfind connected).
+    func fireAndClose(_ json: String) {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0); if fd < 0 { return }
+        var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
+        let pb = Array(sockPath.utf8)
+        withUnsafeMutablePointer(to: &addr.sun_path) { p in
+            p.withMemoryRebound(to: UInt8.self, capacity: pb.count) { d in
+                for (i, b) in pb.enumerated() { d[i] = b } } }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        if withUnsafePointer(to: &addr, { ap in ap.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, len) } }) == 0 {
+            var l = json; l.append("\n")
+            _ = Array(l.utf8).withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        }
+        close(fd)   // hang up immediately, before reading the response
+    }
+    for _ in 0..<5 { fireAndClose("{\"v\":1,\"q\":\"report\",\"limit\":100}") }
+    usleep(50_000)   // let the server's writes hit the closed sockets
+    check("queryserver: client hang-up before read does NOT kill the server (SIGPIPE ignored)",
+          (roundTrip("{\"v\":1,\"q\":\"data\"}")?["ok"] as? Bool) == true)
+
     server.stop()
-    check("queryserver: stop() removes the socket", !fm.fileExists(atPath: sockPath))
-    check("queryserver: connect fails after stop", roundTrip("{\"v\":1,\"q\":\"x\"}") == nil)
+    check("queryserver: connect fails after stop (listener closed)", roundTrip("{\"v\":1,\"q\":\"x\"}") == nil)
+    // a fresh server unlink-before-binds, so restart works even with the old file present
+    let server2 = QueryServer(index: index, runStats: nil, socketPath: sockPath, indexing: { false })
+    check("queryserver: restart rebinds cleanly over a leftover socket file", server2.start())
+    if let r = roundTrip("{\"v\":1,\"q\":\"report\"}") {
+        check("queryserver: restarted server answers", (r["ok"] as? Bool) == true)
+    } else { check("queryserver: restarted server answers", false) }
+    server2.stop()
 }
 
 // ---- RunHistory frecency (Run Count sort + relevance boost) ----

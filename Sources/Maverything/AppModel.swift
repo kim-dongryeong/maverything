@@ -223,6 +223,7 @@ final class AppModel: ObservableObject {
     private var started = false
     private var currentEnumerator: FileEnumerator?
     private var indexGen = 0
+    private var queryServer: QueryServer?   // AF_UNIX server: mvfind/MCP live queries
     private let watcher = FSWatcher()
     private var reconciler: Reconciler?
     private let reconcileQueue = DispatchQueue(label: "maverything.reconcile", qos: .utility)
@@ -266,6 +267,7 @@ final class AppModel: ObservableObject {
         ) { [weak self] _ in
             self?.saveSnapshot(sync: true)
             AppModel.sharedRunStats.flush()   // persist run history before exit
+            self?.queryServer?.stop()         // remove the socket
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(appBecameActive),
@@ -329,6 +331,15 @@ final class AppModel: ObservableObject {
         engine.hideHidden = !showHidden
         engine.wholeNameWildcards = wildcardWholeName
         engine.runStats = AppModel.sharedRunStats          // Run Count sort + relevance frecency
+
+        // Live query server for mvfind / a future MCP bridge: same engine over a
+        // dedicated instance so socket options never mutate the app's engine. Failure
+        // is non-fatal (mvfind falls back to the snapshot).
+        let qs = QueryServer(index: index, runStats: AppModel.sharedRunStats,
+                             socketPath: QueryServer.defaultSocketPath(),
+                             indexing: { [weak self] in self?.isIndexing ?? false })
+        qs.start()
+        queryServer = qs
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess

@@ -47,6 +47,11 @@ public final class QueryServer: @unchecked Sendable {
     @discardableResult
     public func start() -> Bool {
         guard listenFD < 0 else { return true }
+        // A write to a socket the client already closed raises SIGPIPE, whose default
+        // action TERMINATES the process — a client that reads its response and hangs up
+        // would otherwise kill the whole app. Ignore it process-wide (also SO_NOSIGPIPE
+        // per-connection below); our write loop already handles the EPIPE return.
+        signal(SIGPIPE, SIG_IGN)
         let dir = (socketPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
@@ -76,13 +81,19 @@ public final class QueryServer: @unchecked Sendable {
         listenFD = fd
         running = true
         acceptQueue.async { [weak self] in self?.acceptLoop() }
+        if ProcessInfo.processInfo.environment["MV_QS_DEBUG"] == "1" {
+            FileHandle.standardError.write(Data("QueryServer: listening on \(socketPath)\n".utf8))
+        }
         return true
     }
 
     public func stop() {
         running = false
         if listenFD >= 0 { close(listenFD); listenFD = -1 }
-        unlink(socketPath)
+        // Deliberately DON'T unlink here: during a rapid restart an old instance's
+        // teardown could otherwise remove a NEW instance's freshly-bound socket. The
+        // next start() unlink-before-binds, so a leftover file is harmless (a connect
+        // to it gets ECONNREFUSED → mvfind cleanly falls back to the snapshot).
     }
 
     // MARK: - accept loop
@@ -111,6 +122,8 @@ public final class QueryServer: @unchecked Sendable {
 
     private func handle(_ cfd: Int32) {
         defer { close(cfd) }
+        var one: Int32 = 1
+        setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         var tv = timeval(tv_sec: Int(cfg.connectionTimeout), tv_usec: 0)
         setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))

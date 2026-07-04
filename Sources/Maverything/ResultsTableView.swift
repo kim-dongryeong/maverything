@@ -371,6 +371,12 @@ struct ResultsTableView: NSViewRepresentable {
         table.addTableColumn(col)
     }
 
+    /// Row image view that remembers which path it should be showing — an async
+    /// thumbnail lands ONLY if the cell hasn't been reused for another row since.
+    final class MVRowImageView: NSImageView {
+        var expectedPath: String = ""
+    }
+
     static let previewableExts: Set<String> = [
         "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "icns",
         "pdf", "mov", "mp4", "m4v", "avi", "mkv", "webm"]
@@ -458,15 +464,25 @@ struct ResultsTableView: NSViewRepresentable {
                     cell.textField?.attributedStringValue = base
                 }
                 // Finder's "Show icon preview": tiny QL thumbnails for media rows
-                // (Everything's Details view shows only icons — this one's for Finder
-                // muscle memory). Cached sync peek; miss = icon now, refresh when ready.
+                // (Everything's Details view shows only icons — this is Finder
+                // muscle memory). The async result is written STRAIGHT into the
+                // image view (no row-reload round trip — that pipeline dropped
+                // updates and rows kept their generic icons); expectedPath guards
+                // against cell reuse racing the generation.
                 var rowIcon = IconCache.icon(for: r.path, isDir: r.isDir,
                                              isLink: r.isLink, onReady: refreshName)
+                (cell.imageView as? MVRowImageView)?.expectedPath = r.path
                 if model.iconPreview, !r.isDir, ResultsTableView.previewableExts.contains(r.ext.lowercased()) {
                     if let t = ThumbCache.shared.cachedSync(for: r.path, side: 32) {
                         rowIcon = t
                     } else {
-                        ThumbCache.shared.prefetch(for: r.path, side: 32, onReady: refreshName)
+                        let path = r.path
+                        let iv = cell.imageView as? MVRowImageView
+                        Task { @MainActor [weak iv] in
+                            guard let t = await ThumbCache.shared.thumbnail(for: path, side: 32),
+                                  let iv, iv.expectedPath == path else { return }
+                            iv.image = t
+                        }
                     }
                 }
                 cell.imageView?.image = rowIcon
@@ -643,7 +659,7 @@ struct ResultsTableView: NSViewRepresentable {
             cell.addSubview(tf)
             cell.textField = tf
             if colID == "name" {
-                let iv = NSImageView()
+                let iv = MVRowImageView()
                 iv.translatesAutoresizingMaskIntoConstraints = false
                 cell.addSubview(iv); cell.imageView = iv
                 NSLayoutConstraint.activate([

@@ -860,7 +860,8 @@ struct ResultsTableView: NSViewRepresentable {
         func sortColumnKey(_ k: SortKey) -> String? {
             switch k {
             case .name: return "name";  case .path: return "path";  case .size: return "size"
-            case .dateModified: return "date"; case .dateCreated: return "created"; case .relevance: return nil
+            case .dateModified: return "date"; case .dateCreated: return "created"
+            case .relevance, .runCount: return nil   // no column header for computed sorts
             }
         }
 

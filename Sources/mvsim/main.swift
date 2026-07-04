@@ -583,6 +583,72 @@ check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
       && corruptV5Idx.count == 1
       && corruptV5Idx.name(0) == "/sentinel5")
 
+// ---- RunHistory frecency (Run Count sort + relevance boost) ----
+do {
+    let rroot = root + "/runAB"
+    mkdir(rroot)
+    for p in ["alpha_report.txt", "beta_report.txt", "gamma_report.txt",
+              "delta_report.txt", "sub/nested_report.txt"] { write("runAB/" + p, bytes: 4) }
+    let rIdx = FileIndex()
+    _ = FileEnumerator(index: rIdx).crawl(roots: [rroot])
+    rIdx.buildLiveIndexes()
+    let rStats = RunStats(url: nil, cap: 4)     // in-memory (no persistence in tests)
+    let rEng = SearchEngine(index: rIdx)
+    rEng.runStats = rStats
+    let rnow = now
+    // idFor: paths resolve to current ids (grouped by parent, verified lookup)
+    let dPath = rroot + "/delta_report.txt"
+    let nestedPath = rroot + "/sub/nested_report.txt"
+    let resolved = rIdx.resolveIds(forPaths: [dPath, nestedPath, rroot + "/nonexistent.txt"])
+    check("runstats: resolveIds maps real paths to ids, drops missing",
+          resolved[dPath] != nil && resolved[nestedPath] != nil
+          && resolved.count == 2 && rIdx.name(Int(resolved[dPath]!)) == "delta_report.txt")
+
+    // record opens: delta most, then gamma; runCount sort floats them to the front
+    for _ in 0..<5 { rStats.record(path: dPath, now: rnow) }
+    for _ in 0..<2 { rStats.record(path: rroot + "/gamma_report.txt", now: rnow) }
+    rEng.invalidate()
+    let rc = rEng.search("report", sortKey: .runCount, ascending: false, limit: 10, now: rnow)
+                 .ids.map { rIdx.name(Int($0)) }
+    check("runcount: most-run file is first", rc.first == "delta_report.txt", rc.joined(separator: ","))
+    check("runcount: second-most-run is second", rc.count > 1 && rc[1] == "gamma_report.txt", rc.joined(separator: ","))
+    check("runcount: untracked files keep name order after tracked",
+          Array(rc.suffix(3)) == ["alpha_report.txt", "beta_report.txt", "nested_report.txt"],
+          rc.joined(separator: ","))
+    // runCount must not DROP or DUPLICATE any match vs a plain name search
+    let plainSet = Set(rEng.search("report", sortKey: .name, limit: 10, now: rnow).ids)
+    let rcSet = Set(rEng.search("report", sortKey: .runCount, limit: 10, now: rnow).ids)
+    check("runcount: same result set as name sort (no drops/dupes)", plainSet == rcSet)
+
+    // relevance boost: a heavily-run file outranks an equal-name-score peer
+    let relIds = rEng.search("report", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 10, now: rnow)
+                    .ids.map { rIdx.name(Int($0)) }
+    check("relevance: frecency boost lifts the most-run file toward the top",
+          relIds.prefix(2).contains("delta_report.txt"), relIds.joined(separator: ","))
+
+    // frecency decay: an old open is worth less than a fresh one
+    let sOld = RunStats.frecency(count: 10, lastRun: rnow - 60 * 86_400, now: rnow)
+    let sNew = RunStats.frecency(count: 3, lastRun: rnow, now: rnow)
+    check("frecency: recent few can outrank stale many (decay works)", sNew > sOld,
+          "old=\(String(format: "%.2f", sOld)) new=\(String(format: "%.2f", sNew))")
+
+    // cap prunes lowest-frecency entries
+    let capped = RunStats(url: nil, cap: 2)
+    capped.record(path: "/a.txt", now: rnow); capped.record(path: "/a.txt", now: rnow)   // score 2
+    capped.record(path: "/b.txt", now: rnow)                                             // score 1
+    capped.record(path: "/c.txt", now: rnow)                                             // score 1 → evicts a loser
+    check("runstats: cap prunes to size, keeps highest frecency", capped.trackedCount == 2
+          && capped.count(forPath: "/a.txt") == 2)
+
+    // clear wipes history
+    rStats.clear(); rEng.invalidate()
+    let afterClear = rEng.search("report", sortKey: .runCount, ascending: false, limit: 10, now: rnow)
+                        .ids.map { rIdx.name(Int($0)) }
+    check("runstats: clear resets to plain name order",
+          afterClear == ["alpha_report.txt", "beta_report.txt", "delta_report.txt",
+                         "gamma_report.txt", "nested_report.txt"], afterClear.joined(separator: ","))
+}
+
 // ---- character bloom prefilter: A/B equivalence (gate ON must equal brute scan) ----
 // The gate is a NECESSARY-condition prefilter; if it ever drops a real match that's a
 // false negative. Build a controlled tree, then assert the gated engine returns EXACTLY

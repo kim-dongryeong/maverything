@@ -128,7 +128,7 @@ struct ShortcutsSheet: View {
         ]),
         ("App", [
             ("⌘1 – ⌘4", "Table · Compact · Two-Pane · Icon Grid"),
-            ("⌃1 – ⌃6", "sort: Name · Path · Size · Modified · Created · Relevance (again = flip)"),
+            ("⌃1 – ⌃7", "sort: Name · Path · Size · Modified · Created · Relevance · Run Count (again = flip)"),
             ("⌃0", "toggle ascending ↔ descending"),
             ("⌥⌘R", "reindex now"),
             ("⌘,", "settings"),

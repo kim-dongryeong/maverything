@@ -46,6 +46,7 @@ while i < args.count {
         case "size": sort = .size
         case "date", "dm": sort = .dateModified
         case "relevance", "rel": sort = .relevance
+        case "runcount", "run", "frecency": sort = .runCount
         case "path": sort = .path
         default: sort = .name
         }
@@ -85,14 +86,14 @@ if let benchN = ProcessInfo.processInfo.environment["MVFIND_BENCH"].flatMap(Int.
     }
     for i in 1...benchN {
         let b = engine.search(query, mode: mode, scope: scope, sortKey: sort,
-                              ascending: sort != .relevance, limit: limit, now: now)
+                              ascending: sort != .relevance && sort != .runCount, limit: limit, now: now)
         FileHandle.standardError.write(Data(String(
             format: "bench[%d]: %d matches in %.2f ms\n", i, b.total, b.queryMillis).utf8))
     }
     exit(0)
 }
 let r = engine.search(query, mode: mode, scope: scope, sortKey: sort,
-                      ascending: sort != .relevance, limit: countOnly ? 5_000_000 : limit, now: now)
+                      ascending: sort != .relevance && sort != .runCount, limit: countOnly ? 5_000_000 : limit, now: now)
 
 if countOnly {
     print(r.total)

@@ -265,6 +265,7 @@ final class AppModel: ObservableObject {
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.saveSnapshot(sync: true)
+            AppModel.sharedRunStats.flush()   // persist run history before exit
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(appBecameActive),
@@ -327,6 +328,7 @@ final class AppModel: ObservableObject {
         engine.foldersFirst = foldersFirst
         engine.hideHidden = !showHidden
         engine.wholeNameWildcards = wildcardWholeName
+        engine.runStats = AppModel.sharedRunStats          // Run Count sort + relevance frecency
 
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
         showOnboarding = !hasFullDiskAccess
@@ -870,7 +872,17 @@ final class AppModel: ObservableObject {
     /// Services (launch .app, open file/package with its app). Plain
     /// NSWorkspace.open on a .framework errors — com.apple.framework has no
     /// registered opener even though Finder happily browses it.
+    /// Shared run-history store (Everything's Run Count / frecency). Static so the
+    /// static `finderOpen` — the single funnel for every open action across all four
+    /// layouts — records into it without threading a model reference to each caller.
+    static let sharedRunStats: RunStats = {
+        let url = Snapshot.defaultURL().deletingLastPathComponent()
+            .appendingPathComponent("runstats.json")
+        return RunStats(url: url)
+    }()
+
     static func finderOpen(_ path: String) {
+        sharedRunStats.record(path: path, now: Date().timeIntervalSince1970)   // count this "run"
         var st = stat()
         let isDir = stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
         if isDir {
@@ -885,6 +897,13 @@ final class AppModel: ObservableObject {
     }
 
     func reindex() { beginIndexing() }
+
+    /// Wipe Everything-style Run Count history and refresh the current results.
+    func clearRunHistory() {
+        AppModel.sharedRunStats.clear()
+        engine.invalidate()
+        runSearch()
+    }
 
     func setIncludeCloud(_ on: Bool) {
         guard on != includeCloud else { return }

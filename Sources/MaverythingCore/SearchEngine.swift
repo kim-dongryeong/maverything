@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 import UniformTypeIdentifiers
 
-public enum SortKey: Int, Sendable { case name, path, size, dateModified, dateCreated, relevance }
+// `runCount` MUST stay last — rawValue is persisted in UserDefaults/SavedSearch.
+public enum SortKey: Int, Sendable { case name, path, size, dateModified, dateCreated, relevance, runCount }
 public enum SearchScope: Int, Sendable { case nameOnly, fullPath }
 
 public struct SearchResults: Sendable {
@@ -61,6 +62,44 @@ public final class SearchEngine: @unchecked Sendable {
     /// exclude-hidden). The index always stays complete.
     public var hideHidden = false
 
+    /// Run-history provider (Everything's Run Count / frecency). When set, the
+    /// `.runCount` sort floats most-run-first and `.relevance` gets a frecency boost.
+    public var runStats: RunStats?
+    // Resolved tracked-path → id → frecency-score, cached by (index mutationGen,
+    // runStats.generation): ids change on reindex, scores change on every open, so
+    // both must key the cache (Codex review: mutationGen alone would go stale on a
+    // buildLiveIndexes that doesn't bump the mutation counter).
+    private let frecencyLock = NSLock()
+    private var frecencyCache: [Int32: Double] = [:]
+    private var frecencyCacheKey: (gen: Int, runGen: Int, now: Int) = (-1, -1, -1)
+
+    /// tracked id → frecency score for the current index generation (empty if no runStats).
+    private func frecencyMap(now: TimeInterval) -> [Int32: Double] {
+        guard let rs = runStats else { return [:] }
+        let gen = index.withReadLock { index.mutationGenLocked }
+        let runGen = rs.generation
+        let nowBucket = Int(now / 3600)   // re-decay at most hourly (cache-friendly)
+        frecencyLock.lock()
+        if frecencyCacheKey == (gen, runGen, nowBucket) {
+            let c = frecencyCache; frecencyLock.unlock(); return c
+        }
+        frecencyLock.unlock()
+        let scored = rs.scoredPaths(now: now)            // path → score
+        let resolved = index.resolveIds(forPaths: Array(scored.keys))   // path → id
+        var map = [Int32: Double](minimumCapacity: resolved.count)
+        for (path, id) in resolved { if let s = scored[path], s > 0 { map[id] = s } }
+        frecencyLock.lock()
+        frecencyCache = map; frecencyCacheKey = (gen, runGen, nowBucket)
+        frecencyLock.unlock()
+        return map
+    }
+
+    /// Sort key used for the underlying SCAN order: relevance and runCount both scan
+    /// in name order, then reorder by score / frecency afterward.
+    @inline(__always) private func scanOrderKey(_ k: SortKey) -> SortKey {
+        (k == .relevance || k == .runCount) ? .name : k
+    }
+
     /// Everything's "Match whole filename when using wildcards" (default ON there
     /// and here). OFF = a wildcard pattern matches ANYWHERE in the name: mic?o
     /// behaves like *mic?o* and now finds "microsoft". Implemented by star-
@@ -78,11 +117,20 @@ public final class SearchEngine: @unchecked Sendable {
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
-        let needFull = post != nil || foldersFirst || hideHidden   // pre-cap reorder/filter needs the full set
+        // Run-history: resolve tracked paths→ids once (cached) for the frecency boost
+        // (.relevance) and the run-count reorder (.runCount).
+        let frecency: [Int32: Double] = (sortKey == .relevance || sortKey == .runCount)
+            ? frecencyMap(now: now) : [:]
+        let needFull = post != nil || foldersFirst || hideHidden || sortKey == .runCount
         let innerLimit = needFull ? 5_000_000 : limit
+        // Run Count scans in a STABLE name-ascending base; the `ascending` flag then
+        // orders only the tracked prefix (most-run ↔ least), leaving the untracked tail
+        // in a fixed a→z order rather than flipping it with the frecency direction.
+        let innerAscending = sortKey == .runCount ? true : ascending
         var res = index.withReadLock {
             _search(query, mode: mode, scope: scope, sortKey: sortKey,
-                    ascending: ascending, limit: innerLimit, now: now, scopeRoot: scopeRoot)
+                    ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
+                    frecency: frecency)
         }
         if let p = post {
             let clock = ContinuousClock(); let t0 = clock.now
@@ -100,6 +148,23 @@ public final class SearchEngine: @unchecked Sendable {
             let kept = res.ids.filter { Int($0) < hid.count && !hid[Int($0)] }
             let capped = kept.count > limit ? Array(kept[0..<limit]) : kept
             res = SearchResults(ids: capped, total: kept.count, truncated: kept.count > capped.count,
+                                queryMillis: res.queryMillis)
+        }
+        if sortKey == .runCount {
+            // Everything's Run Count sort: tracked (opened-before) matches float to the
+            // front in frecency order; everything else keeps the underlying name order.
+            // A stable partition on the FULL set (needFull above guaranteed no pre-cap
+            // loss — Codex review), then cap. `ascending` flips most-run-first ↔ least.
+            var tracked: [(id: Int32, score: Double)] = []
+            var rest: [Int32] = []
+            rest.reserveCapacity(res.ids.count)
+            for id in res.ids {
+                if let s = frecency[id] { tracked.append((id, s)) } else { rest.append(id) }
+            }
+            tracked.sort { ascending ? $0.score < $1.score : $0.score > $1.score }
+            var merged = tracked.map(\.id); merged.append(contentsOf: rest)
+            let capped = merged.count > limit ? Array(merged[0..<limit]) : merged
+            res = SearchResults(ids: capped, total: res.total, truncated: res.total > capped.count,
                                 queryMillis: res.queryMillis)
         }
         if foldersFirst {
@@ -238,7 +303,7 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func _search(_ query: String, mode: MatchMode, scope: SearchScope,
                          sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval,
-                         scopeRoot: Int32?) -> SearchResults {
+                         scopeRoot: Int32?, frecency: [Int32: Double] = [:]) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
         // Regex mode treats the whole query as one pattern (no term-splitting).
@@ -255,7 +320,7 @@ public final class SearchEngine: @unchecked Sendable {
 
         // empty query → return the chosen order directly (unless scoped to a folder)
         if parsed.isEmpty && scopeRoot == nil {
-            let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+            let order = orderArray(for: scanOrderKey(sortKey))
             let n = order.count
             var out = [Int32](); out.reserveCapacity(min(limit, n))
             if ascending { for k in 0..<min(limit, n) { out.append(order[k]) } }
@@ -264,14 +329,18 @@ public final class SearchEngine: @unchecked Sendable {
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
 
-        // fast path: a single positive exact name term, no filters, no folder scope
-        if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive, scopeRoot == nil {
+        // fast path: a single positive exact name term, no filters, no folder scope.
+        // Skipped when a relevance-frecency boost is active, so the boost (applied in
+        // `general`'s scorer) actually reaches an exact single-term relevance query.
+        if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive, scopeRoot == nil,
+           !(sortKey == .relevance && !frecency.isEmpty) {
             return fastExact(needle: needle, sortKey: sortKey, ascending: ascending,
                              limit: limit, start: start, clock: clock)
         }
 
         return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
-                       limit: limit, start: start, clock: clock, scopeRoot: scopeRoot)
+                       limit: limit, start: start, clock: clock, scopeRoot: scopeRoot,
+                       frecency: frecency)
     }
 
     /// Walk parent links up from `id`; true if `root` is an ancestor (or is `id`).
@@ -598,7 +667,7 @@ public final class SearchEngine: @unchecked Sendable {
             }}}}}}}}
             full = res
         } else {
-            let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+            let order = orderArray(for: scanOrderKey(sortKey))
             let n = order.count
             let nChunks = max(1, min(workerCount, n / 16_000 + 1))
             let chunkSize = (n + nChunks - 1) / nChunks
@@ -684,7 +753,7 @@ public final class SearchEngine: @unchecked Sendable {
             return SearchResults(ids: [], total: 0, truncated: false,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
-        let order = orderArray(for: sortKey == .relevance ? .name : sortKey)
+        let order = orderArray(for: scanOrderKey(sortKey))
         let n = order.count
         let usePath = (scope == .fullPath)
         let nChunks = max(1, min(workerCount, n / 8_000 + 1))
@@ -726,9 +795,13 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func general(parsed: ParsedQuery, mode: MatchMode, sortKey: SortKey, ascending: Bool,
                          limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
-                         scopeRoot: Int32?) -> SearchResults {
+                         scopeRoot: Int32?, frecency: [Int32: Double] = [:]) -> SearchResults {
         let relevance = (sortKey == .relevance)
-        let order = orderArray(for: relevance ? .name : sortKey)
+        // Frecency boost for relevance: a run-history hit adds a bounded bump to the
+        // match score BEFORE the top-K prune (Codex review: boosting after prune is too
+        // late). log2 keeps it from swamping match quality; only touches matched ids.
+        let boostOn = relevance && !frecency.isEmpty
+        let order = orderArray(for: scanOrderKey(sortKey))
         let n = order.count
         let caseSensitive = parsed.caseSensitive
         // Flatten term bytes into one contiguous buffer + trivial refs so the hot loop
@@ -968,6 +1041,11 @@ public final class SearchEngine: @unchecked Sendable {
                                                                  notSuffixes: parsed.notSuffixes) { continue }
                         total += 1
                         if relevance {
+                            if boostOn, let f = frecency[Int32(id)], f > 0 {
+                                // +0..~120: log2(1+frecency) scaled; a daily-opened file
+                                // gets a firm bump without drowning a much better name match.
+                                score += Int(30.0 * log2(1.0 + f))
+                            }
                             pairs.append((id: Int32(id), score: Int32(clamping: score)))
                             if pairs.count > pruneThreshold {
                                 pairs.sort { a, b in
@@ -1153,7 +1231,7 @@ public final class SearchEngine: @unchecked Sendable {
             ids.sort { ct[Int($0)] != ct[Int($1)] ? ct[Int($0)] < ct[Int($1)] : $0 < $1 }
         case .path:
             break   // handled above by computePathOrder (unreachable; kept exhaustive)
-        case .name, .relevance:   // relevance uses name order as the scan base
+        case .name, .relevance, .runCount:   // relevance/runCount use name order as the scan base
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in

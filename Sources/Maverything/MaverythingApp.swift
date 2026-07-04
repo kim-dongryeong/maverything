@@ -107,7 +107,15 @@ struct ViewCommands: Commands {
         Binding(get: { model.sortKey == k },
                 set: { _ in
                     if model.sortKey == k { model.ascending.toggle() }
-                    else { model.sortKey = k }
+                    else {
+                        model.sortKey = k
+                        // "best first" computed sorts default to descending (most-run /
+                        // highest-relevance / biggest / newest at the top).
+                        if k == .runCount || k == .relevance || k == .size
+                            || k == .dateModified || k == .dateCreated {
+                            model.ascending = false
+                        }
+                    }
                 })
     }
 
@@ -131,6 +139,8 @@ struct ViewCommands: Commands {
                 .keyboardShortcut("5", modifiers: .control)
             Toggle("Sort by Relevance", isOn: sortToggle(.relevance))
                 .keyboardShortcut("6", modifiers: .control)
+            Toggle("Sort by Run Count", isOn: sortToggle(.runCount))
+                .keyboardShortcut("7", modifiers: .control)
             Toggle("Ascending", isOn: $model.ascending)
                 .keyboardShortcut("0", modifiers: .control)
             Divider()

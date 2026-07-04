@@ -239,6 +239,13 @@ struct SettingsView: View {
                 Picker("Row density", selection: $model.density) {
                     ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
                 }
+                HStack {
+                    Text("Run history")
+                    Spacer()
+                    Button("Clear Run History") { model.clearRunHistory() }
+                }
+                Text("Sort by Run Count (⌃7) floats files you open most/recently to the top; Relevance also uses it. This clears those counts.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Keyboard") {
                 Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)

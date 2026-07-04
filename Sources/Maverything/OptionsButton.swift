@@ -37,9 +37,9 @@ struct OptionsButton: NSViewRepresentable {
                   selected: UILayout.allCases.firstIndex(of: model.layout) ?? 0, cmd: "layout")
             // (Matching lives in the search bar's match menu + menu-bar Search —
             // the gear is VIEW & APP options only, so nothing is listed twice.)
-            group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance"],
+            group(m, "Sort by", ["Name", "Path", "Size", "Date Modified", "Date Created", "Relevance", "Run Count"],
                   selected: sortIndex(model.sortKey), cmd: "sort",
-                  keys: ["1", "2", "3", "4", "5", "6"], keyMask: [.control])
+                  keys: ["1", "2", "3", "4", "5", "6", "7"], keyMask: [.control])
             group(m, "Appearance", Appearance.allCases.map(\.label),
                   selected: Appearance.allCases.firstIndex(of: model.appearance) ?? 0, cmd: "appear")
             group(m, "Density", RowDensity.allCases.map(\.label),
@@ -76,7 +76,7 @@ struct OptionsButton: NSViewRepresentable {
 
         private func sortIndex(_ k: SortKey) -> Int {
             switch k { case .name: 0; case .path: 1; case .size: 2; case .dateModified: 3
-                       case .dateCreated: 4; case .relevance: 5 }
+                       case .dateCreated: 4; case .relevance: 5; case .runCount: 6 }
         }
 
         private func group(_ menu: NSMenu, _ title: String, _ items: [String], selected: Int, cmd: String,
@@ -115,8 +115,12 @@ struct OptionsButton: NSViewRepresentable {
             // so re-selecting the current value would needlessly reset scroll/selection.
             switch cmd {
             case "layout":  if model.layout != UILayout.allCases[i] { model.layout = UILayout.allCases[i] }
-            case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance][i]
-                            if model.sortKey != k { model.sortKey = k }
+            case "sort":    let k: SortKey = [.name, .path, .size, .dateModified, .dateCreated, .relevance, .runCount][i]
+                            if model.sortKey != k {
+                                model.sortKey = k
+                                if k == .runCount || k == .relevance || k == .size
+                                    || k == .dateModified || k == .dateCreated { model.ascending = false }
+                            }
             case "appear":  model.appearance = Appearance.allCases[i]
             case "density": model.density = RowDensity.allCases[i]
             case "thumb":   model.thumbSize = [112, 144, 192][i]

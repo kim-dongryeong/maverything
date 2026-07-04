@@ -354,6 +354,30 @@ public final class FileIndex: @unchecked Sendable {
         return i
     }
 
+    /// Resolve NFC file paths to their CURRENT entry ids (ids change on reindex,
+    /// paths don't). Grouped by parent directory so each parent's `name → id` map is
+    /// built ONCE (never a per-path child rescan — Codex review: large dirs would
+    /// blow up). Unresolved paths (deleted / moved / not indexed) are simply omitted.
+    public func resolveIds(forPaths paths: [String]) -> [String: Int32] {
+        rdlock(); defer { unlock() }
+        var byParent: [String: [(full: String, base: Substring)]] = [:]
+        for p in paths {
+            guard let slash = p.lastIndex(of: "/") else { continue }
+            let parent = slash == p.startIndex ? "/" : String(p[..<slash])
+            let base = p[p.index(after: slash)...]
+            if base.isEmpty { continue }
+            byParent[parent, default: []].append((p, base))
+        }
+        var out = [String: Int32](minimumCapacity: paths.count)
+        for (parent, kids) in byParent {
+            guard let pid = _dirIndexVerified(parent), let childIdxs = childrenOf[pid] else { continue }
+            var nameToId = [String: Int32](minimumCapacity: childIdxs.count)
+            for ci in childIdxs where !deleted[Int(ci)] { nameToId[_name(Int(ci))] = ci }
+            for (full, base) in kids where nameToId[String(base)] != nil { out[full] = nameToId[String(base)]! }
+        }
+        return out
+    }
+
     /// FNV-1a 64 over the NFC display-path bytes (the dirIndexByHash key).
     @inline(__always) private func pathHash(_ s: String) -> UInt64 {
         var h = fnvOffsetBasis

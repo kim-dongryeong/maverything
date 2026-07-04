@@ -101,8 +101,7 @@ struct CompactResults: View {
         var body: some View {
             let r = model.index.row(Int(id))
             return HStack(spacing: 8) {
-                Image(nsImage: IconCache.icon(for: r.path, isDir: r.isDir))
-                    .resizable().frame(width: 16, height: 16)
+                RowThumb(model: model, path: r.path, isDir: r.isDir, ext: r.ext)
                 Text(r.name).lineLimit(1)
                 Spacer(minLength: 12)
                 Text(r.directory)
@@ -114,6 +113,28 @@ struct CompactResults: View {
             .background(selected ? Color.accentColor.opacity(0.18) : .clear)
             .contentShape(Rectangle())
         }
+    }
+}
+
+/// 16-pt row icon that upgrades to a QuickLook mini-thumbnail for media files
+/// (same ThumbCache the grid uses — one proven pipeline for all layouts).
+struct RowThumb: View {
+    @ObservedObject var model: AppModel
+    let path: String
+    let isDir: Bool
+    let ext: String
+    @State private var img: NSImage? = nil
+    var body: some View {
+        Image(nsImage: img ?? IconCache.icon(for: path, isDir: isDir))
+            .resizable()
+            .clipShape(RoundedRectangle(cornerRadius: 3))
+            .frame(width: 16, height: 16)
+            .task(id: path) {
+                guard model.iconPreview, !isDir,
+                      ResultsTableView.previewableExts.contains(ext.lowercased())
+                else { img = nil; return }
+                img = await ThumbCache.shared.thumbnail(for: path, side: 32)
+            }
     }
 }
 

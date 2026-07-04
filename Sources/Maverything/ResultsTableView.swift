@@ -285,6 +285,10 @@ struct ResultsTableView: NSViewRepresentable {
         scroll.autohidesScrollers = true
         // Returning from another layout: re-adopt the shared selection so arrows
         // continue from the same file (selection must SURVIVE layout switches).
+        // A fresh coordinator starts with lastQueryNonce = -1; without syncing it,
+        // the FIRST updateNSView reads "new query" and wipes model.selectedID —
+        // that's why every arrival AT the table lost the selection.
+        context.coordinator.lastQueryNonce = model.queryNonce
         DispatchQueue.main.async { [weak coordinator = context.coordinator] in
             coordinator?.restoreSelectionFromModel()
         }

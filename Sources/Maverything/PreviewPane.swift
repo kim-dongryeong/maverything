@@ -88,15 +88,9 @@ struct PreviewPane: View {
         let path = r.path
         info = FileInfo(r)
         thumb = nil
-        let url = URL(fileURLWithPath: path)
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 320, height: 240),
-                                               scale: scale, representationTypes: .all)
-        QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { rep, _ in
-            guard let rep else { return }
-            DispatchQueue.main.async {
-                if model.selectedID == id { thumb = rep.nsImage }   // ignore stale
-            }
+        Task {
+            let t = await ThumbCache.shared.thumbnail(for: path, side: 320)
+            if let t, model.selectedID == id { thumb = t }   // ignore stale
         }
     }
 }

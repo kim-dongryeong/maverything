@@ -62,6 +62,8 @@ write(".hidden/.secret.txt", bytes: 5)                 // hidden
 write("zdir/marker_apple.txt", bytes: 8)
 write("adir/marker_zebra.txt", bytes: 8)
 mkdir(root + "/emptydir")                              // empty: fixture (dir with no children)
+mkdir(root + "/thumbs.jpg")                            // DIRECTORY with an image extension (media-chip trap)
+write("thumbs.jpg/picture.jpg", bytes: 5)           // a real image file inside it
 
 // ---- index ----
 let index = FileIndex()
@@ -204,6 +206,11 @@ check("name: term matches filename", has("name:data", "data.json"))
 check("folder: matches the 'data' directory", has("folder:data", "data"))
 check("folder: excludes a plain file", !has("folder:", "report.txt"))
 check("file: matches report.txt", has("file:report", "report.txt"))
+// media-chip semantics: "ext:jpg" alone matches a DIRECTORY named *.jpg, but the chips
+// carry file: so a folder with an image extension is excluded while real files stay.
+check("ext:jpg alone matches a dir with image ext (the trap)", has("ext:jpg", "thumbs.jpg"))
+check("file: ext:jpg EXCLUDES the *.jpg directory", !has("file: ext:jpg", "thumbs.jpg"))
+check("file: ext:jpg still matches a real .jpg file", has("file: ext:jpg", "picture.jpg"))
 check("file: excludes the 'data' directory", !has("file:", "data"))
 check("-folder: (files only) excludes the 'data' directory", !has("-folder:", "data"))
 // review#2: negated type filter with a value must not be always-empty or a positive term

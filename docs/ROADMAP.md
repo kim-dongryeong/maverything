@@ -29,13 +29,6 @@ Everything in this repo (including this file) is part of the open-source project
 
 ## Long-term (post-adoption — "once we're downloaded and somewhat known")
 
-- **`.mvignore` (gitignore-format excludes)** — Cling-style: manage excludes as a
-  gitignore-syntax file (`dir/**`, `!re-include`, anchoring) alongside the existing
-  Everything-parity excludes (folder list / file globs / include-only). Deferred
-  deliberately: the current three exclude mechanisms already cover the practical cases,
-  and full gitignore semantics (last-match-wins, dir-only rules, `!` interaction) is a
-  couple days of careful work best spent once real users ask for it. Kept as "Advanced"
-  so the settings UI doesn't grow a fourth exclude system prematurely.
 - **Run-count column** in the table (the sort key already exists; this adds a visible
   Everything-style "Run Count" / "Date Run" column).
 - **childrenOf CSR** — pack the children map into compressed-sparse-row arrays (~25-30 MB

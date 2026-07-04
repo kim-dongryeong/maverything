@@ -123,10 +123,9 @@ struct ContentView: View {
                         model.recordRecentQuery(model.query)
                         model.focusResultsNonce &+= 1
                     }
-                    .onExitCommand {                         // ESC: close help → clear → dismiss
+                    .onExitCommand {                         // ESC: close help, else HIDE (Everything style)
                         if model.showSyntax { model.showSyntax = false }
-                        else if model.query.isEmpty { model.requestHide?() }
-                        else { model.query = "" }
+                        else { model.requestHide?() }          // reopen: tray · Dock · hotkey
                     }
 
                 if !model.query.isEmpty {

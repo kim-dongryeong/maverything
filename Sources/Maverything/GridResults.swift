@@ -164,6 +164,7 @@ struct GridResults: View {
         case .space:      if let sel = selected { quickLook(sel) }; return .handled
         case .return:     if let sel = selected { AppModel.finderOpen(model.path(sel)) }; return .handled
         case .tab:        model.focusNonce &+= 1; return .handled
+        case .escape:     model.requestHide?(); return .handled
         default:
             if press.characters == "/" { model.focusNonce &+= 1; return .handled }
             return .ignored

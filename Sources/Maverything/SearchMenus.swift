@@ -104,7 +104,7 @@ struct ShortcutsSheet: View {
     private let sections: [(String, [(String, String)])] = [
         ("Search", [
             ("/  or  Tab", "focus the search field"),
-            ("Esc (⎋)", "close help → clear query → hide the window"),
+            ("Esc (⎋)", "hide the window — reopen: menu-bar icon · Dock · hotkey"),
             ("⌘↑ / ⌘↓", "cycle recent searches"),
             ("↓", "jump from the field into the results"),
             ("⌘/", "search-syntax cheat sheet"),

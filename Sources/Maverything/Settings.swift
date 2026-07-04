@@ -242,6 +242,7 @@ struct SettingsView: View {
             }
             Section("Keyboard") {
                 Toggle("Enter key renames (instead of opens)", isOn: $model.enterRenames)
+                Toggle("Clear search when window closes (ESC)", isOn: $model.clearSearchOnClose)
                 Toggle("Page Up/Down · Home/End move the selection", isOn: $model.navKeysMoveSelection)
                 Text("On (Everything-style): the cursor jumps by a page / to the first-last row. Off: macOS default — only the scroll moves.")
                     .font(.caption).foregroundStyle(.secondary)

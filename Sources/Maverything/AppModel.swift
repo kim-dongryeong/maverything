@@ -202,6 +202,12 @@ final class AppModel: ObservableObject {
 
     /// Set by the AppDelegate so the search UI can dismiss the panel (ESC).
     var requestHide: (() -> Void)?
+    /// Everything's "Clear search on close" (Tools ▸ Options ▸ Search) — off by
+    /// default there and here: reopening shows the previous query.
+    @Published var clearSearchOnClose: Bool =
+        UserDefaults.standard.bool(forKey: "mv.clearSearchOnClose") {
+        didSet { UserDefaults.standard.set(clearSearchOnClose, forKey: "mv.clearSearchOnClose") }
+    }
 
     let index = FileIndex()
     lazy var engine = SearchEngine(index: index)

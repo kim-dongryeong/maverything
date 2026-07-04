@@ -25,6 +25,9 @@ final class MVTableView: NSTableView {
             if event.isARepeat { coordinator?.beginNavRepeat() }
         default: break
         }
+        if event.keyCode == 53 {                                // ESC → hide window (Everything)
+            coordinator?.model.requestHide?(); return
+        }
         if event.keyCode == 8 {                                 // C
             if mods == [.command] { coordinator?.copyFile(); return }          // ⌘C  → copy the file(s), Finder-style
             if mods == [.command, .option] { coordinator?.copyPath(); return } // ⌘⌥C → copy pathname

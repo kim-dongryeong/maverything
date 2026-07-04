@@ -16,6 +16,7 @@ struct MaverythingApp: App {
                 .background(WindowConfigurator())
                 .onAppear {
                     delegate.model = model
+                    model.requestHide = { [weak delegate] in delegate?.hideMainWindow() }
                     model.start()
                 }
         }
@@ -161,6 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         summon(); return true
+    }
+
+    /// Everything semantics: ESC hides the window (⌘W-style); reopen via the
+    /// menu-bar icon, the Dock (ShouldHandleReopen), or the global hotkey.
+    func hideMainWindow() {
+        (mainWindow ?? NSApp.keyWindow)?.orderOut(nil)
+        if model?.clearSearchOnClose == true { model?.query = "" }   // Everything's option
     }
 
     func summon() {

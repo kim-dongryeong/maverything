@@ -39,6 +39,7 @@ struct CompactResults: View {
                 return .handled
             }
             .onKeyPress(.tab) { model.focusNonce &+= 1; return .handled }
+            .onKeyPress(.escape) { model.requestHide?(); return .handled }
             .onKeyPress(phases: .down) { press in
                 if press.characters == "/" { model.focusNonce &+= 1; return .handled }
                 return .ignored

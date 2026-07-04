@@ -57,6 +57,11 @@ struct GridResults: View {
             // when there IS one (cold launch: selectedID nil → field keeps focus).
             if selected != nil, !ids.contains(selected!) { model.selectedID = ids.first }
             if selected != nil { DispatchQueue.main.async { focused = true } }
+            // Quick Look stayed open through the layout switch → adopt it here.
+            if let sel = model.selectedID, QLPreviewPanel.sharedPreviewPanelExists(),
+               QLPreviewPanel.shared().isVisible {
+                adoptQLPanel(for: sel)
+            }
         }
         .onChange(of: model.focusResultsNonce) {           // ↓ / Enter from the field
             focused = true
@@ -116,10 +121,15 @@ struct GridResults: View {
         NSPasteboard.general.setString(model.path(id), forType: .string)
     }
     private func quickLook(_ id: Int32) {
+        adoptQLPanel(for: id)
+        QLPreviewPanel.shared()?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Point the shared panel at US: data source, delegate, and the arrow-key
+    /// router (the panel is key while open — previewPanel(_:handle:) forwards
+    /// ←→↑↓ here so browsing continues with the preview up).
+    private func adoptQLPanel(for id: Int32) {
         GridQL.shared.paths = [model.path(id)]
-        // While the panel is key OUR view gets no key events — the panel's
-        // delegate hook (previewPanel(_:handle:)) routes arrows back here so
-        // ←→↑↓ keep browsing with the preview open.
         GridQL.shared.onKey = { code in
             let cols = max(1, currentColumns())
             switch code {
@@ -136,7 +146,6 @@ struct GridResults: View {
             panel.dataSource = GridQL.shared
             panel.delegate = GridQL.shared
             panel.reloadData()
-            panel.makeKeyAndOrderFront(nil)
         }
     }
 

@@ -860,6 +860,14 @@ struct ResultsTableView: NSViewRepresentable {
             tv.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             tv.scrollRowToVisible(row)
             tv.window?.makeFirstResponder(tv)   // arrows work immediately
+            // An open Quick Look must follow the layout switch: re-evaluate the
+            // panel's controller (we're first responder now → the table takes it
+            // back from GridQL) and repaint it on the restored selection.
+            if QLPreviewPanel.sharedPreviewPanelExists(),
+               QLPreviewPanel.shared().isVisible, let panel = QLPreviewPanel.shared() {
+                panel.updateController()
+                panel.reloadData()
+            }
         }
 
         private func selectedPaths() -> [String] {

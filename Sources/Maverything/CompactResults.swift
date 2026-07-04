@@ -34,21 +34,8 @@ struct CompactResults: View {
             .onKeyPress(.return) { if let s = model.selectedID { open(s) }; return .handled }
             .onKeyPress(.space) {                       // Quick Look, same as the table
                 guard let s = model.selectedID else { return .ignored }
-                GridQL.shared.paths = [model.path(s)]
-                GridQL.shared.onKey = { code in          // arrows browse while panel is key
-                    switch code {
-                    case 125: move(+1, self.ids, proxy); return true   // ↓
-                    case 126: move(-1, self.ids, proxy); return true   // ↑
-                    case 49:  QLPreviewPanel.shared().orderOut(nil); return true
-                    default: return false
-                    }
-                }
-                if let panel = QLPreviewPanel.shared() {
-                    panel.dataSource = GridQL.shared
-                    panel.delegate = GridQL.shared
-                    panel.reloadData()
-                    panel.makeKeyAndOrderFront(nil)
-                }
+                adoptQLPanel(for: s, proxy: proxy)
+                QLPreviewPanel.shared()?.makeKeyAndOrderFront(nil)
                 return .handled
             }
             .onKeyPress(.tab) { model.focusNonce &+= 1; return .handled }
@@ -65,6 +52,10 @@ struct CompactResults: View {
                 if let s = model.selectedID, ids.contains(s) {
                     proxy.scrollTo(s, anchor: .center)
                     DispatchQueue.main.async { listFocused = true }   // focus lands post-attach
+                    // Quick Look stayed open through the switch → adopt it here.
+                    if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+                        adoptQLPanel(for: s, proxy: proxy)
+                    }
                 }
             }
         }
@@ -82,6 +73,24 @@ struct CompactResults: View {
         model.selectedID = ids[clamped]
         proxy.scrollTo(ids[clamped], anchor: .center)
         refreshQLIfOpen(ids[clamped])
+    }
+
+    /// Point the shared panel at the compact list (data source + ↑↓ router).
+    private func adoptQLPanel(for id: Int32, proxy: ScrollViewProxy) {
+        GridQL.shared.paths = [model.path(id)]
+        GridQL.shared.onKey = { code in
+            switch code {
+            case 125: move(+1, self.ids, proxy); return true   // ↓
+            case 126: move(-1, self.ids, proxy); return true   // ↑
+            case 49:  QLPreviewPanel.shared().orderOut(nil); return true
+            default: return false
+            }
+        }
+        if let panel = QLPreviewPanel.shared() {
+            panel.dataSource = GridQL.shared
+            panel.delegate = GridQL.shared
+            panel.reloadData()
+        }
     }
 
     /// Open Quick Look keeps tracking the selection (same panel plumbing as the grid).

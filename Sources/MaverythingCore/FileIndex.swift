@@ -34,6 +34,16 @@ public final class FileIndex: @unchecked Sendable {
     // half-built mask can only cost a scan, never drop a real match.
     public internal(set) var nameMask: [UInt64] = []
 
+    // Media "kind" bitmask per entry (one byte): which of documents/images/audio/video/
+    // archives/apps the entry's extension belongs to (see FileTypeClass). Powers the
+    // `type:` operator and the app's type chips with a single AND'd bit test in the hot
+    // loop instead of a per-candidate extension re-scan. Kept EXACT at every append (it's
+    // a filter, not a prefilter — a wrong bit would drop or add a real match), authoritative
+    // values (re)computed in buildLiveIndexes. Never persisted (snapshot format untouched);
+    // snapshot-load seeds 0xFF ("unknown → matches any type:", like nameMask's .max) until
+    // the caller's buildLiveIndexes fills it.
+    public internal(set) var typeClass: [UInt8] = []
+
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
     public internal(set) var size: [Int64] = []       // logical bytes (0 for dirs)
@@ -142,6 +152,7 @@ public final class FileIndex: @unchecked Sendable {
         nameOff.removeAll(keepingCapacity: false); nameLen.removeAll(keepingCapacity: false)
         unicodeFoldOff.removeAll(keepingCapacity: false); unicodeFoldLen.removeAll(keepingCapacity: false)
         nameMask.removeAll(keepingCapacity: false)
+        typeClass.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
@@ -171,17 +182,19 @@ public final class FileIndex: @unchecked Sendable {
         // NFC-normalize like every other stored name, so a non-ASCII volume root is
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
+        let fold = bytes.map(asciiLower)
         let idx = Int32(nameOff.count)
         nameOff.append(UInt64(nameBlob.count))
         nameLen.append(UInt16(bytes.count))
         nameBlob.append(contentsOf: bytes)
-        foldBlob.append(contentsOf: bytes.map(asciiLower))
+        foldBlob.append(contentsOf: fold)
         appendUnicodeFoldStorage(for: bytes, blob: &unicodeFoldBlob,
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(-1)
         size.append(0); mtime.append(0); crtime.append(0)
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
         nameMask.append(.max)   // authoritative value filled by buildLiveIndexes (safe passthrough meanwhile)
+        typeClass.append(fold.withUnsafeBufferPointer { FileTypeClass.mask(foldedName: $0.baseAddress!, 0, $0.count) })
         return idx   // live-update maps are built in bulk post-crawl (buildLiveIndexes)
     }
 
@@ -214,6 +227,18 @@ public final class FileIndex: @unchecked Sendable {
         let n = batch.len.count
         for _ in 0..<n { parent.append(parentIdx); deleted.append(false) }
         nameMask.append(contentsOf: repeatElement(.max, count: n))   // filled by buildLiveIndexes
+        // typeClass is a FILTER (not a prefilter), so compute it EXACT now — a search
+        // during the crawl (narrow-as-you-type on the growing index) must not miss these.
+        // batch.fold shares batch.off/batch.len with the blob (ASCII fold preserves length).
+        batch.fold.withUnsafeBufferPointer { fb in
+            if let fbBase = fb.baseAddress {
+                for i in 0..<n {
+                    typeClass.append(FileTypeClass.mask(foldedName: fbBase, Int(batch.off[i]), Int(batch.len[i])))
+                }
+            } else {
+                typeClass.append(contentsOf: repeatElement(0, count: n))
+            }
+        }
         return base
     }
 
@@ -277,9 +302,12 @@ public final class FileIndex: @unchecked Sendable {
     /// present in the mask (no false negative). Caller holds the write lock.
     private func computeNameMasksLocked(_ n: Int) {
         nameMask = [UInt64](repeating: 0, count: n)
+        typeClass = [UInt8](repeating: 0, count: n)
         foldBlob.withUnsafeBufferPointer { fb in
         unicodeFoldBlob.withUnsafeBufferPointer { ub in
         nameMask.withUnsafeMutableBufferPointer { mb in
+        typeClass.withUnsafeMutableBufferPointer { tc in
+            let fbBase = fb.baseAddress!
             for i in 0..<n {
                 var m: UInt64 = 0
                 let o = Int(nameOff[i]), e = o + Int(nameLen[i])
@@ -289,8 +317,11 @@ public final class FileIndex: @unchecked Sendable {
                     for k in uo..<ue { m |= (1 << UInt64(Self.charBit(ub[k]))) }
                 }
                 mb[i] = m
+                // typeClass reads the SAME folded name bytes (last-dot extension) that
+                // SearchEngine.extMatches uses → type: and ext: agree by construction.
+                tc[i] = FileTypeClass.mask(foldedName: fbBase, o, Int(nameLen[i]))
             }
-        }}}
+        }}}}
     }
 
     /// TEST-ONLY: force every bloom mask to all-bits, disabling the prefilter so a
@@ -634,6 +665,12 @@ public final class FileIndex: @unchecked Sendable {
             m |= Self.maskOf(unicodeFoldBlob[uo..<uo+ul])
         }
         nameMask.append(m)
+        // typeClass exact now too (no buildLiveIndexes after reconcile). Read the just-
+        // appended fold bytes for this row from foldBlob (nameOff/nameLen apply to it).
+        let fo = Int(nameOff[Int(idx)]), fl = Int(nameLen[Int(idx)])
+        typeClass.append(foldBlob.withUnsafeBufferPointer {
+            $0.baseAddress.map { FileTypeClass.mask(foldedName: $0, fo, fl) } ?? 0
+        })
         return idx
     }
 

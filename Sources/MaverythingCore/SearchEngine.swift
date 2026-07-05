@@ -904,6 +904,8 @@ public final class SearchEngine: @unchecked Sendable {
         // Hoist filter presence out of the loop (avoid per-candidate array access + ARC).
         let hasExts = !parsed.exts.isEmpty, hasSizes = !parsed.sizes.isEmpty
         let hasNotExts = !parsed.notExts.isEmpty, hasNotSizes = !parsed.notSizes.isEmpty
+        let typeMasks = parsed.typeMasks, notTypeMasks = parsed.notTypeMasks
+        let hasTypeMasks = !typeMasks.isEmpty, hasNotTypeMasks = !notTypeMasks.isEmpty
         let hasNotDates = !parsed.notDateRanges.isEmpty
         let df = parsed.dateFrom, dt = parsed.dateTo
         let onlyDirs = parsed.onlyDirs, onlyFiles = parsed.onlyFiles
@@ -937,6 +939,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.objType.withUnsafeBufferPointer { otB in
         index.parent.withUnsafeBufferPointer { parB in
         index.nameMask.withUnsafeBufferPointer { maskB in
+        index.typeClass.withUnsafeBufferPointer { tcB in
         order.withUnsafeBufferPointer { ordB in
         termBlob.withUnsafeBufferPointer { tblobB in
         termRefs.withUnsafeBufferPointer { trefsB in
@@ -1004,11 +1007,25 @@ public final class SearchEngine: @unchecked Sendable {
                         // include filters (cheap) first
                         if hasLens && !self.lenMatches(l, parsed.lenFilters) { continue }
                         if hasExts && !self.extMatches(fbBase, o, l, parsed.exts) { continue }
+                        // type: category — precomputed bitmask, O(1) per candidate (no
+                        // per-query extension re-scan). Each include mask must overlap.
+                        if hasTypeMasks {
+                            let tc = tcB[id]
+                            var ok = true
+                            for m in typeMasks where tc & m == 0 { ok = false; break }
+                            if !ok { continue }
+                        }
                         if hasSizes && !self.sizeMatches(szB[id], parsed.sizes) { continue }
                         if let df, mtB[id] < df { continue }
                         if let dt, mtB[id] >= dt { continue }
                         // negated filters: exclude if the candidate matches any of them
                         if hasNotExts && self.extMatches(fbBase, o, l, parsed.notExts) { continue }
+                        if hasNotTypeMasks {
+                            let tc = tcB[id]
+                            var bad = false
+                            for m in notTypeMasks where tc & m != 0 { bad = true; break }
+                            if bad { continue }
+                        }
                         if hasNotSizes && self.excludedBySize(szB[id], parsed.notSizes) { continue }
                         if hasNotDates && self.excludedByDate(mtB[id], parsed.notDateRanges) { continue }
                         // terms — raw pointers into the flattened term blob (no per-candidate ARC).
@@ -1118,7 +1135,7 @@ public final class SearchEngine: @unchecked Sendable {
                     }}
                 }
             }}}
-        }}}}}}}}}}}}}}}}
+        }}}}}}}}}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]

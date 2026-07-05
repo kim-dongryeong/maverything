@@ -64,6 +64,17 @@ write("adir/marker_zebra.txt", bytes: 8)
 mkdir(root + "/emptydir")                              // empty: fixture (dir with no children)
 mkdir(root + "/thumbs.jpg")                            // DIRECTORY with an image extension (media-chip trap)
 write("thumbs.jpg/picture.jpg", bytes: 5)           // a real image file inside it
+// type: operator fixtures — one file per category, incl. a dual-category .dmg
+// (archives AND apps) and mixed case (.PDF) to exercise the folded extraction.
+write("kind/manual.pdf", bytes: 12)                   // documents
+write("kind/SHOUT.PDF", bytes: 12)                    // documents, uppercase ext (fold path)
+write("kind/photo.jpeg", bytes: 12)                   // images
+write("kind/song.mp3", bytes: 12)                     // audio
+write("kind/clip.mp4", bytes: 12)                     // video
+write("kind/bundle.zip", bytes: 12)                   // archives
+write("kind/installer.dmg", bytes: 12)                // archives + apps (dual bit)
+write("kind/tool.exe", bytes: 12)                     // apps
+write("kind/notes.noext", bytes: 12)                  // unknown ext → no category
 
 // ---- index ----
 let index = FileIndex()
@@ -495,6 +506,38 @@ setTag(root + "/contentful.txt", ["Green"])
 check("tag: finds tagged file", has("tag:green", "contentful.txt"))
 check("tag: excludes untagged file", !has("tag:green", "boring.txt"))
 check("tag: wrong tag finds nothing", !has("tag:purple", "contentful.txt"))
+
+// type: operator — the precomputed typeClass bitmap MUST select the exact same set as
+// the equivalent ext: clause it replaces (this is the whole correctness contract). The
+// ext lists are read from the single source of truth so the test can never drift.
+for c in FileTypeClass.categories {
+    let extClause = "ext:" + c.exts.joined(separator: ",")
+    check("type:\(c.name) ≡ \(extClause)",
+          Set(names("type:\(c.name)")) == Set(names(extClause)))
+    check("-type:\(c.name) ≡ -\(extClause)",
+          Set(names("-type:\(c.name)")) == Set(names("-" + extClause)))
+}
+// union (comma list) ≡ the merged ext clause
+let docImg = FileTypeClass.categories[0].exts + FileTypeClass.categories[1].exts
+check("type:documents,images ≡ merged ext clause",
+      Set(names("type:documents,images")) == Set(names("ext:" + docImg.joined(separator: ","))))
+// gate is LIVE, not a no-op: real hits and real misses
+check("type:documents finds the .pdf", has("type:documents", "manual.pdf"))
+check("type:documents finds uppercase .PDF (folded)", has("type:documents", "SHOUT.PDF"))
+check("type:audio finds the .mp3", has("type:audio", "song.mp3"))
+check("type:documents excludes the .mp3", !has("type:documents", "song.mp3"))
+check("type:apps excludes the .zip", !has("type:apps", "bundle.zip"))
+check("unknown ext has no category (type:documents excludes .noext)", !has("type:documents", "notes.noext"))
+// dual-category: .dmg is BOTH archives and apps
+check("type:archives finds the .dmg", has("type:archives", "installer.dmg"))
+check("type:apps finds the .dmg", has("type:apps", "installer.dmg"))
+// media-chip trap: a DIRECTORY named thumbs.jpg matches type:images (== ext:jpg) but the
+// chip's `file:` prefix must drop it while keeping the real image file inside.
+check("type:images matches the thumbs.jpg directory (== ext:jpg)", has("type:images", "thumbs.jpg"))
+check("file: type:images drops the directory but keeps the file",
+      !has("file: type:images", "thumbs.jpg") && has("file: type:images", "picture.jpg"))
+// unknown category name falls through to a literal term (not a filter), so it finds nothing here
+check("type:bogus is a literal term, not a filter", names("type:bogus").isEmpty)
 
 
 // dynamic mount lifecycle: a new crawl root can be appended after launch, then tombstoned

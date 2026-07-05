@@ -82,12 +82,15 @@ enum TypeFilter: String, CaseIterable, Identifiable {
         // merely ends in an image/doc extension (e.g. a CoreSimulator "IMG_0001.JPG"
         // thumbnail folder) would show up. file: is Finder-package-aware, so .app (an
         // "apps" package) still counts; a plain folder named foo.jpg does not.
-        case .documents: return "file: ext:pdf,doc,docx,txt,rtf,pages,md,markdown,odt,tex,epub,xls,xlsx,csv,ppt,pptx,key,numbers"
-        case .images:    return "file: ext:jpg,jpeg,png,gif,bmp,tiff,tif,heic,heif,webp,svg,raw,cr2,nef,arw,dng,psd,ico"
-        case .audio:     return "file: ext:mp3,wav,flac,aac,m4a,ogg,oga,aiff,aif,wma,alac,opus"
-        case .video:     return "file: ext:mp4,mov,avi,mkv,wmv,flv,webm,m4v,mpg,mpeg,3gp,m2ts,mts"
-        case .archives:  return "file: ext:zip,rar,7z,tar,gz,tgz,bz2,xz,dmg,iso,pkg,cab"
-        case .apps:      return "file: ext:app,pkg,dmg,exe"
+        // These emit the `type:` operator (backed by FileIndex.typeClass — one O(1) bit
+        // test per candidate instead of re-scanning the extension against a list every
+        // keystroke). Category ↔ extension lists live in MaverythingCore.FileTypeClass.
+        case .documents: return "file: type:documents"
+        case .images:    return "file: type:images"
+        case .audio:     return "file: type:audio"
+        case .video:     return "file: type:video"
+        case .archives:  return "file: type:archives"
+        case .apps:      return "file: type:apps"
         }
     }
 }

@@ -176,6 +176,7 @@ struct SyntaxHelpView: View {
         ("\"exact phrase\"", "quote to keep spaces — and to make * ? literal"),
         ("image_0*.png",     "wildcards auto-apply in Exact (* any, ? one char)"),
         ("ext:png,jpg",      "one of these extensions"),
+        ("type:documents",   "kind: documents/images/audio/video/archives/apps"),
         ("size:>10mb",       "size >, <, >=, <= (kb/mb/gb)"),
         ("dm:today",         "modified: today / week / month / 2026-01-31"),
         ("folder:  /  file:", "only folders / only files"),

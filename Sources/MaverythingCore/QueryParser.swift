@@ -22,6 +22,11 @@ public struct ParsedQuery: Sendable {
     /// group; `path:a|b` scopes the whole group).
     public var termGroups: [[QueryTerm]] = []
     public var exts: [[UInt8]] = []                 // folded, no leading dot (include)
+    // `type:documents` (or a comma list `type:documents,images`) → OR of category bits.
+    // Multiple type: tokens AND together. Backed by FileIndex.typeClass (O(1) bit test)
+    // and equivalent by construction to the matching ext: clause.
+    public var typeMasks: [UInt8] = []              // each must overlap (AND of tokens)
+    public var notTypeMasks: [UInt8] = []           // `-type:` — must NOT overlap
     public var sizes: [(SizeOp, Int64)] = []
     public var dateFrom: Int64? = nil               // mtime ns >=
     public var dateTo: Int64? = nil                 // mtime ns <
@@ -44,7 +49,8 @@ public struct ParsedQuery: Sendable {
     public var caseSensitive = false
 
     public var hasFilters: Bool {
-        !exts.isEmpty || !sizes.isEmpty || dateFrom != nil || dateTo != nil
+        !exts.isEmpty || !typeMasks.isEmpty || !notTypeMasks.isEmpty
+            || !sizes.isEmpty || dateFrom != nil || dateTo != nil
             || !notExts.isEmpty || !notSizes.isEmpty || !notDateRanges.isEmpty
             || onlyDirs || onlyFiles || wholeWord || dupesOnly
             || emptyDirsOnly || !lenFilters.isEmpty
@@ -143,6 +149,11 @@ public enum QueryParser {
                 let bytes = Array(s.utf8).map(asciiLower)
                 if negated { q.notExts.append(bytes) } else { q.exts.append(bytes) }
             }
+            return true
+        case "type", "kind":                       // media category: documents/images/audio/…
+            let mask = FileTypeClass.maskForOperand(val)
+            guard mask != 0 else { return false }   // unknown category → not a recognized filter (falls back to a plain term)
+            if negated { q.notTypeMasks.append(mask) } else { q.typeMasks.append(mask) }
             return true
         case "size":
             guard let (op, n) = parseSize(val) else { return false }

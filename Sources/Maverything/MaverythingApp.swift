@@ -55,6 +55,8 @@ struct SearchCommands: Commands {
     var body: some Commands {
         CommandMenu("Search") {
             Button("Focus Search Field") { model.focusNonce &+= 1 }      // '/' or Tab from the results
+            Button("Advanced Search…") { model.showAdvancedSearch = true }
+                .keyboardShortcut("f", modifiers: [.command, .shift])     // ⇧⌘F — form builds the query
             Divider()
             Toggle("Match Path", isOn: Binding(
                 get: { model.scope == .fullPath },

@@ -10,6 +10,12 @@ final class MVTableView: NSTableView {
     weak var qlSource: (QLPreviewPanelDataSource & QLPreviewPanelDelegate)?
     weak var coordinator: ResultsTableView.Coordinator?
 
+    // The window is movable-by-background (frameless quick-search look). Without this,
+    // a press-and-drag that starts on a result row is swallowed by the window-move
+    // machinery, so the row never begins a drag-out to Finder. Dragging results must
+    // drag files, never move the window.
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func keyDown(with event: NSEvent) {
         // Only the real chord modifiers — NOT capsLock/function/numericPad, which are in
         // deviceIndependentFlagsMask and would break the exact `== [.command]` checks below.

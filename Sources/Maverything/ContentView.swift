@@ -1,3 +1,4 @@
+import AppKit
 import MaverythingCore
 import SwiftUI
 
@@ -8,6 +9,9 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             searchBar
+                // .full extends the emerald title-bar band DOWN over the search bar so
+                // the whole header is one contiguous colored block (vs .strip = title bar only).
+                .background(model.titleBarTint == .full ? Color(nsColor: .mvBand) : Color.clear)
             Divider()
             FilterBar(model: model)
             Divider()
@@ -28,7 +32,11 @@ struct ContentView: View {
             OnboardingView().environmentObject(model)
         }
         .sheet(isPresented: $model.showShortcuts) { ShortcutsSheet() }
+        .sheet(isPresented: $model.showAdvancedSearch) {
+            AdvancedSearchSheet().environmentObject(model)
+        }
         .background(OpenSettingsBridge(model: model))
+        .background(TitleBarTinter(style: model.titleBarTint))
     }
 
     @ViewBuilder private var layoutBody: some View {
@@ -253,5 +261,32 @@ struct ContentView: View {
         .background(Capsule().fill(Color.accentColor.opacity(0.15)))
         .foregroundStyle(Color.accentColor)
         .help("Searching in \(root)")
+    }
+}
+
+/// Tints the window's title-bar region (behind the traffic lights) to give the app a
+/// Chrome/VS Code-style visual identity. Reactive: re-applies whenever the style changes.
+/// `.full` washes the whole title bar; `.off`/`.strip` leave the system background
+/// (the strip's accent is drawn in the content instead).
+private struct TitleBarTinter: NSViewRepresentable {
+    let style: TitleBarTintStyle
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ v: NSView, context: Context) {
+        let style = self.style
+        DispatchQueue.main.async {
+            guard let w = v.window else { return }
+            switch style {
+            case .off:
+                // No tint — the title bar shows the system window background.
+                w.backgroundColor = .windowBackgroundColor
+            case .strip, .full:
+                // Both color the title-bar region the SAME emerald band (the only way to
+                // paint behind the traffic lights is window.backgroundColor). They differ
+                // in EXTENT, not intensity: .full ALSO tints the search bar below (see the
+                // searchBar .background above) so the header becomes one contiguous block;
+                // .strip leaves the search bar untinted so only the title bar is colored.
+                w.backgroundColor = .mvBand
+            }
+        }
     }
 }

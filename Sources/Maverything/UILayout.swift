@@ -17,6 +17,38 @@ enum RowDensity: String, CaseIterable, Identifiable {
     var rowHeight: CGFloat { self == .compact ? 17 : 22 }
 }
 
+/// Chrome/VS Code-style title-bar accent — the app's visual identity. The user can
+/// switch live to compare and settle on one. Persisted in UserDefaults.
+enum TitleBarTintStyle: String, CaseIterable, Identifiable {
+    case off       // no tint (system default)
+    case strip     // Chrome-style: a thin accent bar across the very top
+    case full      // VS Code-style: the whole search bar washed in the accent
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off:   return "Off"
+        case .strip: return "Title bar band (Chrome)"
+        case .full:  return "Full tint (VS Code)"
+        }
+    }
+}
+
+extension Color {
+    /// Maverything's emerald brand accent — matches the app icon (#10B981).
+    static let mvAccent = Color(red: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0)
+}
+
+extension NSColor {
+    /// The emerald title-bar/header band — brand accent blended toward the window
+    /// background so it reads as a tinted chrome band, not a neon block. Recomputed
+    /// per call so it tracks the current light/dark appearance.
+    static var mvBand: NSColor {
+        NSColor(red: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0, alpha: 1)
+            .blended(withFraction: 0.35, of: .windowBackgroundColor) ?? .windowBackgroundColor
+    }
+}
+
 /// The window layouts the user can switch between live (the "build every option"
 /// rule). Persisted in UserDefaults.
 enum UILayout: String, CaseIterable, Identifiable {

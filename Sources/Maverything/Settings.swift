@@ -239,6 +239,9 @@ struct SettingsView: View {
                 Picker("Row density", selection: $model.density) {
                     ForEach(RowDensity.allCases) { Text($0.label).tag($0) }
                 }
+                Picker("Title bar accent", selection: $model.titleBarTint) {
+                    ForEach(TitleBarTintStyle.allCases) { Text($0.label).tag($0) }
+                }
                 HStack {
                     Text("Run history")
                     Spacer()

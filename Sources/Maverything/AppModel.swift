@@ -210,6 +210,11 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.string(forKey: "mv.density") ?? "") ?? .comfortable {
         didSet { UserDefaults.standard.set(density.rawValue, forKey: "mv.density") }
     }
+    /// Title-bar accent style (visual identity) — switch live in Settings to compare.
+    @Published var titleBarTint: TitleBarTintStyle = TitleBarTintStyle(rawValue:
+        UserDefaults.standard.string(forKey: "mv.titleBarTint") ?? "") ?? .strip {
+        didSet { UserDefaults.standard.set(titleBarTint.rawValue, forKey: "mv.titleBarTint") }
+    }
 
     /// Set by the AppDelegate so the search UI can dismiss the panel (ESC).
     var requestHide: (() -> Void)?
@@ -782,12 +787,18 @@ final class AppModel: ObservableObject {
     var lastNavAt: TimeInterval = 0
     private func scheduleLiveRefresh() {
         snapshotDirty = true
-        // When the app isn't frontmost, background file churn shouldn't burn a core
-        // rebuilding the sort order — defer until the user comes back.
-        guard NSApp.isActive else { pendingLiveRefresh = true; return }
+        // Refresh whenever our window is on screen — even if we're not the frontmost app.
+        // Moving/deleting a shown result from Finder (which makes Finder frontmost) must
+        // still drop it from the list promptly; only fully defer when our window is hidden,
+        // where there's nothing to update and no reason to burn a core on background churn.
+        let windowVisible = (NSApp.delegate as? AppDelegate)?.mainWindow?.isVisible ?? false
+        guard NSApp.isActive || windowVisible else { pendingLiveRefresh = true; return }
         guard !liveRefreshScheduled else { return }
         liveRefreshScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        // Snappy when frontmost; a touch longer as a background window so bursty
+        // Finder-driven churn still reflects quickly without hogging a core.
+        let delay = NSApp.isActive ? 0.35 : 0.6
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.liveRefreshScheduled = false
             guard !self.isIndexing else { return }
@@ -885,6 +896,7 @@ final class AppModel: ObservableObject {
     }
     @Published var showSyntax = false
     @Published var showShortcuts = false
+    @Published var showAdvancedSearch = false
     /// Set by OpenSettingsBridge with SwiftUI's openSettings environment action —
     /// the sendAction(showSettingsWindow:) path silently no-ops from an NSMenu.
     var openSettingsAction: (() -> Void)?

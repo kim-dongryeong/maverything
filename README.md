@@ -1,5 +1,7 @@
 # Maverything
 
+[![CI](https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml/badge.svg)](https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml)
+
 **Mac + Everything** — a **free** macOS clone of [voidtools Everything](https://www.voidtools.com/):
 instant, system-wide, real-time file search.
 

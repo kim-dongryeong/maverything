@@ -1,0 +1,32 @@
+name: CI
+
+# Accuracy gate: every push/PR must compile in release and pass the full
+# mvsim scenario suite (the project's canonical regression harness — it builds
+# a self-contained synthetic tree under the temp dir, so it needs no real
+# volumes or Full Disk Access and runs unattended on a macOS runner).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-sim:
+    name: Build (release) + mvsim scenarios
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift toolchain
+        run: swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: mvsim scenario regression
+        # mvsim exits non-zero if any scenario fails → this step (and the job) goes red.
+        run: .build/release/mvsim

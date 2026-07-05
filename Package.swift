@@ -1,13 +1,18 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+// NOTE: release builds no longer pass `-Ounchecked`. That flag drops Swift's bounds /
+// overflow / precondition checks, so a bug surfaces as a wrong result or memory
+// corruption instead of a clean trap — unacceptable for a file-search tool people trust.
+// (It once masked an `Int(UInt64.max)` overflow in _appendOne.) Standard `-O` (release
+// default) keeps those checks. If a hot loop ever needs it, wrap just that loop in a
+// perf-lab build (`swift build -c release -Xswiftc -Ounchecked`), never the shipped one.
 let package = Package(
     name: "Maverything",
     platforms: [.macOS(.v14)],
     targets: [
         .target(
-            name: "MaverythingCore",
-            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+            name: "MaverythingCore"
         ),
         .executableTarget(
             name: "Maverything",
@@ -15,23 +20,19 @@ let package = Package(
         ),
         .executableTarget(
             name: "mvtest",
-            dependencies: ["MaverythingCore"],
-            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+            dependencies: ["MaverythingCore"]
         ),
         .executableTarget(
             name: "mvsim",
-            dependencies: ["MaverythingCore"],
-            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+            dependencies: ["MaverythingCore"]
         ),
         .executableTarget(
             name: "mvfind",
-            dependencies: ["MaverythingCore"],
-            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+            dependencies: ["MaverythingCore"]
         ),
         .executableTarget(
             name: "mv-mcp",
-            dependencies: ["MaverythingCore"],
-            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+            dependencies: ["MaverythingCore"]
         ),
     ],
     swiftLanguageModes: [.v5]

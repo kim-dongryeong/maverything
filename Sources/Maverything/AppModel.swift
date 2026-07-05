@@ -5,17 +5,35 @@ import Foundation
 import MaverythingCore
 import os
 
-/// Lightweight file logger so we can verify the in-app engine pipeline headlessly.
+/// Lightweight, **opt-in** file logger so we can verify the in-app engine pipeline
+/// headlessly. OFF by default — these lines include the user's folder/volume paths,
+/// so a shipped app must not silently write the user's filesystem structure to disk.
+/// Enable with `MV_DIAG=1` (writes to `~/Library/Logs/Maverything/maverything-diag.log`,
+/// a real, creatable location — not a hardcoded dev path); override the destination
+/// with `MV_DIAG_PATH=/some/file`.
 enum Diag {
-    static let path = NSHomeDirectory() + "/dev/maverything/maverything-diag.log"
-    static func log(_ s: String) {
-        let line = "[\(Date())] \(s)\n"
-        if let data = line.data(using: .utf8) {
-            if let fh = FileHandle(forWritingAtPath: path) {
-                fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
-            } else {
-                try? line.write(toFile: path, atomically: true, encoding: .utf8)
-            }
+    /// nil ⇒ logging disabled (the release default). Resolved once at launch.
+    static let path: String? = {
+        let env = ProcessInfo.processInfo.environment
+        if let custom = env["MV_DIAG_PATH"], !custom.isEmpty { return custom }
+        guard env["MV_DIAG"] == "1" else { return nil }
+        let dir = NSHomeDirectory() + "/Library/Logs/Maverything"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir + "/maverything-diag.log"
+    }()
+
+    static var isEnabled: Bool { path != nil }
+
+    /// `@autoclosure` so the message (often a `map`/`join` over path lists) is never
+    /// built when logging is disabled — zero cost on the default release path.
+    static func log(_ s: @autoclosure () -> String) {
+        guard let path else { return }
+        let line = "[\(Date())] \(s())\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
         }
     }
 }

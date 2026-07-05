@@ -69,6 +69,17 @@ public struct ParsedQuery: Sendable {
               !t.negated, t.scope == .name, !t.isGlob else { return nil }
         return t.bytes
     }
+
+    /// Fast-path eligibility for PATH-scope search (`path:foo`, or a bare term in
+    /// full-path mode ⌃U): one positive non-glob path term, no filters, case-insensitive.
+    /// The engine answers these with a directory-prefix prepass instead of materializing
+    /// every candidate's full path (see SearchEngine.fastPathScope).
+    public var simplePath: [UInt8]? {
+        guard !hasFilters, !caseSensitive, termGroups.count == 1, let g = termGroups.first,
+              g.count == 1, let t = g.first,
+              !t.negated, t.scope == .path, !t.isGlob else { return nil }
+        return t.bytes
+    }
 }
 
 public enum QueryParser {

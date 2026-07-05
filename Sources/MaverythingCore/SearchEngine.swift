@@ -134,6 +134,11 @@ public final class SearchEngine: @unchecked Sendable {
     /// wrapping glob terms at compile time — the matcher itself stays anchored.
     public var wholeNameWildcards = true
 
+    /// TEST-ONLY: when true, eligible path-scope queries skip `fastPathScope` and run
+    /// through `general` (the full-path-materializing evaluator). mvsim flips this to
+    /// prove the prepass returns exactly the same set as the ground-truth scan.
+    public var _debugForceGeneralPath = false
+
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
                        limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
@@ -375,6 +380,17 @@ public final class SearchEngine: @unchecked Sendable {
            !(sortKey == .relevance && !frecency.isEmpty) {
             return fastExact(needle: needle, sortKey: sortKey, ascending: ascending,
                              limit: limit, start: start, clock: clock)
+        }
+
+        // fast path: a single positive exact PATH term (`path:foo` / full-path mode), no
+        // filters, no folder scope. A directory-prefix prepass avoids materializing every
+        // candidate's full path (the general path's ~100ms → ~10-20ms). `_debugForceGeneralPath`
+        // routes these back through `general` so mvsim can A/B the two for equivalence.
+        if mode == .exact, let needle = parsed.simplePath, scopeRoot == nil,
+           sortKey != .relevance, needle.count <= Self.fastPathMaxNeedle,
+           !needle.isEmpty, !_debugForceGeneralPath {
+            return fastPathScope(needle: needle, sortKey: sortKey, ascending: ascending,
+                                 limit: limit, start: start, clock: clock)
         }
 
         return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
@@ -773,6 +789,171 @@ public final class SearchEngine: @unchecked Sendable {
 
         return SearchResults(ids: out, total: total, truncated: total > out.count,
                              queryMillis: secondsBetween(start, clock.now) * 1000)
+    }
+
+    /// Path needles at or below this length use the prepass; longer ones fall back to the
+    /// general evaluator (they'd blow up the transient tail store, and are rare).
+    private static let fastPathMaxNeedle = 32
+
+    /// PATH-scope fast path (`path:foo`, or a bare term in full-path mode ⌃U): decide, for
+    /// every entry, whether the needle appears anywhere in its full folded path WITHOUT
+    /// materializing that path per candidate — which is what makes the general evaluator
+    /// ~100ms on deep trees. Entries are stored parent-before-child, so one forward pass
+    /// can carry each entry's answer down from its parent:
+    ///
+    ///   contains(e) = contains(parent) OR (needle ⊆ name(e)) OR (needle spans the
+    ///                 parent-tail + "/" + name(e) boundary)
+    ///
+    /// keeping only each directory's last (needleLen-1) folded path bytes (`tail`) — enough
+    /// to catch any match straddling the dir/child join. Byte-for-byte identical to the
+    /// general path scan (mvsim proves it via `_debugForceGeneralPath`), 5-10x faster.
+    private func fastPathScope(needle: [UInt8], sortKey: SortKey, ascending: Bool,
+                               limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock) -> SearchResults {
+        let nLen = needle.count
+        let tailCap = nLen - 1                       // bytes of a dir's path we must remember
+        let n = index.count
+        let slash = UInt8(ascii: "/")
+
+        // Per-DIRECTORY only (dirs are the dependency chain; files are leaves): does the
+        // needle occur in this dir's full path, and its last `tailCap` folded path bytes.
+        // dirContains[p]/dirTail[p] are read by p's children in the parallel phase below.
+        var dirContains = [Bool](repeating: false, count: n)
+        // never empty (max(…,1)) so its baseAddress is non-nil even when tailCap == 0
+        // (a 1-char needle) — the boundary probe still needs to emit the "/" separator.
+        var dirTail = [UInt8](repeating: 0, count: max(n &* tailCap, 1))
+        var dirTailLen = [UInt8](repeating: 0, count: n)
+        var pathScopeResult = SearchResults(ids: [], total: 0, truncated: false, queryMillis: 0)
+
+        // reusable helper: a folded boundary probe `parentTail + "/" + nameHead` → does it
+        // contain the needle? (catches a match straddling the parent|child join). Also the
+        // shared "entry i's folded name segment" accessor.
+        needle.withUnsafeBufferPointer { nd in
+        index.foldBlob.withUnsafeBufferPointer { fb in
+        index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
+        index.nameOff.withUnsafeBufferPointer { offB in
+        index.nameLen.withUnsafeBufferPointer { lenB in
+        index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
+        index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
+        index.parent.withUnsafeBufferPointer { parB in
+        index.objType.withUnsafeBufferPointer { otB in
+        index.deleted.withUnsafeBufferPointer { delB in
+            let fbBase = fb.baseAddress!
+            let ufbBase = ufb.baseAddress
+            let ndBase = UnsafeRawPointer(nd.baseAddress!)
+            @inline(__always) func nameSeg(_ i: Int) -> (UnsafePointer<UInt8>, Int) {
+                if uOffB[i] != noUnicodeFoldOffset, let ufbBase {
+                    return (ufbBase + Int(uOffB[i]), Int(uLenB[i]))
+                }
+                return (fbBase + Int(offB[i]), Int(lenB[i]))
+            }
+            // needle in (parentTail + "/" + nameHead), written into caller's scratch.
+            @inline(__always) func spanHit(_ pTail: Int, _ pBase: Int, _ nmPtr: UnsafePointer<UInt8>,
+                                            _ nmLen: Int, _ tb: UnsafePointer<UInt8>,
+                                            _ sp: UnsafeMutablePointer<UInt8>) -> Bool {
+                var w = 0, j = 0
+                while j < pTail { sp[w] = tb[pBase + j]; w += 1; j += 1 }
+                sp[w] = slash; w += 1
+                let headTake = min(tailCap, nmLen); j = 0
+                while j < headTake { sp[w] = nmPtr[j]; w += 1; j += 1 }
+                return w >= nLen && memmem(sp, w, ndBase, nLen) != nil
+            }
+
+            // ---- Phase 1 (serial, DIRECTORIES only): carry contains/tail down the tree.
+            dirContains.withUnsafeMutableBufferPointer { dcB in
+            dirTail.withUnsafeMutableBufferPointer { dtB in
+            dirTailLen.withUnsafeMutableBufferPointer { dtlB in
+                let dtBase = dtB.baseAddress!
+                var span = [UInt8](repeating: 0, count: max(2 * tailCap + 1, 1))
+                span.withUnsafeMutableBufferPointer { spB in
+                    let spBase = spB.baseAddress!
+                    for i in 0..<n where otB[i] == VNODE_VDIR {
+                        let (nmPtr, nmLen) = nameSeg(i)
+                        let p = Int(parB[i])
+                        var hit = nmLen >= nLen && memmem(nmPtr, nmLen, ndBase, nLen) != nil
+                        if p < 0 || p >= i || otB[p] != VNODE_VDIR {
+                            // root (or defensive): path IS the name, except "/" = empty segment.
+                            if nmLen == 1 && nmPtr[0] == slash { dcB[i] = false; dtlB[i] = 0; continue }
+                            dcB[i] = hit
+                            if tailCap > 0 {
+                                let take = min(tailCap, nmLen)
+                                for j in 0..<take { dtBase[i &* tailCap &+ j] = nmPtr[nmLen - take + j] }
+                                dtlB[i] = UInt8(take)
+                            }
+                            continue
+                        }
+                        let pTail = Int(dtlB[p]); let pBase = p &* tailCap
+                        if !hit { hit = spanHit(pTail, pBase, nmPtr, nmLen, dtBase, spBase) }
+                        dcB[i] = dcB[p] || hit
+                        if tailCap > 0 {
+                            if nmLen >= tailCap {
+                                for j in 0..<tailCap { dtBase[i &* tailCap &+ j] = nmPtr[nmLen - tailCap + j] }
+                                dtlB[i] = UInt8(tailCap)
+                            } else {
+                                var w = 0
+                                let fromParent = min(tailCap - nmLen - 1, pTail)
+                                if fromParent > 0 {
+                                    for j in (pTail - fromParent)..<pTail { dtBase[i &* tailCap &+ w] = dtBase[pBase + j]; w += 1 }
+                                }
+                                if w < tailCap { dtBase[i &* tailCap &+ w] = slash; w += 1 }
+                                var j = 0
+                                while j < nmLen && w < tailCap { dtBase[i &* tailCap &+ w] = nmPtr[j]; w += 1; j += 1 }
+                                dtlB[i] = UInt8(w)
+                            }
+                        }
+                    }
+                }
+            }}}
+
+            // ---- Phase 2 (PARALLEL over sort order): decide each candidate cheaply.
+            //  dir  → dirContains[id];  leaf → dirContains[parent] OR needle∈name OR boundary.
+            let order = orderArray(for: scanOrderKey(sortKey))
+            let oc = order.count
+            let nChunks = max(1, min(workerCount, oc / 16_000 + 1))
+            let chunkSize = (oc + nChunks - 1) / nChunks
+            var chunkIDs = [[Int32]](repeating: [], count: nChunks)
+            dirContains.withUnsafeBufferPointer { dcB in
+            dirTail.withUnsafeBufferPointer { dtB in
+            dirTailLen.withUnsafeBufferPointer { dtlB in
+            order.withUnsafeBufferPointer { ordB in
+                let dtBase = dtB.baseAddress!
+                chunkIDs.withUnsafeMutableBufferPointer { outIDs in
+                    DispatchQueue.concurrentPerform(iterations: nChunks) { c in
+                        let lo = c * chunkSize, hi = min(oc, lo + chunkSize)
+                        if lo >= hi { return }
+                        var ids = [Int32]()
+                        var span = [UInt8](repeating: 0, count: max(2 * tailCap + 1, 1))
+                        span.withUnsafeMutableBufferPointer { spB in
+                            let spBase = spB.baseAddress!
+                            for k in lo..<hi {
+                                let id = Int(ascending ? ordB[k] : ordB[oc - 1 - k])
+                                if delB[id] { continue }
+                                if otB[id] == VNODE_VDIR { if dcB[id] { ids.append(Int32(id)) }; continue }
+                                let (nmPtr, nmLen) = nameSeg(id)
+                                let p = Int(parB[id])
+                                var matched = nmLen >= nLen && memmem(nmPtr, nmLen, ndBase, nLen) != nil
+                                if !matched, p >= 0 {
+                                    if dcB[p] { matched = true }
+                                    // spanHit is safe when the parent tail is empty (pTail==0):
+                                    // it emits only the "/" separator + name head, never reads dtBase.
+                                    else { matched = spanHit(Int(dtlB[p]), p &* tailCap, nmPtr, nmLen, dtBase, spBase) }
+                                }
+                                if matched { ids.append(Int32(id)) }
+                            }
+                        }
+                        outIDs[c] = ids
+                    }
+                }
+            }}}}
+
+            var full = [Int32](); full.reserveCapacity(chunkIDs.reduce(0) { $0 + $1.count })
+            for c in 0..<chunkIDs.count { full.append(contentsOf: chunkIDs[c]) }
+            let total = full.count
+            let out = total > limit ? Array(full[0..<limit]) : full
+            pathScopeResult = SearchResults(ids: out, total: total, truncated: total > out.count,
+                                            queryMillis: secondsBetween(start, clock.now) * 1000)
+        }}}}}}}}}}
+
+        return pathScopeResult
     }
 
     /// True if `bytes` begins with `prefix` (byte-wise).

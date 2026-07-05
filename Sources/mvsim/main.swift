@@ -540,6 +540,46 @@ check("file: type:images drops the directory but keeps the file",
 check("type:bogus is a literal term, not a filter", names("type:bogus").isEmpty)
 
 
+// path: fast prepass (fastPathScope) MUST equal the general full-path evaluator, byte for
+// byte, on every needle & fixture — the whole correctness contract of the #7 speedup.
+// _debugForceGeneralPath flips the engine to the trusted ground-truth scan for comparison.
+func pathAB(_ needle: String, _ mode: MatchMode = .exact) -> (fast: [String], slow: [String]) {
+    engine._debugForceGeneralPath = true
+    let slow = names("path:\(needle)", mode: mode)
+    engine._debugForceGeneralPath = false
+    let fast = names("path:\(needle)", mode: mode)
+    return (fast, slow)
+}
+// also exercise full-path MODE (⌃U): a bare term, path scope via the search scope
+func fullPathAB(_ needle: String) -> (fast: [String], slow: [String]) {
+    engine._debugForceGeneralPath = true
+    let slow = names(needle, scope: .fullPath)
+    engine._debugForceGeneralPath = false
+    let fast = names(needle, scope: .fullPath)
+    return (fast, slow)
+}
+let pathNeedles = [
+    "report", "src", "src/a", "src/a/b/c/d", "d/leaf",          // deep nesting + segment joins
+    "img/image", "g/image_0", "intl", "intl/한글", "한글파일",   // boundary spans + unicode
+    "café", "CAFÉ", "kind/manual", "thumbs.jpg", "thumbs.jpg/pic", // fold + media-trap dir
+    "dupA/twin", "twin_name", "/", "a/b/c", ".hidden/.sec",      // separator, single-char, hidden
+    "zdir/marker_apple", "mvsim-tree", "no_such_path_xyz",       // whole-index root, non-match
+    "z", ".", "t", "é",                                          // single-char needles (tailCap==0 path)
+]
+for nd in pathNeedles {
+    let r = pathAB(nd)
+    check("path:\(nd) fast≡general (\(r.slow.count) hits)", Set(r.fast) == Set(r.slow))
+    let fp = fullPathAB(nd)
+    check("⌃U '\(nd)' fast≡general", Set(fp.fast) == Set(fp.slow))
+}
+// concrete behaviour (not just fast≡slow): real hits, boundary spans, non-matches
+check("path:src/a/b/c/d finds the deep leaf", has("path:src/a/b/c/d", "leaf.txt"))
+check("path:g/image_0 (boundary span across img/) finds images", has("path:g/image_0", "image_001.png"))
+check("path:intl finds the unicode file", has("path:intl", "한글파일.txt"))
+check("path:thumbs.jpg finds the file inside the media-trap dir", has("path:thumbs.jpg", "picture.jpg"))
+check("path:no_such_path_xyz finds nothing", pathAB("no_such_path_xyz").fast.isEmpty)
+check("path:report excludes a file in a different dir", !has("path:src/a", "report.txt"))
+
 // dynamic mount lifecycle: a new crawl root can be appended after launch, then tombstoned
 // as one subtree on unmount. Both operations must self-invalidate search caches.
 mkdir(dynamicRoot)

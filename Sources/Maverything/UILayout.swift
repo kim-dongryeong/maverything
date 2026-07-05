@@ -40,12 +40,12 @@ extension Color {
 }
 
 extension NSColor {
-    /// The emerald title-bar/header band — brand accent blended toward the window
-    /// background so it reads as a tinted chrome band, not a neon block. Recomputed
-    /// per call so it tracks the current light/dark appearance.
+    /// The emerald title-bar/header band. It renders as a real accessory view ABOVE the
+    /// title-bar material, so it must be a BOLD color (a light blend gets visually lost).
+    /// Kept mostly-solid emerald (matches the app icon #10B981), only slightly grounded.
     static var mvBand: NSColor {
-        NSColor(red: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0, alpha: 1)
-            .blended(withFraction: 0.35, of: .windowBackgroundColor) ?? .windowBackgroundColor
+        NSColor(srgbRed: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0, alpha: 1)
+            .blended(withFraction: 0.08, of: .windowBackgroundColor) ?? NSColor(srgbRed: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0, alpha: 1)
     }
 }
 

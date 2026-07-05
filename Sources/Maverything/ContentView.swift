@@ -6,12 +6,55 @@ struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @FocusState private var searchFocused: Bool
 
+    /// The app-icon emerald gradient (#0C6E5F → #10B981 → #A6E635), horizontal so the logo
+    /// palette reads across the wide title-bar band and the (full-width) search bar align.
+    private static let mvBandGradient = LinearGradient(
+        gradient: Gradient(stops: [
+            .init(color: Color(red: 0x0C / 255.0, green: 0x6E / 255.0, blue: 0x5F / 255.0), location: 0),
+            .init(color: Color(red: 0x10 / 255.0, green: 0xB9 / 255.0, blue: 0x81 / 255.0), location: 0.52),
+            .init(color: Color(red: 0xA6 / 255.0, green: 0xE6 / 255.0, blue: 0x35 / 255.0), location: 0.86),
+        ]),
+        startPoint: .leading, endPoint: .trailing)
+
+    /// The title-bar fill: the icon's LINEAR gradient PLUS two soft RADIAL glows (mint upper-left,
+    /// lime lower-right) — exactly the layers on the app-icon background. Siri-logo style, where
+    /// the color pools glow softly and don't need to span edge to edge. Empty when tint is off.
+    @ViewBuilder private var bandBackground: some View {
+        if model.titleBarTint != .off {
+            ZStack {
+                Self.mvBandGradient
+                RadialGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0x8C / 255.0, green: 0xF5 / 255.0, blue: 0xD2 / 255.0).opacity(0.60), .clear]),
+                    center: UnitPoint(x: 0.24, y: 0.10), startRadius: 0, endRadius: 240)
+                // A soft CYAN pool in the middle — a cooler, different-family accent so the band
+                // reads Siri-like (multi-hue) instead of a single green sweep. Kept faint.
+                RadialGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0x22 / 255.0, green: 0xD3 / 255.0, blue: 0xEE / 255.0).opacity(0.38), .clear]),
+                    center: UnitPoint(x: 0.56, y: 0.35), startRadius: 0, endRadius: 210)
+                RadialGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0xD4 / 255.0, green: 0xF7 / 255.0, blue: 0x6A / 255.0).opacity(0.55), .clear]),
+                    center: UnitPoint(x: 0.86, y: 0.95), startRadius: 0, endRadius: 280)
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
+            // Title-bar strip drawn EDGE-TO-EDGE behind the traffic lights. The window uses
+            // .windowStyle(.hiddenTitleBar) (no native title bar / no material), so this
+            // emerald reaches all the way up and reads bold — the close/min/max buttons sit
+            // on top of it. (.off → clear, so the buttons keep the plain background.)
+            Color.clear
+                .frame(height: 28)
+                .background { bandBackground }            // icon gradient + soft radial glows (clear when off)
             searchBar
-                // .full extends the emerald title-bar band DOWN over the search bar so
-                // the whole header is one contiguous colored block (vs .strip = title bar only).
-                .background(model.titleBarTint == .full ? Color(nsColor: .mvBand) : Color.clear)
+                // .full continues the band DOWN over the search bar so the header reads as one
+                // block; .strip/.off leave the search bar plain. The linear part is horizontal,
+                // so the band and the (full-width) search bar line up seamlessly.
+                .background { if model.titleBarTint == .full { bandBackground } }
             Divider()
             FilterBar(model: model)
             Divider()
@@ -25,8 +68,24 @@ struct ContentView: View {
             Divider()
             statusBar
         }
+        .ignoresSafeArea(.container, edges: .top)
+        .overlay {
+            // A thin GRADIENT border around the whole window, echoing the title-bar band.
+            // (Yes — borders can be gradients: SwiftUI strokeBorder takes any ShapeStyle.)
+            if model.titleBarTint != .off {
+                ContainerRelativeShape()          // follows the window's own corner radius — no magic number
+                    .strokeBorder(Self.mvBandGradient, lineWidth: 3)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+        }
         .preferredColorScheme(model.appearance.colorScheme)
-        .onAppear { searchFocused = true }
+        .onAppear {
+            searchFocused = true
+            DispatchQueue.main.async {
+                configureWindow()
+            }
+        }
         .onChange(of: model.focusNonce) { searchFocused = true }
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView().environmentObject(model)
@@ -36,7 +95,6 @@ struct ContentView: View {
             AdvancedSearchSheet().environmentObject(model)
         }
         .background(OpenSettingsBridge(model: model))
-        .background(TitleBarTinter(style: model.titleBarTint))
     }
 
     @ViewBuilder private var layoutBody: some View {
@@ -146,7 +204,11 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 10)
-            .background(RoundedRectangle(cornerRadius: 9).fill(.quaternary.opacity(0.55)))
+            // In .full the whole header is gradient; keep the search INPUT box itself an
+            // opaque neutral field so the gradient doesn't tint it (only the bar around it).
+            .background(RoundedRectangle(cornerRadius: 9).fill(
+                model.titleBarTint == .full ? AnyShapeStyle(Color(nsColor: .textBackgroundColor))
+                                            : AnyShapeStyle(.quaternary.opacity(0.55))))
             .overlay(
                 RoundedRectangle(cornerRadius: 9)
                     .strokeBorder(searchFocused ? Color.accentColor
@@ -262,31 +324,14 @@ struct ContentView: View {
         .foregroundStyle(Color.accentColor)
         .help("Searching in \(root)")
     }
-}
 
-/// Tints the window's title-bar region (behind the traffic lights) to give the app a
-/// Chrome/VS Code-style visual identity. Reactive: re-applies whenever the style changes.
-/// `.full` washes the whole title bar; `.off`/`.strip` leave the system background
-/// (the strip's accent is drawn in the content instead).
-private struct TitleBarTinter: NSViewRepresentable {
-    let style: TitleBarTintStyle
-    func makeNSView(context: Context) -> NSView { NSView() }
-    func updateNSView(_ v: NSView, context: Context) {
-        let style = self.style
-        DispatchQueue.main.async {
-            guard let w = v.window else { return }
-            switch style {
-            case .off:
-                // No tint — the title bar shows the system window background.
-                w.backgroundColor = .windowBackgroundColor
-            case .strip, .full:
-                // Both color the title-bar region the SAME emerald band (the only way to
-                // paint behind the traffic lights is window.backgroundColor). They differ
-                // in EXTENT, not intensity: .full ALSO tints the search bar below (see the
-                // searchBar .background above) so the header becomes one contiguous block;
-                // .strip leaves the search bar untinted so only the title bar is colored.
-                w.backgroundColor = .mvBand
-            }
-        }
+    /// The title-bar tint is now pure SwiftUI content (the edge-to-edge strip above), drawn
+    /// under the traffic lights because the scene uses `.windowStyle(.hiddenTitleBar)` and the
+    /// body `.ignoresSafeArea(.top)`. Here we only make the frameless window draggable by its
+    /// background (there's no title bar to grab) and pin its level.
+    private func configureWindow() {
+        guard let window = (NSApp.delegate as? AppDelegate)?.mainWindow ?? NSApp.windows.first else { return }
+        window.level = .normal
+        window.isMovableByWindowBackground = true
     }
 }

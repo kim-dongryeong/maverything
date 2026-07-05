@@ -13,13 +13,14 @@ struct MaverythingApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 720, minHeight: 420)
-                .background(WindowConfigurator())
                 .onAppear {
                     delegate.model = model
                     model.requestHide = { [weak delegate] in delegate?.hideMainWindow() }
                     model.start()
                 }
         }
+        .windowStyle(.hiddenTitleBar)   // no native title bar → content goes edge-to-edge, so the
+                                        // emerald title-bar strip reaches up behind the traffic lights
         .windowResizability(.contentMinSize)
         .defaultSize(width: 960, height: 620)
         .commands {
@@ -200,24 +201,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Grabs the hosting NSWindow once it exists and gives it the floating,
-/// title-less quick-search look — done here (not by creating a window manually)
-/// so SwiftUI owns realization and there's no launch-time deadlock.
-private struct WindowConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let v = NSView()
-        DispatchQueue.main.async {
-            guard let window = v.window else { return }
-            (NSApp.delegate as? AppDelegate)?.mainWindow = window
-            window.level = .normal               // not always-on-top
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.isMovableByWindowBackground = true
-            window.standardWindowButton(.zoomButton)?.isHidden = false
-            // (SwiftUI's Window(id:) scene already persists frame; a manual
-            // setFrameAutosaveName would fight it, so we don't set one.)
-        }
-        return v
-    }
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
+

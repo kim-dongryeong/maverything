@@ -12,6 +12,11 @@ public struct SearchResults: Sendable {
     public var total: Int        // total matches (may exceed ids.count if truncated)
     public var truncated: Bool
     public var queryMillis: Double
+    // `content:` search is bounded (it streams file bodies on demand). When it hits the
+    // candidate budget or skips oversized files, the result is INCOMPLETE — surfaced so the
+    // UI/CLI/MCP can say "not found *so far*" instead of a false "no matches".
+    public var contentIncomplete: Bool = false      // hit the 200k-candidate scan budget
+    public var contentSkippedLarge: Int = 0         // files skipped for exceeding the 64 MB cap
 }
 
 /// Multi-core search over the packed name blob (the Everything model). A simple
@@ -167,11 +172,14 @@ public final class SearchEngine: @unchecked Sendable {
         var ids = res.ids
         var total = res.total
         var extraMillis = 0.0
+        var contentIncomplete = false
+        var contentSkippedLarge = 0
         if let p = post {
             let clock = ContinuousClock(); let t0 = clock.now
             if !p.tagGroups.isEmpty { ids = Self.filterByTags(ids, groups: p.tagGroups, index: index) }
             if let needle = p.contentNeedle {
-                ids = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive, index: index)
+                let c = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive, index: index)
+                ids = c.ids; contentIncomplete = c.incomplete; contentSkippedLarge = c.skippedLarge
             }
             total = ids.count
             extraMillis += secondsBetween(t0, clock.now) * 1000
@@ -216,33 +224,36 @@ public final class SearchEngine: @unchecked Sendable {
         // single final cap
         let capped = ids.count > limit ? Array(ids[0..<limit]) : ids
         return SearchResults(ids: capped, total: total, truncated: total > capped.count,
-                             queryMillis: res.queryMillis + extraMillis)
+                             queryMillis: res.queryMillis + extraMillis,
+                             contentIncomplete: contentIncomplete, contentSkippedLarge: contentSkippedLarge)
     }
 
     // MARK: - post-lock filters (content: / tag:) — Everything 1.4-style on-demand
 
     private static let contentMaxFileBytes: Int64 = 64 << 20     // skip files > 64 MB
-    private static let contentMaxCandidates = 200_000            // scan budget (bare `content:` safety)
+    public static let contentMaxCandidates = 200_000             // scan budget (bare `content:` safety) — surfaced in the UI warning
 
     /// On-demand file-content substring (ASCII case-insensitive unless case:on) — the
     /// same 64 KiB-window streaming model Cardinal uses; no content index is kept.
     static func filterByContent(_ ids: [Int32], needle: [UInt8], caseSensitive: Bool,
-                                index: FileIndex) -> [Int32] {
-        guard !needle.isEmpty else { return ids }
+                                index: FileIndex) -> (ids: [Int32], incomplete: Bool, skippedLarge: Int) {
+        guard !needle.isEmpty else { return (ids, false, 0) }
         let folded = caseSensitive ? needle : needle.map(asciiLower)
         var out: [Int32] = []
         var scanned = 0
+        var skippedLarge = 0
+        var incomplete = false
         for id in ids {
             let r = index.row(Int(id))
             if r.isDir { continue }
-            if r.size > contentMaxFileBytes { continue }
-            if scanned >= contentMaxCandidates { break }   // budget → truncated, not frozen
+            if r.size > contentMaxFileBytes { skippedLarge += 1; continue }
+            if scanned >= contentMaxCandidates { incomplete = true; break }   // budget → truncated, not frozen
             scanned += 1
             if fileContains(path: r.path, needle: folded, caseSensitive: caseSensitive) {
                 out.append(id)
             }
         }
-        return out
+        return (out, incomplete, skippedLarge)
     }
 
     /// Streaming scan: 64 KiB windows with a needle-1 overlap so matches can span

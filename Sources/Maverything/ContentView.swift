@@ -299,6 +299,15 @@ struct ContentView: View {
                 if !model.hasFullDiskAccess {
                     Text("· limited (no Full Disk Access)").foregroundStyle(.orange)
                 }
+                if model.contentIncomplete {
+                    Text("· content scan partial — narrow the query for complete results")
+                        .foregroundStyle(.orange)
+                        .help("Content search stopped after scanning \(SearchEngine.contentMaxCandidates.formatted()) candidate files. Add a name/ext/path filter so fewer files need to be opened.")
+                } else if model.contentSkippedLarge > 0 {
+                    Text("· \(model.contentSkippedLarge.formatted()) large file\(model.contentSkippedLarge == 1 ? "" : "s") skipped")
+                        .foregroundStyle(.secondary)
+                        .help("Files larger than 64 MB are skipped by content search.")
+                }
             }
             Spacer()
             if !model.isIndexing {

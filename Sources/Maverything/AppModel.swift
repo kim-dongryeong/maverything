@@ -90,6 +90,8 @@ final class AppModel: ObservableObject {
     @Published var statusText = "Starting…"
     @Published var resultTotal = 0
     @Published var resultShown = 0          // rows actually returned (may be capped below resultTotal)
+    @Published var contentIncomplete = false   // `content:` hit the scan budget → results may be partial
+    @Published var contentSkippedLarge = 0     // files skipped for exceeding the 64 MB content cap
     @Published var indexedCount = 0
     @Published var queryMillis = 0.0
     @Published var resultsVersion = 0
@@ -1165,6 +1167,8 @@ final class AppModel: ObservableObject {
                 self.resultsStore.ids = res.ids
                 self.resultTotal = res.total
                 self.resultShown = res.ids.count
+                self.contentIncomplete = res.contentIncomplete
+                self.contentSkippedLarge = res.contentSkippedLarge
                 self.queryMillis = res.queryMillis
                 self.resultsVersion &+= 1
             }

@@ -474,6 +474,16 @@ check("content: excludes non-matching files", !has("content:secret-token", "bori
 check("content: combined with ext filter", has("ext:txt content:quietly", "contentful.txt"))
 check("content: no match returns empty", engine.search("content:zzznope_xyz", limit: 100, now: now).total == 0)
 
+// content: oversized files are skipped AND reported (contentSkippedLarge) — not silently absent
+FileManager.default.createFile(atPath: root + "/huge_blob.bin", contents: Data(count: (64 << 20) + 4096))
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+let hugeRes = engine.search("content:secret-token", limit: 100, now: now)
+check("content: oversized file counted in contentSkippedLarge", hugeRes.contentSkippedLarge >= 1)
+check("content: oversized zero file not a false match", !has("content:secret-token", "huge_blob.bin"))
+check("content: normal query flags no incompleteness", !engine.search("content:secret-token", limit: 100, now: now).contentIncomplete)
+try? FileManager.default.removeItem(atPath: root + "/huge_blob.bin")
+_ = rec.reconcile(eventPaths: [root]); engine.invalidate()
+
 // tag: — Finder tag filter (xattr path; mdfind path needs >10k candidates, not simulated)
 func setTag(_ path: String, _ tags: [String]) {
     let value = tags.map { "\($0)\n2" }

@@ -837,7 +837,7 @@ final class AppModel: ObservableObject {
             }
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
-            self.runSearch()
+            self.runSearch(userInitiated: false)         // background live refresh — must not blink the empty-state
             self.warmCachesInBackground()                // keep type-chip clicks instant
         }
     }
@@ -1161,9 +1161,13 @@ final class AppModel: ObservableObject {
         return out
     }
 
-    func runSearch() {
+    /// `userInitiated` = the user changed the query/chip/scope/options. Only those flip
+    /// `searchInFlight` (to hide a stale "No Results" during the gap). Background live
+    /// refreshes (FSEvents fire constantly on a live Mac) must NOT toggle it, or the
+    /// empty-state would blink on every filesystem change.
+    func runSearch(userInitiated: Bool = true) {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
-        searchInFlight = true               // hide a stale "No Results" until this result lands
+        if userInitiated { searchInFlight = true }   // hide a stale "No Results" until this lands
         let seq = nextSearchSeq()
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
         let root = scopeRoot
@@ -1183,7 +1187,7 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.currentSearchSeq() == seq else { return }
                     self.resultsStore.ids = []; self.resultTotal = 0; self.resultShown = 0
-                    self.searchInFlight = false
+                    if self.searchInFlight { self.searchInFlight = false }
                     self.resultsVersion &+= 1
                 }
                 return
@@ -1198,7 +1202,7 @@ final class AppModel: ObservableObject {
                 self.contentIncomplete = res.contentIncomplete
                 self.contentSkippedLarge = res.contentSkippedLarge
                 self.queryMillis = res.queryMillis
-                self.searchInFlight = false
+                if self.searchInFlight { self.searchInFlight = false }
                 self.resultsVersion &+= 1
             }
         }

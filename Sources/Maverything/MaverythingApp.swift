@@ -24,15 +24,22 @@ struct MaverythingApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: 960, height: 620)
         .commands {
-            SearchCommands(model: model)   // Everything's Search menu (⌃U/⌃I/⌃B/⌃R live here)
-            ViewCommands(model: model)     // layouts ⌘1/2/3 in the View menu
-            CommandGroup(replacing: .help) {
-                Button("Search Syntax") { model.showSyntax = true }
-                    .keyboardShortcut("/")
-                Button("Keyboard Shortcuts") { model.showShortcuts = true }
-                    .keyboardShortcut("/", modifiers: .control)
-            }
+            NewSearchWindowCommand()       // File ▸ New Search Window (⌘N)
+            SearchCommands(primary: model) // Everything's Search menu (⌃U/⌃I/⌃B/⌃R live here)
+            ViewCommands(primary: model)   // layouts ⌘1/2/3 in the View menu
+            HelpCommands(primary: model)
         }
+
+        // Everything-style "New Search Window" (⌘N): every window shares the ONE index +
+        // engine (no second crawl, no extra RAM for the index) but owns its own query,
+        // results, sort, chips, and layout — a per-window AppModel attached to the primary.
+        WindowGroup(id: "search") {
+            SecondarySearchWindow(primary: model)
+                .frame(minWidth: 720, minHeight: 420)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 960, height: 620)
 
         Settings {
             SettingsView().environmentObject(model)
@@ -48,10 +55,47 @@ struct MaverythingApp: App {
     }
 }
 
+/// Root of a "New Search Window": builds a per-window AppModel attached to the primary
+/// (shared index/engine, independent view state) exactly once per window instance.
+private struct SecondarySearchWindow: View {
+    private let primary: AppModel
+    @StateObject private var model: AppModel
+
+    init(primary: AppModel) {
+        self.primary = primary
+        _model = StateObject(wrappedValue: AppModel(attachedTo: primary))
+    }
+
+    var body: some View {
+        ContentView()
+            .environmentObject(model)
+            .onAppear {
+                primary.start()   // idempotent — covers state restoration reopening only this window
+                model.start()
+            }
+    }
+}
+
+/// File ▸ New Search Window (⌘N) — replaces the default New item.
+struct NewSearchWindowCommand: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Search Window") { openWindow(id: "search") }
+                .keyboardShortcut("n")
+        }
+    }
+}
+
 /// The menu-bar "Search" menu — the canonical macOS home for these shortcuts
 /// (mirrors Windows Everything's Search menu, same key set).
+/// Multi-window: commands target the KEY window's model (published by each ContentView
+/// via .focusedSceneObject), falling back to the primary when no search window is key.
 struct SearchCommands: Commands {
-    @ObservedObject var model: AppModel
+    @FocusedObject private var focused: AppModel?
+    @ObservedObject var primary: AppModel
+    private var model: AppModel { focused ?? primary }
 
     var body: some Commands {
         CommandMenu("Search") {
@@ -63,9 +107,11 @@ struct SearchCommands: Commands {
                 get: { model.scope == .fullPath },
                 set: { model.scope = $0 ? .fullPath : .nameOnly }))
                 .keyboardShortcut("u", modifiers: .control)
-            Toggle("Match Case", isOn: $model.matchCase)
+            Toggle("Match Case", isOn: Binding(
+                get: { model.matchCase }, set: { model.matchCase = $0 }))
                 .keyboardShortcut("i", modifiers: .control)
-            Toggle("Match Whole Word", isOn: $model.wholeWord)
+            Toggle("Match Whole Word", isOn: Binding(
+                get: { model.wholeWord }, set: { model.wholeWord = $0 }))
                 .keyboardShortcut("b", modifiers: .control)
             Divider()
             // Mode shortcuts: each is a to-mode/back toggle (Everything's ⌃R
@@ -97,8 +143,11 @@ struct SearchCommands: Commands {
 }
 
 /// Layout switching as real View-menu items (⌘1/2/3), with checkmarks.
+/// Targets the key window's model (multi-window), falling back to the primary.
 struct ViewCommands: Commands {
-    @ObservedObject var model: AppModel
+    @FocusedObject private var focused: AppModel?
+    @ObservedObject var primary: AppModel
+    private var model: AppModel { focused ?? primary }
 
     private func layoutToggle(_ l: UILayout) -> Binding<Bool> {
         Binding(get: { model.layout == l }, set: { if $0 { model.layout = l } })
@@ -144,9 +193,26 @@ struct ViewCommands: Commands {
                 .keyboardShortcut("6", modifiers: .control)
             Toggle("Sort by Run Count", isOn: sortToggle(.runCount))
                 .keyboardShortcut("7", modifiers: .control)
-            Toggle("Ascending", isOn: $model.ascending)
+            Toggle("Ascending", isOn: Binding(
+                get: { model.ascending }, set: { model.ascending = $0 }))
                 .keyboardShortcut("0", modifiers: .control)
             Divider()
+        }
+    }
+}
+
+/// Help-menu items routed to the key window's model (syntax sheet opens in THAT window).
+struct HelpCommands: Commands {
+    @FocusedObject private var focused: AppModel?
+    @ObservedObject var primary: AppModel
+    private var model: AppModel { focused ?? primary }
+
+    var body: some Commands {
+        CommandGroup(replacing: .help) {
+            Button("Search Syntax") { model.showSyntax = true }
+                .keyboardShortcut("/")
+            Button("Keyboard Shortcuts") { model.showShortcuts = true }
+                .keyboardShortcut("/", modifiers: .control)
         }
     }
 }

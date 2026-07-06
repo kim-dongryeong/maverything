@@ -145,6 +145,7 @@ final class AppModel: ObservableObject {
             UserDefaults.standard.set(wildcardWholeName, forKey: "mv.wildcardWholeName")
             engine.wholeNameWildcards = wildcardWholeName
             runSearch()
+            broadcastResultsRefresh()   // engine-level option — other windows must re-search too
         }
     }
     @Published var typeFilter: TypeFilter = .all   // Everything-style quick type chips
@@ -194,6 +195,7 @@ final class AppModel: ObservableObject {
             UserDefaults.standard.set(foldersFirst, forKey: "mv.foldersFirst")
             engine.foldersFirst = foldersFirst
             runSearch()
+            broadcastResultsRefresh()   // engine-level option — other windows must re-search too
         }
     }
     /// Everything 1.5's "Index folder sizes": folders sort AND display by their live
@@ -205,6 +207,7 @@ final class AppModel: ObservableObject {
             engine.useFolderSizes = indexFolderSizes
             engine.invalidate()          // size order must rebuild with/without folder totals
             runSearch()
+            broadcastResultsRefresh()   // engine-level option — other windows must re-search too
         }
     }
     /// Minutes between scheduled rescans of the custom index roots (0 = off).
@@ -220,6 +223,7 @@ final class AppModel: ObservableObject {
             UserDefaults.standard.set(showHidden, forKey: "mv.showHidden")
             engine.hideHidden = !showHidden      // result-level filter — no reindex
             runSearch()
+            broadcastResultsRefresh()   // engine-level option — other windows must re-search too
         }
     }
     @Published var enterRenames: Bool = UserDefaults.standard.bool(forKey: "mv.enterRenames") {
@@ -263,8 +267,21 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(clearSearchOnClose, forKey: "mv.clearSearchOnClose") }
     }
 
-    let index = FileIndex()
-    lazy var engine = SearchEngine(index: index)
+    // Multi-window: the FIRST model (primary) owns the whole index lifecycle — crawl,
+    // FSEvents, snapshot, query server, hotkey. A "New Search Window" model attaches to
+    // the primary's index + engine (both are concurrency-safe: engine caches are lock-
+    // guarded and searches run under the index read lock — QueryServer already drives one
+    // engine from concurrent connections), while ALL view state (query, results, sort,
+    // chips, layout, selection) stays per-window in each model instance.
+    let index: FileIndex
+    let engine: SearchEngine
+    let isPrimary: Bool
+    weak var window: NSWindow?   // this model's own NSWindow (ContentView's WindowAccessor sets it)
+    /// Posted by whichever model changed state that affects every window's RESULTS
+    /// (index contents after a live refresh/crawl, engine-level options). Every OTHER
+    /// model re-runs its own search on receipt.
+    static let resultsShouldRefresh = Notification.Name("mv.resultsShouldRefresh")
+    private var refreshObserver: NSObjectProtocol?
     let resultsStore = ResultsStore()
 
     private var cancellables = Set<AnyCancellable>()
@@ -286,8 +303,70 @@ final class AppModel: ObservableObject {
     private var pendingVolumeRefresh = false
 
     init() {
+        index = FileIndex()
+        engine = SearchEngine(index: index)
+        isPrimary = true
         resultsStore.index = index
+        wireSearchPipelines()
+        observeCrossWindowRefresh()
 
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.saveSnapshot(sync: true)
+            AppModel.sharedRunStats.flush()   // persist run history before exit
+            self?.queryServer?.stop()         // remove the socket
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appBecameActive),
+            name: NSApplication.didBecomeActiveNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(volumeDidMount(_:)),
+            name: NSWorkspace.didMountNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(volumeDidUnmount(_:)),
+            name: NSWorkspace.didUnmountNotification, object: nil)
+    }
+
+    /// A "New Search Window" model: shares the primary's index + engine, owns its own
+    /// query/results/sort/chip state, and skips the entire index lifecycle (crawl, watch,
+    /// snapshot, query server, onboarding) — those remain the primary's job.
+    init(attachedTo primary: AppModel) {
+        index = primary.index
+        engine = primary.engine
+        isPrimary = false
+        resultsStore.index = index
+        wireSearchPipelines()
+        observeCrossWindowRefresh()
+
+        // Mirror the primary's shared status so this window's overlays/status bar stay live.
+        isIndexing = primary.isIndexing
+        indexedCount = primary.indexedCount
+        statusText = primary.statusText
+        hasFullDiskAccess = primary.hasFullDiskAccess
+        primary.$isIndexing.dropFirst()
+            .sink { [weak self] v in
+                self?.isIndexing = v
+                if !v { self?.runSearch() }   // crawl / snapshot load finished → populate
+            }
+            .store(in: &cancellables)
+        primary.$indexedCount.dropFirst()
+            .sink { [weak self] in self?.indexedCount = $0 }.store(in: &cancellables)
+        primary.$statusText.dropFirst()
+            .sink { [weak self] in self?.statusText = $0 }.store(in: &cancellables)
+        primary.$hasFullDiskAccess.dropFirst()
+            .sink { [weak self] in self?.hasFullDiskAccess = $0 }.store(in: &cancellables)
+        // ESC closes THIS window (the primary instead hides via the app delegate).
+        requestHide = { [weak self] in self?.window?.performClose(nil) }
+    }
+
+    deinit {
+        if let refreshObserver { NotificationCenter.default.removeObserver(refreshObserver) }
+    }
+
+    /// The per-window search plumbing every model needs: debounce the query field and
+    /// re-run on any search-input change. (Identical for primary and secondary windows.)
+    private func wireSearchPipelines() {
         $query
             .debounce(for: .milliseconds(35), scheduler: DispatchQueue.main)  // fires during window tracking too
             .removeDuplicates()
@@ -315,23 +394,22 @@ final class AppModel: ObservableObject {
         .dropFirst()
         .sink { [weak self] in self?.queryNonce &+= 1; self?.runSearch() }
         .store(in: &cancellables)
+    }
 
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.saveSnapshot(sync: true)
-            AppModel.sharedRunStats.flush()   // persist run history before exit
-            self?.queryServer?.stop()         // remove the socket
+    /// Re-run OUR search when another window changes shared state (index refresh,
+    /// engine-level option). The sender skips itself — it already re-searched.
+    private func observeCrossWindowRefresh() {
+        refreshObserver = NotificationCenter.default.addObserver(
+            forName: Self.resultsShouldRefresh, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, (note.object as? AppModel) !== self else { return }
+            self.runSearch()
         }
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(appBecameActive),
-            name: NSApplication.didBecomeActiveNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(volumeDidMount(_:)),
-            name: NSWorkspace.didMountNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(volumeDidUnmount(_:)),
-            name: NSWorkspace.didUnmountNotification, object: nil)
+    }
+
+    /// Tell every OTHER window to re-run its search (shared index/engine state changed).
+    private func broadcastResultsRefresh() {
+        NotificationCenter.default.post(name: Self.resultsShouldRefresh, object: self)
     }
 
     private var progressTimer: Timer?
@@ -380,6 +458,12 @@ final class AppModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        guard isPrimary else {
+            // Secondary window: the shared index is already live (or still crawling —
+            // the isIndexing mirror re-searches when it finishes). Just populate.
+            runSearch()
+            return
+        }
         engine.useFolderSizes = indexFolderSizes
         engine.foldersFirst = foldersFirst
         engine.hideHidden = !showHidden
@@ -829,7 +913,8 @@ final class AppModel: ObservableObject {
         // Moving/deleting a shown result from Finder (which makes Finder frontmost) must
         // still drop it from the list promptly; only fully defer when our window is hidden,
         // where there's nothing to update and no reason to burn a core on background churn.
-        let windowVisible = (NSApp.delegate as? AppDelegate)?.mainWindow?.isVisible ?? false
+        let windowVisible = window?.isVisible
+            ?? ((NSApp.delegate as? AppDelegate)?.mainWindow?.isVisible ?? false)
         guard NSApp.isActive || windowVisible else { pendingLiveRefresh = true; return }
         guard !liveRefreshScheduled else { return }
         liveRefreshScheduled = true
@@ -848,6 +933,7 @@ final class AppModel: ObservableObject {
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()                             // background live refresh (re-runs same inputs → no blink)
+            self.broadcastResultsRefresh()               // other search windows show the same index — refresh them
             self.warmCachesInBackground()                // keep type-chip clicks instant
         }
     }
@@ -995,6 +1081,7 @@ final class AppModel: ObservableObject {
         AppModel.sharedRunStats.clear()
         engine.invalidate()
         runSearch()
+        broadcastResultsRefresh()   // run-count sort / relevance boost changed everywhere
     }
 
     func setIncludeCloud(_ on: Bool) {
@@ -1225,6 +1312,7 @@ final class AppModel: ObservableObject {
             engine.warmCaches(sortKey: .name)   // also builds packageDirBitmap (file:/folder: chips)
         }
         runSearch()
+        broadcastResultsRefresh()   // crawl/snapshot load finished → refresh other windows too
     }
 
     // Convenience for the table coordinator.

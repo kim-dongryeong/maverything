@@ -80,12 +80,19 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(model.appearance.colorScheme)
-        .onAppear {
-            searchFocused = true
-            DispatchQueue.main.async {
-                configureWindow()
-            }
-        }
+        // Publish OUR model as the focused scene object so menu commands (⌃U/⌃I/⌘1…)
+        // target the KEY window's model, not always the primary (multi-window).
+        .focusedSceneObject(model)
+        .background(WindowAccessor { window in
+            // Per-window setup — each ContentView configures ITS OWN window. The window
+            // is frameless (.hiddenTitleBar), so make it draggable by background; only
+            // the PRIMARY registers as the delegate's main window (hotkey/summon target).
+            model.window = window
+            window.level = .normal
+            window.isMovableByWindowBackground = true
+            if model.isPrimary { (NSApp.delegate as? AppDelegate)?.mainWindow = window }
+        })
+        .onAppear { searchFocused = true }
         .onChange(of: model.focusNonce) { searchFocused = true }
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView().environmentObject(model)
@@ -339,13 +346,17 @@ struct ContentView: View {
         .help("Searching in \(root)")
     }
 
-    /// The title-bar tint is now pure SwiftUI content (the edge-to-edge strip above), drawn
-    /// under the traffic lights because the scene uses `.windowStyle(.hiddenTitleBar)` and the
-    /// body `.ignoresSafeArea(.top)`. Here we only make the frameless window draggable by its
-    /// background (there's no title bar to grab) and pin its level.
-    private func configureWindow() {
-        guard let window = (NSApp.delegate as? AppDelegate)?.mainWindow ?? NSApp.windows.first else { return }
-        window.level = .normal
-        window.isMovableByWindowBackground = true
+}
+
+/// Hands the hosting NSWindow to its ContentView — required for multi-window, where each
+/// view must configure its OWN window (the old `NSApp.windows.first` guess breaks with a
+/// second window, and `AppDelegate.mainWindow` was never even assigned before this).
+private struct WindowAccessor: NSViewRepresentable {
+    var configure: (NSWindow) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { [weak v] in if let w = v?.window { configure(w) } }
+        return v
     }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

@@ -113,6 +113,11 @@ final class AppModel: ObservableObject {
     @Published var resultShown = 0          // rows actually returned (may be capped below resultTotal)
     @Published var contentIncomplete = false   // `content:` hit the scan budget → results may be partial
     @Published var contentSkippedLarge = 0     // files skipped for exceeding the 64 MB content cap
+    // A user-initiated search (typing / chip / scope change) is dispatched but its result
+    // hasn't landed yet. While true we suppress the "No Results" empty-state so a stale
+    // "No Results" from the PREVIOUS query can't masquerade as the new query's answer —
+    // "No Results" then reliably means "search finished, genuinely nothing".
+    @Published var searchInFlight = false
     @Published var indexedCount = 0
     @Published var queryMillis = 0.0
     @Published var resultsVersion = 0
@@ -1158,6 +1163,7 @@ final class AppModel: ObservableObject {
 
     func runSearch() {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
+        searchInFlight = true               // hide a stale "No Results" until this result lands
         let seq = nextSearchSeq()
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
         let root = scopeRoot
@@ -1177,6 +1183,7 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.currentSearchSeq() == seq else { return }
                     self.resultsStore.ids = []; self.resultTotal = 0; self.resultShown = 0
+                    self.searchInFlight = false
                     self.resultsVersion &+= 1
                 }
                 return
@@ -1191,6 +1198,7 @@ final class AppModel: ObservableObject {
                 self.contentIncomplete = res.contentIncomplete
                 self.contentSkippedLarge = res.contentSkippedLarge
                 self.queryMillis = res.queryMillis
+                self.searchInFlight = false
                 self.resultsVersion &+= 1
             }
         }

@@ -150,7 +150,11 @@ struct ContentView: View {
                         .frame(maxWidth: 340)
                 }
                 .allowsHitTesting(false)
-            } else if !model.query.isEmpty || model.typeFilter != .all || model.scopeRoot != nil {
+            } else if !model.searchInFlight,
+                      !model.query.isEmpty || model.typeFilter != .all || model.scopeRoot != nil {
+                // Only once the dispatched search has actually landed — otherwise a stale
+                // "No Results" from the previous query/chip would linger during the (brief)
+                // processing gap and look like the new query's answer.
                 VStack(spacing: 6) {
                     Text("No Results")
                         .font(.title3.weight(.semibold))

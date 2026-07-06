@@ -150,11 +150,12 @@ struct ContentView: View {
                         .frame(maxWidth: 340)
                 }
                 .allowsHitTesting(false)
-            } else if !model.searchInFlight,
+            } else if model.resultsSignature == model.searchSignature,
                       !model.query.isEmpty || model.typeFilter != .all || model.scopeRoot != nil {
-                // Only once the dispatched search has actually landed — otherwise a stale
-                // "No Results" from the previous query/chip would linger during the (brief)
-                // processing gap and look like the new query's answer.
+                // Show "No Results" ONLY when the empty result belongs to the current inputs.
+                // The moment a chip/query/scope changes, searchSignature changes (live state)
+                // so a stale "No Results" vanishes at once and can't blink back before the new
+                // results land — no timing-sensitive flag involved.
                 VStack(spacing: 6) {
                     Text("No Results")
                         .font(.title3.weight(.semibold))

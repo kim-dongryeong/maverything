@@ -113,11 +113,21 @@ final class AppModel: ObservableObject {
     @Published var resultShown = 0          // rows actually returned (may be capped below resultTotal)
     @Published var contentIncomplete = false   // `content:` hit the scan budget → results may be partial
     @Published var contentSkippedLarge = 0     // files skipped for exceeding the 64 MB content cap
-    // A user-initiated search (typing / chip / scope change) is dispatched but its result
-    // hasn't landed yet. While true we suppress the "No Results" empty-state so a stale
-    // "No Results" from the PREVIOUS query can't masquerade as the new query's answer —
-    // "No Results" then reliably means "search finished, genuinely nothing".
-    @Published var searchInFlight = false
+    // The search inputs (query + filters) that produced the CURRENTLY displayed results.
+    // "No Results" shows only when this equals `searchSignature` (the inputs right now) —
+    // i.e. the empty result really belongs to what's on screen. The instant the user changes
+    // a chip/query/scope, `searchSignature` changes (it reads live @Published state), so a
+    // stale "No Results" is hidden immediately, with NO dependency on a flag being toggled
+    // in time — and a background refresh re-runs the same inputs, so the signature is
+    // unchanged and the empty-state can't blink.
+    @Published var resultsSignature = "\u{1}initial"
+
+    /// A fingerprint of every input that affects the result SET (not its order). Compared
+    /// against `resultsSignature` to decide whether "No Results" is current or stale.
+    var searchSignature: String {
+        "\(effectiveQuery)\u{1}\(String(describing: scope))\u{1}\(String(describing: matchMode))"
+        + "\u{1}\(scopeRoot ?? "")\u{1}\(wholeWord)\u{1}\(matchCase)"
+    }
     @Published var indexedCount = 0
     @Published var queryMillis = 0.0
     @Published var resultsVersion = 0
@@ -837,7 +847,7 @@ final class AppModel: ObservableObject {
             }
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
-            self.runSearch(userInitiated: false)         // background live refresh — must not blink the empty-state
+            self.runSearch()                             // background live refresh (re-runs same inputs → no blink)
             self.warmCachesInBackground()                // keep type-chip clicks instant
         }
     }
@@ -1161,14 +1171,10 @@ final class AppModel: ObservableObject {
         return out
     }
 
-    /// `userInitiated` = the user changed the query/chip/scope/options. Only those flip
-    /// `searchInFlight` (to hide a stale "No Results" during the gap). Background live
-    /// refreshes (FSEvents fire constantly on a live Mac) must NOT toggle it, or the
-    /// empty-state would blink on every filesystem change.
-    func runSearch(userInitiated: Bool = true) {
+    func runSearch() {
         guard !isIndexing else { return }   // M1: index is immutable only after crawl
-        if userInitiated { searchInFlight = true }   // hide a stale "No Results" until this lands
         let seq = nextSearchSeq()
+        let sig = searchSignature            // stamp the results with the inputs they're for
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
         let root = scopeRoot
         let now = Date().timeIntervalSince1970
@@ -1187,7 +1193,7 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.currentSearchSeq() == seq else { return }
                     self.resultsStore.ids = []; self.resultTotal = 0; self.resultShown = 0
-                    if self.searchInFlight { self.searchInFlight = false }
+                    self.resultsSignature = sig
                     self.resultsVersion &+= 1
                 }
                 return
@@ -1202,7 +1208,7 @@ final class AppModel: ObservableObject {
                 self.contentIncomplete = res.contentIncomplete
                 self.contentSkippedLarge = res.contentSkippedLarge
                 self.queryMillis = res.queryMillis
-                if self.searchInFlight { self.searchInFlight = false }
+                self.resultsSignature = sig
                 self.resultsVersion &+= 1
             }
         }

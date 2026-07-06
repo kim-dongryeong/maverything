@@ -20,3 +20,4 @@ sparkle_priv*
 *_ed25519_priv*
 .env
 .env.*
+.vscode

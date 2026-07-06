@@ -357,7 +357,9 @@ final class AppModel: ObservableObject {
         primary.$hasFullDiskAccess.dropFirst()
             .sink { [weak self] in self?.hasFullDiskAccess = $0 }.store(in: &cancellables)
         // ESC closes THIS window (the primary instead hides via the app delegate).
-        requestHide = { [weak self] in self?.window?.performClose(nil) }
+        // keyWindow fallback: requestHide only fires from views INSIDE this window, so if
+        // `window` hasn't been captured yet the key window IS this window — never a no-op.
+        requestHide = { [weak self] in (self?.window ?? NSApp.keyWindow)?.performClose(nil) }
     }
 
     deinit {

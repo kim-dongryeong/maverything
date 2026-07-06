@@ -351,12 +351,28 @@ struct ContentView: View {
 /// Hands the hosting NSWindow to its ContentView — required for multi-window, where each
 /// view must configure its OWN window (the old `NSApp.windows.first` guess breaks with a
 /// second window, and `AppDelegate.mainWindow` was never even assigned before this).
+/// Uses `viewDidMoveToWindow` (not a one-shot async peek): it fires exactly when the view
+/// lands in its window, so the callback can never be missed by a hosting-order race —
+/// a missed callback left `model.window` nil, which silently broke ESC-to-close on
+/// secondary windows.
 private struct WindowAccessor: NSViewRepresentable {
     var configure: (NSWindow) -> Void
-    func makeNSView(context: Context) -> NSView {
-        let v = NSView()
-        DispatchQueue.main.async { [weak v] in if let w = v?.window { configure(w) } }
-        return v
-    }
+    func makeNSView(context: Context) -> NSView { Probe(configure: configure) }
     func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class Probe: NSView {
+        let configure: (NSWindow) -> Void
+        private var configuredFor: ObjectIdentifier?   // once per window (re-fires if re-hosted)
+        init(configure: @escaping (NSWindow) -> Void) {
+            self.configure = configure
+            super.init(frame: .zero)
+        }
+        @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let w = window else { return }
+            let id = ObjectIdentifier(w)
+            if configuredFor != id { configuredFor = id; configure(w) }
+        }
+    }
 }

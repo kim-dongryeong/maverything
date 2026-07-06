@@ -87,6 +87,7 @@ struct ContentView: View {
             // Per-window setup — each ContentView configures ITS OWN window. The window
             // is frameless (.hiddenTitleBar), so make it draggable by background; only
             // the PRIMARY registers as the delegate's main window (hotkey/summon target).
+            Diag.log("WindowAccessor: window #\(window.windowNumber) → model(primary=\(model.isPrimary))")
             model.window = window
             window.level = .normal
             window.isMovableByWindowBackground = true
@@ -202,6 +203,7 @@ struct ContentView: View {
                         model.focusResultsNonce &+= 1
                     }
                     .onExitCommand {                         // ESC: close help, else HIDE (Everything style)
+                        Diag.log("ESC onExitCommand primary=\(model.isPrimary) syntax=\(model.showSyntax) requestHide=\(model.requestHide == nil ? "nil" : "set")")
                         if model.showSyntax { model.showSyntax = false }
                         else { model.requestHide?() }          // reopen: tray · Dock · hotkey
                     }

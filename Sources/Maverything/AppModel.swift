@@ -359,7 +359,11 @@ final class AppModel: ObservableObject {
         // ESC closes THIS window (the primary instead hides via the app delegate).
         // keyWindow fallback: requestHide only fires from views INSIDE this window, so if
         // `window` hasn't been captured yet the key window IS this window — never a no-op.
-        requestHide = { [weak self] in (self?.window ?? NSApp.keyWindow)?.performClose(nil) }
+        requestHide = { [weak self] in
+            let target = self?.window ?? NSApp.keyWindow
+            Diag.log("requestHide(secondary): window=\(self?.window?.windowNumber ?? -1) key=\(NSApp.keyWindow?.windowNumber ?? -1) target=\(target?.windowNumber ?? -1)")
+            target?.performClose(nil)
+        }
     }
 
     deinit {

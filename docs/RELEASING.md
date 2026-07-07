@@ -1,46 +1,181 @@
 # Releasing Maverything
 
-Short checklist for cutting a release. Licensed **GPL-3.0** (`LICENSE`). The DMG
-bundles the `mvfind` and `mv-mcp` helpers in `Maverything.app/Contents/Helpers/`
-(build.sh copies them); the Homebrew cask symlinks those onto PATH. Never commit
-signing/notarization/Sparkle keys — they're gitignored and live outside the repo.
+Maverything is GPL-3.0. The DMG bundles:
 
-1. **Bump the version** in `Resources/Info.plist`:
-   - `CFBundleShortVersionString` (marketing version, e.g. `0.2`)
-   - `CFBundleVersion` (monotonic build number)
+- `Maverything.app`
+- `mvfind` at `Maverything.app/Contents/Helpers/mvfind`
+- `mv-mcp` at `Maverything.app/Contents/Helpers/mv-mcp`
 
-   ```bash
-   /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 0.2' Resources/Info.plist
-   /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 2' Resources/Info.plist
-   ```
+Never commit signing identities, notarization credentials, Sparkle keys, app-specific passwords, or `.env` files.
 
-2. **Build the DMG** (universal build + package):
+## Current Release State
 
-   ```bash
-   ./make-dmg.sh          # → dist/Maverything-<ver>.dmg
-   ```
+The repo can already produce a distributable DMG:
 
-   Sanity-check: mount the DMG, launch the app from it once.
+```bash
+./make-dmg.sh
+```
 
-3. **(Future) Notarize** — requires an Apple Developer account and a
-   Developer ID Application signing identity. The exact commands are staged in
-   `make-dmg.sh` behind `MV_NOTARIZE=1`:
+If no Apple Developer ID certificate is installed, the app is signed with the local development identity or ad-hoc signing. That is fine for public testing, but macOS Gatekeeper will warn after download.
 
-   ```bash
-   MV_NOTARIZE=1 APPLE_ID=… TEAM_ID=… APP_PASSWORD=… ./make-dmg.sh
-   ```
+For a polished public release, install a **Developer ID Application** certificate and notarize the DMG.
 
-   Until then, release notes should mention the right-click → Open /
-   `xattr -dr com.apple.quarantine` first-launch step.
+Check local signing identities:
 
-4. **Create the GitHub release**: tag `v<ver>`, attach
-   `dist/Maverything-<ver>.dmg`, paste highlights from the changelog.
+```bash
+security find-identity -v -p codesigning
+```
 
-   ```bash
-   gh release create "v<ver>" dist/Maverything-<ver>.dmg --title "Maverything <ver>" --notes "…"
-   ```
+You want an identity like:
 
-5. **Update the Homebrew cask draft** `packaging/homebrew/maverything.rb`:
-   bump `version`, set `sha256` from
-   `shasum -a 256 dist/Maverything-<ver>.dmg`, verify the `url` matches the
-   uploaded asset name.
+```text
+Developer ID Application: <Name> (<TEAM_ID>)
+```
+
+## Version Bump
+
+Update `Resources/Info.plist`:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 0.2' Resources/Info.plist
+/usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 2' Resources/Info.plist
+```
+
+Rules:
+
+- `CFBundleShortVersionString`: human version, for example `0.1`, `0.2`, `1.0`
+- `CFBundleVersion`: monotonic build number
+- Git tag: `v<CFBundleShortVersionString>`
+
+## Build and Package
+
+Universal release build:
+
+```bash
+./make-dmg.sh
+```
+
+Output:
+
+```text
+dist/Maverything-<version>.dmg
+```
+
+Get checksum:
+
+```bash
+shasum -a 256 dist/Maverything-<version>.dmg
+```
+
+Sanity-check the DMG:
+
+```bash
+hdiutil attach dist/Maverything-<version>.dmg
+open /Volumes/Maverything\ <version>/Maverything.app
+hdiutil detach /Volumes/Maverything\ <version>
+```
+
+## Developer ID Signing
+
+When the Developer ID certificate is installed:
+
+```bash
+MAVERYTHING_SIGN_ID="Developer ID Application: <Name> (<TEAM_ID>)" ./build.sh
+codesign --verify --deep --strict --verbose=2 Maverything.app
+spctl --assess --type execute --verbose Maverything.app
+```
+
+Then package with the same identity:
+
+```bash
+MAVERYTHING_SIGN_ID="Developer ID Application: <Name> (<TEAM_ID>)" ./make-dmg.sh
+```
+
+## Notarization
+
+`make-dmg.sh` supports notarization through `MV_NOTARIZE=1`:
+
+```bash
+MV_NOTARIZE=1 \
+APPLE_ID="you@example.com" \
+TEAM_ID="XXXXXXXXXX" \
+APP_PASSWORD="xxxx-xxxx-xxxx-xxxx" \
+MAVERYTHING_SIGN_ID="Developer ID Application: <Name> (<TEAM_ID>)" \
+./make-dmg.sh
+```
+
+After notarization, verify:
+
+```bash
+spctl --assess --type open --verbose dist/Maverything-<version>.dmg
+xcrun stapler validate dist/Maverything-<version>.dmg
+```
+
+Prefer a keychain profile when cutting many releases:
+
+```bash
+xcrun notarytool store-credentials "maverything-notary" \
+  --apple-id "you@example.com" \
+  --team-id "XXXXXXXXXX" \
+  --password "xxxx-xxxx-xxxx-xxxx"
+```
+
+Then adapt `make-dmg.sh` to use:
+
+```bash
+xcrun notarytool submit "$DMG" --keychain-profile "maverything-notary" --wait
+```
+
+## GitHub Release
+
+Create the tag and release:
+
+```bash
+VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+git tag "v$VER"
+git push origin "v$VER"
+gh release create "v$VER" "dist/Maverything-$VER.dmg" \
+  --title "Maverything $VER" \
+  --notes-file /tmp/maverything-release-notes.md
+```
+
+Release notes should include:
+
+- top user-facing changes
+- whether the DMG is notarized
+- first-run Full Disk Access note
+- checksum
+- known limitations
+
+## Update Checker
+
+The in-app updater checks:
+
+```text
+https://api.github.com/repos/kim-dongryeong/maverything/releases/latest
+```
+
+It compares the latest release tag with `CFBundleShortVersionString` and opens the `.dmg` asset from that release.
+
+For updates to work well:
+
+- tag releases as `v0.1`, `v0.2`, etc.
+- attach `Maverything-<version>.dmg`
+- keep prerelease/draft status consistent with what users should see
+
+## Homebrew Cask Draft
+
+After the DMG is built and uploaded, update:
+
+```text
+packaging/homebrew/maverything.rb
+```
+
+Set:
+
+- `version`
+- `sha256`
+- `url`
+- `homepage`
+
+The cask should not be submitted to the main Homebrew Cask repo until releases are Developer ID signed and notarized.

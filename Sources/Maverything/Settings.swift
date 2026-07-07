@@ -178,7 +178,7 @@ struct SettingsView: View {
         .onExitCommand {   // ESC closes Settings (macOS default is ⌘W only)
             NSApp.keyWindow?.performClose(nil)
         }
-        .frame(width: 500, height: 480)
+        .frame(width: 500, height: 540)
         .environmentObject(model)
     }
 
@@ -258,6 +258,25 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text("F2 always renames. Space = Quick Look · ⌘⌫ = Move to Trash · drag rows to Finder to copy/move.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Updates") {
+                Toggle("Automatically check for updates", isOn: $model.automaticallyCheckForUpdates)
+                HStack {
+                    Button("Check Now") { model.checkForUpdates(userInitiated: true) }
+                        .disabled(model.updateCheckInProgress)
+                    if model.updateCheckInProgress { ProgressView().controlSize(.small) }
+                    Spacer()
+                    Text(model.updateStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let update = model.availableUpdate {
+                    HStack {
+                        Text("Latest: \(update.version)")
+                        Spacer()
+                        Button("Download DMG") { model.openAvailableUpdate() }
+                    }
+                }
             }
         }
         .formStyle(.grouped)

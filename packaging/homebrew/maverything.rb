@@ -4,9 +4,8 @@
 # Prepared for a future GitHub release of Maverything. Before this cask works:
 #   1. Publish a GitHub release with dist/Maverything-<version>.dmg attached
 #      (built by ./make-dmg.sh).
-#   2. Replace OWNER/REPO in `url`/`homepage` with the real GitHub location.
-#   3. Fill in `sha256` (shasum -a 256 dist/Maverything-<version>.dmg).
-#   4. For homebrew/cask submission the app must be Developer ID-signed and
+#   2. Fill in `sha256` (shasum -a 256 dist/Maverything-<version>.dmg).
+#   3. For homebrew/cask submission the app must be Developer ID-signed and
 #      notarized (see the TODO block in make-dmg.sh); unsigned apps are only
 #      acceptable in a personal tap with `--no-quarantine` caveats.
 # ============================================================================
@@ -14,10 +13,10 @@ cask "maverything" do
   version "0.1"
   sha256 "PLACEHOLDER_SHA256_OF_DMG" # TODO: shasum -a 256 Maverything-#{version}.dmg
 
-  url "https://github.com/OWNER/REPO/releases/download/v#{version}/Maverything-#{version}.dmg"
+  url "https://github.com/kim-dongryeong/maverything/releases/download/v#{version}/Maverything-#{version}.dmg"
   name "Maverything"
   desc "Instant, system-wide, real-time file search (an Everything clone for macOS)"
-  homepage "https://github.com/OWNER/REPO"
+  homepage "https://github.com/kim-dongryeong/maverything"
 
   depends_on macos: ">= :sonoma" # LSMinimumSystemVersion 14.0
 

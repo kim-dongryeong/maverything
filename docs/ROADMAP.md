@@ -1,60 +1,75 @@
-# Maverything — Roadmap
+# Maverything Roadmap
 
-Everything in this repo (including this file) is part of the open-source project — see
-"Open-source scope" at the bottom. Items are grouped by horizon, not priority.
+This file tracks public product and engineering direction only. Release credentials, signing keys, and launch/community plans do not belong in this repository.
 
-## Near-term (pre-launch)
+## Done for the First Public Test
 
-- **Apple Developer signing + notarization** — the one true gate to sharing the app
-  (`make-dmg.sh` already has the `MV_NOTARIZE=1` hook; needs Apple Developer credentials).
-- **Sparkle auto-update** — EdDSA-signed `appcast.xml` on GitHub Releases; "Check for
-  Updates" menu + optional silent background updates.
-- **GitHub launch** — LICENSE (GPL-3.0 recommended: blocks closed-source reuse, builds
-  trust for a Full-Disk-Access app), README with demo GIF + benchmark table, Homebrew
-  cask, Show HN / r/macapps.
+- GPL-3.0 license
+- native SwiftUI/AppKit app
+- whole-volume indexing
+- FSEvents live updates
+- compressed snapshot reload
+- table, compact, two-pane, and grid layouts
+- Everything-style query syntax
+- Finder actions and drag-out workflows
+- dynamic volume indexing
+- custom roots for network shares
+- folder-size indexing
+- run-count sort
+- `mvfind` CLI
+- `mv-mcp` MCP server
+- agent skill draft
+- GitHub Actions release build plus `mvsim`
+- DMG packaging
+- lightweight GitHub Releases update checker
+- README screenshots and GIF
 
-## Mid-term (adopt from the 3-app audit)
+## Near-Term
 
-- **MCP server** — a thin bridge over the existing `QueryServer` Unix socket (already
-  built + hardened). "Give an AI instant search over every file on your Mac" — a launch
-  hook none of Everything/Cling/Cardinal has. The socket protocol was designed for this
-  (versioned JSON, structured `{path,name,size,mtime,isDir}` results, `indexing` flag).
-- **Agent Skill** — a `SKILL.md` teaching an agent when/how to call `mvfind` / the MCP
-  tools (query syntax, sort keys, live-vs-snapshot). Small once the MCP exists.
-- **CLI install affordance** — Settings ▸ "Install command-line tool" (symlink `mvfind`
-  into `/usr/local/bin`), `--help`/man page polish.
-- **Unique-basename index** (Cardinal-inspired) — fold same-named files so a common
-  basename's candidate set shrinks instantly; complements the incremental narrowing.
-- **`< >` grouping operators** — Everything's parenthesized boolean grouping.
+- Developer ID signing and notarized DMG releases
+- first-run install polish for downloaded builds
+- Homebrew cask in a personal tap, then potential main cask submission after notarization
+- clearer permission diagnostics for Full Disk Access and Accessibility
+- visible Run Count / Date Run columns in the table
+- CLI install affordance from Settings
+- `mvfind --help` and shell-completion polish
+- broader benchmark table across Apple Silicon and Intel Macs
 
-## Long-term (post-adoption — "once we're downloaded and somewhat known")
+## Search and Indexing
 
-- **Run-count column** in the table (the sort key already exists; this adds a visible
-  Everything-style "Run Count" / "Date Run" column).
-- **childrenOf CSR** — pack the children map into compressed-sparse-row arrays (~25-30 MB
-  saved at 1.9M).
-- **Content full-text index** — optional, opt-in; today `content:` streams on demand
-  (64 KiB windows) with no persistent index, matching Cardinal.
+- unique-basename index for common-name narrowing
+- boolean grouping operators like `< >`
+- more Everything-compatible date and size aliases
+- richer duplicate-finder modes
+- optional content index for users who explicitly want persistent full-text search
+- more efficient children map representation
 
-## Open-source scope
+## App Experience
 
-**Yes — all of it is public**, and that is the point. If the project goes GPL-3.0/MIT
-and lives on GitHub, then the app, `mvfind`, the `QueryServer`, the **MCP server**, the
-**Agent Skill**, the docs, the mvsim test suite, and this roadmap are all in the same
-public repo. There is no private tier. The reasons this is the right call for the stated
-goal (reach + reputation, not revenue):
+- saved-search management UI
+- richer preview-pane metadata
+- better first-run demo state when the index is empty or Full Disk Access is missing
+- settings import/export
+- custom result columns
+- keyboard shortcut editor for app-level commands
 
-- macOS free-utility fame *is* GitHub stars — the whole category (Rectangle, IINA, Stats,
-  AltTab, Cling, Cardinal) is open source, and the distribution funnel (Show HN, brew,
-  "best free alternative" lists) runs through the public repo.
-- A Full-Disk-Access app is trusted only when its code is auditable ("look — zero network
-  calls"). Closing any part (especially the MCP/socket layer that exposes the index)
-  would re-raise exactly the trust question open-sourcing answers.
-- The MCP server and Skill are *marketing surface*, not moat — being public is how people
-  discover "the file-search app that plugs into my AI."
+## Updates
 
-The only things that are never in the repo are **secrets/credentials** (signing certs,
-notarization keys, EdDSA private key) — those live outside git regardless of license.
-Roadmap items being public also doesn't cost us: competitors can read the plan, but an
-actively-shipped roadmap is a strength (contributors, early adopters), and ideas aren't
-the moat — execution + the live index architecture is.
+The current updater is dependency-free: it checks GitHub Releases and opens the newest DMG.
+
+Future work:
+
+- signed Sparkle appcast
+- in-app download progress
+- automatic install flow after Developer ID signing and notarization are stable
+- release-channel preference for stable vs prerelease builds
+
+## Trust Boundary
+
+Maverything asks for Full Disk Access, so the code, release process, and privacy story must stay easy to inspect:
+
+- no telemetry
+- no analytics SDK
+- no background network calls except explicit update checks
+- no secret material in git
+- public source for the app, CLI, MCP server, tests, packaging, and docs

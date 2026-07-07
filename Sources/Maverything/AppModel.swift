@@ -266,6 +266,16 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.bool(forKey: "mv.clearSearchOnClose") {
         didSet { UserDefaults.standard.set(clearSearchOnClose, forKey: "mv.clearSearchOnClose") }
     }
+    @Published var automaticallyCheckForUpdates: Bool =
+        (UserDefaults.standard.object(forKey: "mv.automaticallyCheckForUpdates") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(automaticallyCheckForUpdates,
+                                      forKey: "mv.automaticallyCheckForUpdates")
+        }
+    }
+    @Published private(set) var updateCheckInProgress = false
+    @Published private(set) var updateStatusText = "Ready"
+    @Published private(set) var availableUpdate: AppUpdateInfo?
 
     // Multi-window: the FIRST model (primary) owns the whole index lifecycle — crawl,
     // FSEvents, snapshot, query server, hotkey. A "New Search Window" model attaches to
@@ -563,6 +573,7 @@ final class AppModel: ObservableObject {
         startPeriodicSave()
         startCustomRootRescanTimer()
         if !loadFromSnapshot() { beginIndexing() }
+        maybeCheckForUpdatesOnLaunch()
     }
 
     /// Fast path: reload the last snapshot (~100 ms) and resume live updates from
@@ -1323,6 +1334,80 @@ final class AppModel: ObservableObject {
         if let data = try? JSONEncoder().encode(savedSearches) {
             UserDefaults.standard.set(data, forKey: Self.savedKey)
         }
+    }
+
+    // MARK: - updates
+
+    private static let lastUpdateCheckKey = "mv.lastUpdateCheckAt"
+    private static let automaticUpdateInterval: TimeInterval = 12 * 3600
+
+    func maybeCheckForUpdatesOnLaunch() {
+        guard automaticallyCheckForUpdates else { return }
+        let last = UserDefaults.standard.double(forKey: Self.lastUpdateCheckKey)
+        guard Date().timeIntervalSince1970 - last > Self.automaticUpdateInterval else { return }
+        checkForUpdates(userInitiated: false)
+    }
+
+    func checkForUpdates(userInitiated: Bool) {
+        guard !updateCheckInProgress else { return }
+        updateCheckInProgress = true
+        updateStatusText = "Checking for updates…"
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let latest = try await AppUpdateChecker.fetchLatestRelease()
+                UserDefaults.standard.set(Date().timeIntervalSince1970,
+                                          forKey: Self.lastUpdateCheckKey)
+                updateCheckInProgress = false
+                if AppUpdateChecker.isNewer(latest.version) {
+                    availableUpdate = latest
+                    updateStatusText = "Maverything \(latest.version) is available."
+                    presentUpdateAvailableAlert(latest)
+                } else {
+                    availableUpdate = nil
+                    updateStatusText = "Maverything \(AppUpdateChecker.currentVersion) is up to date."
+                    if userInitiated { presentUpToDateAlert() }
+                }
+            } catch {
+                updateCheckInProgress = false
+                updateStatusText = "Couldn't check for updates."
+                if userInitiated { presentUpdateErrorAlert(error) }
+            }
+        }
+    }
+
+    func openAvailableUpdate() {
+        guard let url = availableUpdate?.downloadURL ?? availableUpdate?.releaseURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func presentUpdateAvailableAlert(_ update: AppUpdateInfo) {
+        let alert = NSAlert()
+        alert.messageText = "Maverything \(update.version) is available"
+        alert.informativeText = "You are running \(AppUpdateChecker.currentVersion). Download the latest DMG from GitHub Releases?"
+        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(update.downloadURL)
+        }
+    }
+
+    private func presentUpToDateAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Maverything is up to date"
+        alert.informativeText = "You are running version \(AppUpdateChecker.currentVersion)."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func presentUpdateErrorAlert(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't check for updates"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - export current results

@@ -1,207 +1,432 @@
 # Maverything
 
-[![CI](https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml/badge.svg)](https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml)
+<p align="center">
+  <img src="Resources/AppIcon.svg" alt="Maverything app icon" width="96" height="96">
+</p>
 
-**Mac + Everything** — a **free** macOS clone of [voidtools Everything](https://www.voidtools.com/):
-instant, system-wide, real-time file search.
+<h3 align="center">Everything-style instant file search for macOS.</h3>
 
-Type anything and matches appear **as you type, in milliseconds, across every file on
-your Mac** — including the hidden files, system files, and other apps' data that
-Spotlight deliberately ignores. Pure Swift, native AppKit/SwiftUI, no external
-dependencies, universal binary (Apple Silicon + Intel).
+<p align="center">
+  Search every file name on your Mac as you type, including hidden files, system files,
+  external volumes, and folders Spotlight does not try to expose.
+</p>
 
-<!-- TODO: screenshots
-![Search window](docs/img/screenshot-main.png)
-![Compact bar](docs/img/screenshot-compact.png)
--->
+<p align="center">
+  <a href="https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kim-dongryeong/maverything/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/kim-dongryeong/maverything/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kim-dongryeong/maverything?display_name=tag&sort=semver"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-0C6E5F"></a>
+  <img alt="macOS 14+" src="https://img.shields.io/badge/macOS-14%2B-111827">
+  <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138">
+</p>
 
-## Why it's instant
+<p align="center">
+  <a href="https://github.com/kim-dongryeong/maverything/releases/latest"><b>Download the latest DMG</b></a>
+  ·
+  <a href="docs/RELEASING.md">Release notes / packaging</a>
+  ·
+  <a href="docs/USE-CASES.md">Use cases</a>
+</p>
 
-Everything is fast on Windows because it bulk-reads the NTFS MFT, tracks changes via
-the USN journal, and brute-force scans a flat in-RAM index. macOS has none of those,
-so Maverything rebuilds the same design on APFS:
+![Maverything layout tour](docs/img/maverything-demo.gif)
 
-| Everything (NTFS) | Maverything (APFS) |
+## Why Maverything Exists
+
+Windows has [Everything](https://www.voidtools.com/): a tiny, instant, exhaustive file-name search tool that power users keep open all day.
+macOS has Spotlight, which is excellent for curated content search, but it intentionally skips many hidden, system, and app-private locations and does not behave like an exhaustive live file list.
+
+Maverything is the macOS-native attempt at the Everything mental model:
+
+- every indexed file name in RAM
+- matches while you type
+- real-time updates through file-system events
+- a transparent query syntax
+- a native app plus a terminal command and MCP server
+- free, GPL-3.0, and auditable
+
+The angle is not "another Spotlight UI." The angle is: if the file exists and your Mac lets an app see it, Maverything tries to make it searchable immediately.
+
+## Screenshots
+
+| Table search | Icon grid |
 |---|---|
-| Raw `$MFT` bulk read | `getattrlistbulk(2)` parallel tree walk (~120k entries/s/core) |
-| `$UsnJrnl` + USN cursor | FSEvents on `/` + persisted event id for resume |
-| Flat RAM list | Struct-of-arrays in RAM; paths rebuilt by walking parent links |
-| Multi-threaded `strstr` | Multi-core `memmem` over a packed UTF-8 blob, scanned in cached sort order |
-| `Everything.db` | LZFSE-compressed binary snapshot + FSEvents replay on launch |
+| ![Table layout with a live search query](docs/img/maverything-search.png) | ![Icon grid layout](docs/img/maverything-grid.png) |
 
-Measured on an Apple Silicon M4 (16 GB, APFS): cold whole-disk crawl of ~3.3 M files
-in ~26–40 s, warm relaunch from snapshot ~1 s, per-keystroke search ~0.1–3 ms
-(broadest queries ~100 ms over 4 M files).
+| Compact bar | Two-pane preview |
+|---|---|
+| ![Compact result list](docs/img/maverything-compact.png) | ![Two-pane preview layout](docs/img/maverything-preview.png) |
 
-## Features
+## What It Can Do
 
-- **Search as you type** over every indexed file name — hidden and system files included.
-  A per-file character bloom prefilter makes even fuzzy search over ~2M files run in a
-  few milliseconds.
-- **3 match modes**: **Exact substring** (Everything's default — fastest; `*`/`?`
-  auto-glob as you type), **Fuzzy** (fzf/Sublime-style with scoring), **Regex**.
-- **Everything query syntax** (combine freely, e.g. `photo ext:jpg dm:week size:>1mb`):
+### Instant File-Name Search
 
-  | Syntax | Meaning |
-  |---|---|
-  | `jpg\|png` | OR — either alternative matches (space is still AND) |
-  | `ext:png,jpg` | one of these extensions |
-  | `size:>10mb` | size `>` `<` `>=` `<=` (kb/mb/gb) |
-  | `dm:today` | modified: today / week / month / `2026-01-31` |
-  | `folder:` / `file:` | only folders / only files |
-  | `path:src` | match against the full path |
-  | `name:data` | match the name even in path mode |
-  | `case:on` | case-sensitive query |
-  | `ww:` | whole words only (`report` ≠ `reporting`) |
-  | `dupe:` | only names that exist more than once (duplicate finder) |
-  | `content:text` | search **inside** files (on-demand, slower — combine with `ext:`) |
-  | `tag:red;blue` | Finder tags — `;` = OR, repeat `tag:` = AND |
+Type a few characters and results update immediately over the in-memory index. Maverything is built around a flat RAM representation of the file tree, cached sort orders, and tight matching loops. On an Apple Silicon M4 with about 3.3 million files:
 
-  Plus `"quoted phrases"` and `-negation`.
-- **Everything's toggle shortcuts**: `⌃U` Match Path · `⌃I` Match Case · `⌃B` Match
-  Whole Word · `⌃R` Regex (and `⌘F` focus search, `⌥⌘R` reindex).
-- **Type-filter chips** under the search field (Folders, Documents, Images, …) —
-  one click ANDs a `folder:`/`ext:` clause with your query.
-- **3 layouts** (`⌘1/2/3`): full **Table** grid · Spotlight-style **Compact bar** ·
-  **Preview pane** (results + Quick Look/metadata).
-- **Folder indexing** for locations the volume scan doesn't cover — above all
-  **NAS/SMB network shares** (live updates on network volumes are best-effort).
-- **User excludes** — excluded folders drop out of the index immediately.
-- **Dynamic volumes** — external drives are indexed on mount and dropped on unmount,
-  automatically.
-- **Finder integration**: Quick Look (`Space`) · rename in place (`F2`, or `Enter` if
-  you prefer) · Move to Trash (`⌘⌫`) · Finder **tags** · Get Info (`⌘I`) · drag files
-  straight out of the results.
-- **Run Count sort** (`⌃7`) — the files you open most/recently float to the top, and
-  Relevance factors it in (Everything's Run Count, path-keyed so it survives reindexes).
-- **Saved searches** — name a query and recall it from the menu.
-- **CSV export** of the current results (Name, Path, Size, Dates).
-- **Global hotkey** — summon the window from anywhere; default `⌥Space`, rebindable
-  to almost any combo (an event-tap mode grabs combos other apps also claim, like
-  `⇧Space`).
-- **Instant relaunch** — the whole index persists as an LZFSE-compressed snapshot and
-  resumes from the saved FSEvents id, so restart takes ~1 s instead of a re-crawl.
-- **Universal binary** — one app, native on arm64 and x86_64.
-- Menu-bar icon, light/dark/system appearance, comfortable/compact row density.
+| Operation | Typical result |
+|---|---:|
+| Cold whole-disk crawl | about 26-40 s |
+| Warm relaunch from snapshot | about 1 s |
+| Common per-keystroke queries | about 0.1-3 ms |
+| Broad queries over millions of rows | often under 100 ms |
+
+The app persists an LZFSE-compressed binary snapshot at:
+
+```text
+~/Library/Application Support/Maverything/index.mvidx
+```
+
+On launch, it loads the snapshot first and resumes from the saved FSEvents id. If the snapshot is too old to trust, it reindexes for correctness.
+
+### Everything-Style Query Syntax
+
+You can combine plain text, quoted phrases, negation, file metadata, and type filters:
+
+| Query | Meaning |
+|---|---|
+| `report pdf` | AND search: both terms must match |
+| `"final report"` | quoted phrase |
+| `jpg\|png` | OR search |
+| `-cache` | exclude matches containing `cache` |
+| `ext:png,jpg` | one of several extensions |
+| `size:>10mb` | file size comparison |
+| `dm:today` | modified today |
+| `dm:week` | modified this week |
+| `dm:2026-01-31` | modified on a specific date |
+| `folder:` | folders only |
+| `file:` | files only |
+| `path:src` | match the full path |
+| `name:data` | force a name match even in path mode |
+| `case:on` | case-sensitive search |
+| `ww:` | whole-word matching |
+| `dupe:` | duplicate file names |
+| `content:token` | on-demand content search inside files |
+| `tag:red;blue` | Finder tags, OR within a tag clause |
+| `type:images` | fast type-class filter |
+
+The toolbar chips emit the same syntax under the hood, so a click on Images is just a readable query fragment instead of a hidden mode.
+
+### Four Result Layouts
+
+Maverything supports four layouts because file search is not one job:
+
+- **Table**: dense scanning, sorting, CSV export, multi-select workflows.
+- **Compact bar**: Spotlight-like quick launcher mode.
+- **Two-pane preview**: result list plus Quick Look and metadata.
+- **Icon grid**: visual browsing for images, folders, apps, and media.
+
+Shortcuts:
+
+| Shortcut | Action |
+|---|---|
+| `Command-1` | Table |
+| `Command-2` | Compact bar |
+| `Command-3` | Two-pane preview |
+| `Command-4` | Icon grid |
+| `Control-1...7` | Sort by name, path, size, modified, created, relevance, run count |
+| `Control-0` | Toggle ascending |
+| `/` | Focus the search field |
+| `Space` | Quick Look |
+| `Command-Delete` | Move selected files to Trash |
+| `F2` | Rename |
+| `Command-R` | Reveal in Finder |
+
+### Finder-Grade Workflow
+
+Maverything is meant to stay open while you work:
+
+- Quick Look with `Space`
+- rename in place
+- move to Trash
+- Get Info
+- reveal in Finder
+- drag files out of the result list
+- Finder tag filters
+- CSV export
+- saved searches
+- recent queries
+- global hotkey, default `Option-Space`
+- menu-bar extra
+- light, dark, and system appearance
+- comfortable and compact row density
+
+### Dynamic Volumes and Network Folders
+
+Local APFS volumes are discovered automatically. External drives are indexed on mount and removed from results on unmount.
+
+For places the volume scan does not cover, especially NAS or SMB shares, add **Extra index folders** in Settings. Network shares do not always deliver reliable file events, so Maverything also supports scheduled rescans for those folders.
+
+### Run Count Sort
+
+Maverything tracks files you open from the app and exposes a **Run Count** sort, inspired by Everything. Relevance can also factor in files you have used recently or often.
+
+The run history is local and can be cleared in Settings.
+
+## How It Works
+
+Everything is fast on Windows because it can bulk-read the NTFS MFT, replay the USN journal, and brute-force scan a flat in-memory list.
+
+macOS does not expose the same primitives, so Maverything rebuilds the design around APFS and public macOS APIs:
+
+| Everything on NTFS | Maverything on macOS / APFS |
+|---|---|
+| Raw `$MFT` bulk read | `getattrlistbulk(2)` parallel tree walk |
+| `$UsnJrnl` cursor | FSEvents stream plus persisted event id |
+| Flat RAM list | struct-of-arrays file index |
+| Parent references | path rebuilt by walking parent links |
+| Multi-threaded string search | cached sort orders plus tight byte matching |
+| `Everything.db` | LZFSE-compressed snapshot |
+| Volume database | local volume discovery plus custom roots |
+
+The app is native SwiftUI/AppKit with no runtime database server and no telemetry.
 
 ## Install
 
-### Build from source
+### Option 1: Download the DMG
 
-Requires macOS 14 (Sonoma) or later and a Swift 6 toolchain (Xcode 16+).
+Download the newest build from:
 
-```bash
-git clone <this repo> && cd maverything
-./build.sh          # release build + assemble Maverything.app (universal)
-./build.sh run      # …and launch it
-MV_ARCH=native ./build.sh   # faster single-arch dev build
+```text
+https://github.com/kim-dongryeong/maverything/releases/latest
 ```
 
-### DMG
+Drag `Maverything.app` to `/Applications`.
+
+Current public-test builds may be self-signed until a Developer ID certificate is installed and notarization is completed. If macOS warns on first launch:
+
+1. Right-click `Maverything.app`.
+2. Choose **Open**.
+3. Confirm once.
+
+Or, for a local test build only:
 
 ```bash
-./make-dmg.sh       # builds and packages dist/Maverything-<version>.dmg
+xattr -dr com.apple.quarantine /Applications/Maverything.app
 ```
 
-Until releases are signed with a Developer ID and notarized, Gatekeeper will warn on
-a downloaded DMG: right-click the app → **Open** (once), or clear quarantine with
-`xattr -dr com.apple.quarantine /Applications/Maverything.app`.
+### Option 2: Build from Source
 
-A draft Homebrew cask lives at `packaging/homebrew/maverything.rb` (not yet
-submitted anywhere).
+Requirements:
 
-### First run: Full Disk Access
-
-To index *every* file — system files, hidden dotfiles, other apps' containers — the
-app needs **Full Disk Access**. Spotlight hides that part of the disk by design;
-FDA is the supported way for a third-party tool to see it. On first launch
-Maverything shows an onboarding sheet → **Open Settings** → enable Maverything under
-**Privacy & Security ▸ Full Disk Access**. Without it the app still works, but
-results are limited to what your account can already read. The app is **not
-sandboxed** (whole-disk indexing is incompatible with App Sandbox) and never sends
-anything anywhere: the index lives in
-`~/Library/Application Support/Maverything/index.mvidx`.
-
-Developer note: ad-hoc signing changes the code hash every rebuild, which makes
-macOS forget the FDA grant. Run `./make-cert.sh` once to create a stable self-signed
-cert so the grant sticks (`MAVERYTHING_SIGN_ID="Maverything Dev Cert" ./build.sh`).
-
-## mvfind — the same search, in your terminal
-
-`mvfind` queries the **running app's live index over a local socket** (real-time,
-never stale), falling back to the saved snapshot when the app is closed. Same engine,
-same query syntax:
+- macOS 14 Sonoma or later
+- Xcode 16 or newer
+- Swift 6 toolchain
 
 ```bash
-swift build -c release   # builds mvfind alongside the app
-mvfind report ext:pdf size:>1mb
-mvfind "*.swift" --wildcard --sort size --limit 20
-mvfind 'ext:jpg dm:month' --sort date --limit 20
-mvfind config --path --count
-mvfind '*.log' -0 | xargs -0 rm        # NUL-delimited, pipe to other tools
-# flags: [--fuzzy|--wildcard] [--path]
-#        [--sort name|path|size|date|created|relevance|runcount]
-#        [--limit N] [-0] [--count] [--live|--snapshot] [--json]
+git clone https://github.com/kim-dongryeong/maverything.git
+cd maverything
+./build.sh
+open Maverything.app
 ```
 
-`--live` forces the socket (errors if the app isn't running), `--snapshot` forces the
-saved file, `--json` emits structured results. `--sort runcount` ranks the files you
-open most/recently first.
+For faster development builds on the current machine:
 
-## AI / MCP — give an agent instant search over your Mac
+```bash
+MV_ARCH=native ./build.sh
+```
 
-`mv-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that
-exposes a `search` tool backed by the same live index, so an AI assistant can find any
-file on your Mac — hidden and system files included — in milliseconds. MCP is an **open
-standard**, so this works with *any* MCP-compatible client — Claude Desktop, Cline,
-Continue, Zed, Cursor, custom agents — not just one vendor. Register it (Claude Desktop
-shown; other clients use the same `command`):
+For a universal release-style app:
+
+```bash
+./build.sh
+```
+
+### Option 3: Package a DMG Locally
+
+```bash
+./make-dmg.sh
+open dist/
+```
+
+The output is:
+
+```text
+dist/Maverything-<version>.dmg
+```
+
+## First Run: Full Disk Access
+
+To search your whole Mac, Maverything needs **Full Disk Access**.
+
+Without it, macOS restricts what a third-party app can read, so Maverything will still work but results will be incomplete. On first launch, the app opens an onboarding sheet that points to:
+
+```text
+System Settings > Privacy & Security > Full Disk Access
+```
+
+Enable Maverything there, then reindex.
+
+Maverything is intentionally **not sandboxed** because whole-disk indexing and unrestricted file reveal/open workflows are incompatible with the App Sandbox.
+
+## Privacy and Security
+
+Maverything asks for Full Disk Access, so the trust bar should be high. The project is GPL-3.0 and intentionally simple to audit:
+
+- no telemetry
+- no analytics SDK
+- no cloud sync
+- no network calls for your index
+- no file contents stored for normal name search
+- update checks only call GitHub Releases metadata
+- diagnostics are off by default
+
+The index stays on your machine:
+
+```text
+~/Library/Application Support/Maverything/
+```
+
+If diagnostics are enabled with `MV_DIAG=1`, logs go to:
+
+```text
+~/Library/Logs/Maverything/maverything-diag.log
+```
+
+Diagnostics can include local paths, so they are opt-in only.
+
+## Updates
+
+Maverything includes a lightweight update checker:
+
+- **Help > Check for Updates...**
+- menu-bar extra > **Check for Updates...**
+- Settings > General > **Automatically check for updates**
+
+It checks the latest GitHub Release, compares it to the app version, and opens the newest DMG asset when an update is available.
+
+This first implementation is deliberately dependency-free. A Sparkle appcast with signed automatic install can be added later once Developer ID signing, notarization, and update-signing keys are all in place.
+
+## mvfind: Terminal Search over the Same Index
+
+`mvfind` queries the running app's live index over a local Unix socket. If the app is closed, it can fall back to the saved snapshot.
+
+```bash
+swift build -c release
+.build/release/mvfind report ext:pdf size:>1mb
+.build/release/mvfind "*.swift" --sort date --limit 20
+.build/release/mvfind 'ext:jpg dm:month' --sort size --limit 20
+.build/release/mvfind config --path --count
+.build/release/mvfind '*.log' -0 | xargs -0 rm
+```
+
+Useful flags:
+
+| Flag | Meaning |
+|---|---|
+| `--fuzzy` | fuzzy matching |
+| `--wildcard` | wildcard mode |
+| `--path` | match paths |
+| `--sort name\|path\|size\|date\|created\|relevance\|runcount` | sort order |
+| `--limit N` | cap result count |
+| `--count` | print only the count |
+| `--json` | structured JSON output |
+| `-0` | NUL-delimited output |
+| `--live` | require the running app |
+| `--snapshot` | force snapshot mode |
+
+## MCP: Give an Agent Instant Local File Search
+
+`mv-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server backed by the same index.
+
+That means an AI coding assistant can search your Mac in milliseconds without asking Spotlight or crawling the file system itself.
+
+Example Claude Desktop config:
 
 ```jsonc
-// ~/Library/Application Support/Claude/claude_desktop_config.json
-{ "mcpServers": { "maverything": { "command": "/usr/local/bin/mv-mcp" } } }
+{
+  "mcpServers": {
+    "maverything": {
+      "command": "/Applications/Maverything.app/Contents/Helpers/mv-mcp"
+    }
+  }
+}
 ```
 
-For agents that prefer a shell command over MCP, a ready-to-share **agent skill** lives
-at `packaging/agent-skill/maverything-search/` (Anthropic Agent Skills format, but its
-content — how to drive `mvfind` — works for any agent).
+For agents that prefer a shell command, a ready-to-share skill lives at:
+
+```text
+packaging/agent-skill/maverything-search/
+```
 
 ## Development
 
-```
+Repository layout:
+
+```text
 Sources/
-  MaverythingCore/   # engine: enumerator, index, search, FSEvents watcher, snapshot, socket server
-  Maverything/       # the app: SwiftUI shell + AppKit NSTableView results
-  mvfind/            # CLI over the live socket (snapshot fallback)
-  mv-mcp/            # Model Context Protocol server (search tool over the live index)
-  mvtest/            # headless engine test/benchmark harness
-  mvsim/             # simulation harness (180+ scenarios)
+  MaverythingCore/   engine: enumerator, index, search, watcher, snapshot, socket server
+  Maverything/       app: SwiftUI shell plus AppKit result views
+  mvfind/            CLI over the live socket, snapshot fallback
+  mv-mcp/            MCP server over the live index
+  mvtest/            focused engine test harness
+  mvsim/             simulation and regression harness
 ```
 
-`mvsim` builds a synthetic file tree and drives the engine through dozens of
-realistic scenarios — every match mode, all query filters, sorting, live
-add/delete/modify, volume mount/unmount, snapshot round-trip — asserting PASS/FAIL
-and writing `SIMULATION-REPORT.md` with latency numbers:
+Main commands:
 
 ```bash
+swift build -c release
 swift run -c release mvsim
+./build.sh
+./make-dmg.sh
 ```
 
-## How it compares
+`mvsim` builds a synthetic file tree under a temp directory and validates matching, filters, sorting, live add/delete/modify, snapshot round trip, query server behavior, and dynamic volume scenarios.
 
-- **Spotlight** ranks a curated, content-oriented index and intentionally skips
-  hidden/system files; Maverything exhaustively lists every file name, instantly.
-- **Find Any File** searches the live file system on demand — admirably thorough
-  with nothing to maintain, but each search takes seconds; Maverything answers per
-  keystroke from RAM.
-- **Cling** and **Cardinal** are polished Everything-inspired macOS apps worth a
-  look; Maverything's angle is simple: free, whole-disk coverage including
-  hidden/system files, deep Everything syntax/shortcut parity, and a CLI.
+CI runs on macOS and requires:
+
+- release build
+- full `mvsim` scenario pass
+
+## Compared with Other Tools
+
+| Tool | Difference |
+|---|---|
+| Spotlight | ranks a curated content index and omits many hidden/system locations |
+| Find Any File | thorough live file-system search, but searches take seconds |
+| Cling / Cardinal | polished Everything-inspired macOS apps; Maverything's emphasis is free GPL source, hidden/system coverage, CLI, and MCP |
+| `find` / `mdfind` | scriptable, but not a live, sorted, app-wide RAM index |
+
+## Project Status
+
+Maverything is early but already useful. The core workflows are in place:
+
+- app search
+- layouts
+- query syntax
+- live updates
+- snapshots
+- dynamic volumes
+- Finder actions
+- CLI
+- MCP
+- DMG packaging
+- update checking
+
+Areas still expected to evolve:
+
+- notarized Developer ID releases
+- signed Sparkle-style automatic installation
+- more polished onboarding and permission diagnostics
+- broader hardware benchmark table
+- Homebrew cask publication
+- more tests around UI-level workflows
+
+## Contributing
+
+Bug reports, performance traces, and "this query should behave like Everything" examples are especially valuable.
+
+When reporting an issue, include:
+
+- macOS version
+- Mac model / chip
+- approximate file count
+- whether Full Disk Access is granted
+- query and mode
+- whether the result differs from Spotlight, Finder, or Everything
+
+Please do not paste private path logs unless you have reviewed them first.
 
 ## License
 
-**GPL-3.0** — see [LICENSE](LICENSE). Free to use, study, share, and modify; if you
-distribute a modified version you must share your source under the same license. This
-keeps Maverything (and any fork) open, which matters for a tool that asks for Full Disk
-Access: the code is auditable, and you can verify for yourself that it never sends
-anything anywhere.
+Maverything is licensed under **GPL-3.0**. See [LICENSE](LICENSE).
+
+You can use, study, share, and modify it. If you distribute a modified version, you must share the source under the same license. That matters for a tool that asks for Full Disk Access: the code should stay inspectable.

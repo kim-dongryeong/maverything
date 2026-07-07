@@ -48,6 +48,7 @@ struct MaverythingApp: App {
         MenuBarExtra("Maverything", systemImage: "magnifyingglass.circle") {
             Button("Show Maverything") { delegate.summon() }
             Button("Reindex Now") { model.reindex() }
+            Button("Check for Updates…") { model.checkForUpdates(userInitiated: true) }
             SettingsLink { Text("Settings…") }
             Divider()
             Button("Quit Maverything") { NSApp.terminate(nil) }   // willTerminate saves the snapshot once
@@ -230,6 +231,8 @@ struct HelpCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
+            Button("Check for Updates…") { model.checkForUpdates(userInitiated: true) }
+            Divider()
             Button("Search Syntax") { model.showSyntax = true }
                 .keyboardShortcut("/")
             Button("Keyboard Shortcuts") { model.showShortcuts = true }
@@ -287,5 +290,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
-
 

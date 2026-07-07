@@ -55,18 +55,39 @@ struct MaverythingApp: App {
     }
 }
 
-/// Root of a "New Search Window": builds a per-window AppModel attached to the primary
-/// (shared index/engine, independent view state) exactly once per window instance.
+/// Holds a "New Search Window"'s AppModel and builds it EXACTLY ONCE per window.
+///
+/// Why this indirection: `MaverythingApp.body` re-evaluates on every primary @Published
+/// change (searches landing, live-refresh index growth, status text) — several times a
+/// second while the app is busy. That re-runs the `WindowGroup(id:"search")` content
+/// closure, which re-runs `SecondarySearchWindow.init`. If the per-window AppModel were
+/// built in a `StateObject(wrappedValue: AppModel(attachedTo:))` autoclosure, a fresh
+/// (throwaway) AppModel — with its whole Combine pipeline + notification observers — would
+/// be constructed on EVERY one of those re-evaluations (measured: ~15 builds over 6s per
+/// window). This host's own autoclosure is trivial, and the real AppModel is created lazily
+/// once and cached, so the storm collapses to a single build.
+@MainActor private final class SecondaryModelHost: ObservableObject {
+    private var model: AppModel?
+    func model(attachedTo primary: AppModel) -> AppModel {
+        if let model { return model }
+        let m = AppModel(attachedTo: primary)
+        model = m
+        return m
+    }
+}
+
+/// Root of a "New Search Window": a per-window AppModel attached to the primary
+/// (shared index/engine, independent view state), built once via `SecondaryModelHost`.
 private struct SecondarySearchWindow: View {
     private let primary: AppModel
-    @StateObject private var model: AppModel
+    @StateObject private var host = SecondaryModelHost()
 
     init(primary: AppModel) {
         self.primary = primary
-        _model = StateObject(wrappedValue: AppModel(attachedTo: primary))
     }
 
     var body: some View {
+        let model = host.model(attachedTo: primary)
         ContentView()
             .environmentObject(model)
             .onAppear {

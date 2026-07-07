@@ -17,19 +17,18 @@ enum RowDensity: String, CaseIterable, Identifiable {
     var rowHeight: CGFloat { self == .compact ? 17 : 22 }
 }
 
-/// Chrome/VS Code-style title-bar accent — the app's visual identity. The user can
-/// switch live to compare and settle on one. Persisted in UserDefaults.
+/// Title-bar accent style — the app's visual identity. Always on (no "off": the emerald
+/// band is part of who we are); the user only chooses how far it reaches. Persisted in
+/// UserDefaults; defaults to `.full`.
 enum TitleBarTintStyle: String, CaseIterable, Identifiable {
-    case off       // no tint (system default)
-    case strip     // Chrome-style: a thin accent bar across the very top
-    case full      // VS Code-style: the whole search bar washed in the accent
+    case strip     // a thin accent band across the very top
+    case full      // the whole search bar washed in the accent
 
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .off:   return "Off"
-        case .strip: return "Title bar band (Chrome)"
-        case .full:  return "Full tint (VS Code)"
+        case .strip: return "Title bar band"
+        case .full:  return "Full tint"
         }
     }
 }

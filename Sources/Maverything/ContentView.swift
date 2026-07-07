@@ -83,18 +83,13 @@ struct ContentView: View {
         // Publish OUR model as the focused scene object so menu commands (⌃U/⌃I/⌘1…)
         // target the KEY window's model, not always the primary (multi-window).
         .focusedSceneObject(model)
-        .background(WindowAccessor { window in
-            // Per-window setup — each ContentView configures ITS OWN window. The window
-            // is frameless (.hiddenTitleBar), so make it draggable by background; only
-            // the PRIMARY registers as the delegate's main window (hotkey/summon target).
-            Diag.log("WindowAccessor: window #\(window.windowNumber) → model(primary=\(model.isPrimary))")
-            model.window = window
-            window.level = .normal
-            window.isMovableByWindowBackground = true
-            if model.isPrimary { (NSApp.delegate as? AppDelegate)?.mainWindow = window }
-        })
+        // Per-window setup — each ContentView wires ITS OWN window (drag-by-background,
+        // primary registration, focus-independent ESC, initial-focus race handling).
+        .background(WindowAccessor { model.attachWindow($0) })
         .onAppear { searchFocused = true }
         .onChange(of: model.focusNonce) { searchFocused = true }
+        // (Initial ⌘N-window focus is granted by the MODEL's didBecomeKey observer via
+        // focusNonce — a view-level onReceive here can subscribe too late and miss it.)
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingView().environmentObject(model)
         }

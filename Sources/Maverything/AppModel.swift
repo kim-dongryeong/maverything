@@ -277,6 +277,9 @@ final class AppModel: ObservableObject {
     let engine: SearchEngine
     let isPrimary: Bool
     weak var window: NSWindow?   // this model's own NSWindow (ContentView's WindowAccessor sets it)
+    private var escMonitor: Any?   // window-level ESC hook (see installEscMonitor)
+    private var keyObserver: NSObjectProtocol?   // secondary: first-become-key focus grant
+    private var grantedInitialFocus = false
     /// Posted by whichever model changed state that affects every window's RESULTS
     /// (index contents after a live refresh/crawl, engine-level options). Every OTHER
     /// model re-runs its own search on receipt.
@@ -364,10 +367,63 @@ final class AppModel: ObservableObject {
             Diag.log("requestHide(secondary): window=\(self?.window?.windowNumber ?? -1) key=\(NSApp.keyWindow?.windowNumber ?? -1) target=\(target?.windowNumber ?? -1)")
             target?.performClose(nil)
         }
+        // Initial keyboard focus for a fresh ⌘N window. SwiftUI's onAppear runs before
+        // the window is key (focus request dropped), and a view-level onReceive can
+        // subscribe AFTER didBecomeKey already fired (missed) — so observe from the
+        // MODEL, which exists before the window does. Bumping focusNonce routes through
+        // ContentView's onChange, which applies focus AFTER the window is key → sticks.
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, !self.grantedInitialFocus,
+                  let w = note.object as? NSWindow, w === self.window else { return }
+            self.grantedInitialFocus = true
+            Diag.log("didBecomeKey(secondary #\(w.windowNumber)) → granting search-field focus")
+            self.focusNonce &+= 1
+        }
     }
 
     deinit {
         if let refreshObserver { NotificationCenter.default.removeObserver(refreshObserver) }
+        if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+        if let escMonitor { NSEvent.removeMonitor(escMonitor) }
+    }
+
+    /// Called by ContentView's WindowAccessor the moment its view lands in this window.
+    /// Handles BOTH orders of the attach/become-key race: if the window went key before
+    /// we learned about it (didBecomeKey observer missed — it matches on `window`),
+    /// grant the initial search-field focus right here.
+    func attachWindow(_ w: NSWindow) {
+        Diag.log("attachWindow: #\(w.windowNumber) primary=\(isPrimary) alreadyKey=\(w.isKeyWindow)")
+        window = w
+        installEscMonitor()
+        w.level = .normal
+        w.isMovableByWindowBackground = true
+        if isPrimary { (NSApp.delegate as? AppDelegate)?.mainWindow = w }
+        if !isPrimary, !grantedInitialFocus, w.isKeyWindow {
+            grantedInitialFocus = true
+            Diag.log("attachWindow: already key → granting search-field focus")
+            focusNonce &+= 1
+        }
+    }
+
+    /// Window-level ESC (hide/close — Everything semantics), independent of keyboard focus.
+    /// The view-level handlers (onExitCommand / table keyDown) only fire when something is
+    /// FOCUSED — but a fresh ⌘N window (or a click on the title band) can leave focus
+    /// nowhere, and ESC then silently did nothing (user repro: worked only after Tab).
+    /// A local key monitor sees the event before the responder chain, so it always works.
+    func installEscMonitor() {
+        guard escMonitor == nil else { return }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard let self, ev.keyCode == 53,   // ESC
+                  let w = self.window, ev.window === w else { return ev }
+            // An active IME composition (e.g. Korean jamo) must keep its ESC-to-cancel.
+            if let fr = w.firstResponder as? NSTextView, fr.hasMarkedText() { return ev }
+            Diag.log("ESC monitor: window #\(w.windowNumber) primary=\(self.isPrimary) syntax=\(self.showSyntax)")
+            if self.showSyntax { self.showSyntax = false; return nil }   // 1st ESC closes help
+            self.requestHide?()   // primary: hide via delegate · secondary: close the window
+            return nil            // consumed
+        }
     }
 
     /// The per-window search plumbing every model needs: debounce the query field and

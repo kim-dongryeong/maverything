@@ -18,26 +18,25 @@ struct ContentView: View {
 
     /// The title-bar fill: the icon's LINEAR gradient PLUS two soft RADIAL glows (mint upper-left,
     /// lime lower-right) — exactly the layers on the app-icon background. Siri-logo style, where
-    /// the color pools glow softly and don't need to span edge to edge. Empty when tint is off.
-    @ViewBuilder private var bandBackground: some View {
-        if model.titleBarTint != .off {
-            ZStack {
-                Self.mvBandGradient
-                RadialGradient(
-                    gradient: Gradient(colors: [
-                        Color(red: 0x8C / 255.0, green: 0xF5 / 255.0, blue: 0xD2 / 255.0).opacity(0.60), .clear]),
-                    center: UnitPoint(x: 0.24, y: 0.10), startRadius: 0, endRadius: 240)
-                // A soft CYAN pool in the middle — a cooler, different-family accent so the band
-                // reads Siri-like (multi-hue) instead of a single green sweep. Kept faint.
-                RadialGradient(
-                    gradient: Gradient(colors: [
-                        Color(red: 0x22 / 255.0, green: 0xD3 / 255.0, blue: 0xEE / 255.0).opacity(0.38), .clear]),
-                    center: UnitPoint(x: 0.56, y: 0.35), startRadius: 0, endRadius: 210)
-                RadialGradient(
-                    gradient: Gradient(colors: [
-                        Color(red: 0xD4 / 255.0, green: 0xF7 / 255.0, blue: 0x6A / 255.0).opacity(0.55), .clear]),
-                    center: UnitPoint(x: 0.86, y: 0.95), startRadius: 0, endRadius: 280)
-            }
+    /// the color pools glow softly and don't need to span edge to edge. Always on — the band is
+    /// part of the app's identity; the tint style only controls how far it reaches.
+    private var bandBackground: some View {
+        ZStack {
+            Self.mvBandGradient
+            RadialGradient(
+                gradient: Gradient(colors: [
+                    Color(red: 0x8C / 255.0, green: 0xF5 / 255.0, blue: 0xD2 / 255.0).opacity(0.60), .clear]),
+                center: UnitPoint(x: 0.24, y: 0.10), startRadius: 0, endRadius: 240)
+            // A soft CYAN pool in the middle — a cooler, different-family accent so the band
+            // reads Siri-like (multi-hue) instead of a single green sweep. Kept faint.
+            RadialGradient(
+                gradient: Gradient(colors: [
+                    Color(red: 0x22 / 255.0, green: 0xD3 / 255.0, blue: 0xEE / 255.0).opacity(0.38), .clear]),
+                center: UnitPoint(x: 0.56, y: 0.35), startRadius: 0, endRadius: 210)
+            RadialGradient(
+                gradient: Gradient(colors: [
+                    Color(red: 0xD4 / 255.0, green: 0xF7 / 255.0, blue: 0x6A / 255.0).opacity(0.55), .clear]),
+                center: UnitPoint(x: 0.86, y: 0.95), startRadius: 0, endRadius: 280)
         }
     }
 
@@ -46,14 +45,14 @@ struct ContentView: View {
             // Title-bar strip drawn EDGE-TO-EDGE behind the traffic lights. The window uses
             // .windowStyle(.hiddenTitleBar) (no native title bar / no material), so this
             // emerald reaches all the way up and reads bold — the close/min/max buttons sit
-            // on top of it. (.off → clear, so the buttons keep the plain background.)
+            // on top of it.
             Color.clear
                 .frame(height: 28)
-                .background { bandBackground }            // icon gradient + soft radial glows (clear when off)
+                .background { bandBackground }            // icon gradient + soft radial glows
             searchBar
                 // .full continues the band DOWN over the search bar so the header reads as one
-                // block; .strip/.off leave the search bar plain. The linear part is horizontal,
-                // so the band and the (full-width) search bar line up seamlessly.
+                // block; .strip leaves the search bar plain. The linear part is horizontal, so
+                // the band and the (full-width) search bar line up seamlessly.
                 .background { if model.titleBarTint == .full { bandBackground } }
             Divider()
             FilterBar(model: model)
@@ -72,12 +71,10 @@ struct ContentView: View {
         .overlay {
             // A thin GRADIENT border around the whole window, echoing the title-bar band.
             // (Yes — borders can be gradients: SwiftUI strokeBorder takes any ShapeStyle.)
-            if model.titleBarTint != .off {
-                ContainerRelativeShape()          // follows the window's own corner radius — no magic number
-                    .strokeBorder(Self.mvBandGradient, lineWidth: 3)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-            }
+            ContainerRelativeShape()          // follows the window's own corner radius — no magic number
+                .strokeBorder(Self.mvBandGradient, lineWidth: 3)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
         }
         .preferredColorScheme(model.appearance.colorScheme)
         // Publish OUR model as the focused scene object so menu commands (⌃U/⌃I/⌘1…)
@@ -153,9 +150,21 @@ struct ContentView: View {
                         .frame(maxWidth: 340)
                 }
                 .allowsHitTesting(false)
-            } else if model.resultsSignature == model.searchSignature,
-                      !model.query.isEmpty || model.typeFilter != .all || model.scopeRoot != nil {
-                // Show "No Results" ONLY when the empty result belongs to the current inputs.
+            } else if model.resultsSignature != model.searchSignature {
+                // A search is in flight and nothing has landed yet for the CURRENT inputs —
+                // e.g. a just-opened ⌘N window whose first whole-disk sort (~0.5s cold) is
+                // still running, or any query mid-compute. Show a quiet spinner instead of a
+                // blank so the window never reads as empty/broken while it's actually working.
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Searching…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .allowsHitTesting(false)
+            } else if !model.query.isEmpty || model.typeFilter != .all || model.scopeRoot != nil {
+                // Show "No Results" ONLY when the empty result belongs to the current inputs
+                // (resultsSignature == searchSignature, established by the branch above).
                 // The moment a chip/query/scope changes, searchSignature changes (live state)
                 // so a stale "No Results" vanishes at once and can't blink back before the new
                 // results land — no timing-sensitive flag involved.

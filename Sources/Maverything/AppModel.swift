@@ -254,7 +254,7 @@ final class AppModel: ObservableObject {
     }
     /// Title-bar accent style (visual identity) — switch live in Settings to compare.
     @Published var titleBarTint: TitleBarTintStyle = TitleBarTintStyle(rawValue:
-        UserDefaults.standard.string(forKey: "mv.titleBarTint") ?? "") ?? .strip {
+        UserDefaults.standard.string(forKey: "mv.titleBarTint") ?? "") ?? .full {
         didSet { UserDefaults.standard.set(titleBarTint.rawValue, forKey: "mv.titleBarTint") }
     }
 
@@ -347,6 +347,21 @@ final class AppModel: ObservableObject {
         indexedCount = primary.indexedCount
         statusText = primary.statusText
         hasFullDiskAccess = primary.hasFullDiskAccess
+        // Paint INSTANTLY instead of blank: a fresh ⌘N window shares the primary's index +
+        // engine, and starts with the same default (empty) query — so when the primary is
+        // already showing that same result set, its rows are byte-for-byte what our own first
+        // search would return. Seed them now; our own search (below) re-runs and lands the
+        // identical set ~0.5s later (a cold whole-disk sort), by which point the list is
+        // already on screen. Guarded by the signature so we never flash the primary's
+        // *filtered* results into a window that's about to show the full list.
+        if primary.resultsSignature == searchSignature, !primary.resultsStore.ids.isEmpty {
+            resultsStore.ids = primary.resultsStore.ids
+            resultTotal = primary.resultTotal
+            resultShown = primary.resultShown
+            queryMillis = primary.queryMillis
+            resultsSignature = primary.resultsSignature
+            resultsVersion &+= 1
+        }
         primary.$isIndexing.dropFirst()
             .sink { [weak self] v in
                 self?.isIndexing = v
@@ -522,7 +537,9 @@ final class AppModel: ObservableObject {
         started = true
         guard isPrimary else {
             // Secondary window: the shared index is already live (or still crawling —
-            // the isIndexing mirror re-searches when it finishes). Just populate.
+            // the isIndexing mirror re-searches when it finishes). Just populate. (The
+            // list is already on screen if init seeded it from the primary; this refreshes
+            // it with our own freshly-computed set.)
             runSearch()
             return
         }
@@ -965,6 +982,13 @@ final class AppModel: ObservableObject {
     // rebuild the sort order (and burn a core) on every individual event.
     private var liveRefreshScheduled = false
     private var pendingLiveRefresh = false
+    /// Monotonic time the last live refresh actually ran. Watching all of `/` means macOS's
+    /// own constant background writes (logs, caches, Spotlight) stream in events forever; each
+    /// refresh re-runs a full ~2M sort (+ folder-size rebuild, ×every window), so under
+    /// SUSTAINED churn we must cap the rate or the CPU never idles and the whole UI — ⌘N, ESC,
+    /// typing — janks fighting for cores + the index lock. A single isolated change still
+    /// reflects in `burstDelay`; only a storm gets throttled to `minRefreshInterval`.
+    private var lastLiveRefreshAt: TimeInterval = 0
     /// Timestamp (monotonic) of the last keyboard navigation in the results list.
     /// A live refresh reloads the table, which would reset scroll/selection under an
     /// actively-held arrow key — so we defer it until the user pauses.
@@ -980,9 +1004,13 @@ final class AppModel: ObservableObject {
         guard NSApp.isActive || windowVisible else { pendingLiveRefresh = true; return }
         guard !liveRefreshScheduled else { return }
         liveRefreshScheduled = true
-        // Snappy when frontmost; a touch longer as a background window so bursty
-        // Finder-driven churn still reflects quickly without hogging a core.
-        let delay = NSApp.isActive ? 0.35 : 0.6
+        // Snappy for an ISOLATED change (feels live); back off hard under SUSTAINED churn so a
+        // full re-sort runs at most once per `minInterval` instead of ~3×/s pegging a core.
+        let active = NSApp.isActive
+        let burstDelay = active ? 0.35 : 0.6      // debounce one burst
+        let minInterval = active ? 1.5 : 3.0      // cap the sustained full-refresh rate
+        let now = ProcessInfo.processInfo.systemUptime
+        let delay = max(burstDelay, lastLiveRefreshAt + minInterval - now)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.liveRefreshScheduled = false
@@ -992,6 +1020,7 @@ final class AppModel: ObservableObject {
                 self.scheduleLiveRefresh()   // flag is clear now → reschedules for later
                 return
             }
+            self.lastLiveRefreshAt = ProcessInfo.processInfo.systemUptime
             self.engine.invalidate()
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()                             // background live refresh (re-runs same inputs → no blink)
@@ -1009,8 +1038,14 @@ final class AppModel: ObservableObject {
         guard NSApp.isActive, !isIndexing, !warmScheduled else { return }
         warmScheduled = true
         let engine = self.engine, sk = self.sortKey
+        let idx = self.index, wantFolderSizes = self.indexFolderSizes
         warmQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             engine.warmCaches(sortKey: sk)
+            // Warm folder subtree totals ONCE off-main after a refresh: the size column shows
+            // them for every folder even under a name sort, so otherwise each visible folder
+            // cell kicks its own full ~2M `buildFolderSizes()` on the gen bump (a redundant
+            // rebuild storm). One warm here → cells hit the cache instead of racing.
+            if wantFolderSizes { idx.buildFolderSizes() }
             DispatchQueue.main.async { self?.warmScheduled = false }
         }
     }

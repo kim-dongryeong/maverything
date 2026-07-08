@@ -284,15 +284,12 @@ Diagnostics can include local paths, so they are opt-in only.
 
 ## Updates
 
-Maverything includes a lightweight update checker:
+Maverything uses **[Sparkle](https://sparkle-project.org/)** for seamless, secure automatic updates. 
+When a new version is released, you will be prompted to download and install it right from within the app — no manual DMG downloading required.
 
+You can check for updates manually via:
 - **Help > Check for Updates...**
 - menu-bar extra > **Check for Updates...**
-- Settings > General > **Automatically check for updates**
-
-It checks the latest GitHub Release, compares it to the app version, and opens the newest DMG asset when an update is available.
-
-This first implementation is deliberately dependency-free. A Sparkle appcast with signed automatic install can be added later once Developer ID signing, notarization, and update-signing keys are all in place.
 
 ## mvfind: Terminal Search over the Same Index
 
@@ -399,12 +396,11 @@ Maverything is early but already useful. The core workflows are in place:
 - CLI
 - MCP
 - DMG packaging
-- update checking
+- notarized Developer ID releases
+- signed Sparkle-style automatic installation
 
 Areas still expected to evolve:
 
-- notarized Developer ID releases
-- signed Sparkle-style automatic installation
 - more polished onboarding and permission diagnostics
 - broader hardware benchmark table
 - Homebrew cask publication

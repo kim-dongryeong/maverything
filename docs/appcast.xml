@@ -1,0 +1,14 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Maverything</title>
+        <item>
+            <title>0.1</title>
+            <pubDate>Wed, 08 Jul 2026 12:45:32 +0900</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/kim-dongryeong/maverything/releases/download/v0.1/Maverything-0.1.dmg" length="4704687" type="application/octet-stream" sparkle:edSignature="jeWygIGUgTHbfP4oBQGFV65GbdjxaojNrKAkkcCw1P34Pa28eTAt/RQ/XoqdA3PD/L+8SBWTLfGFBavOaFsYCQ=="/>
+        </item>
+    </channel>
+</rss>

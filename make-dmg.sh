@@ -45,15 +45,19 @@ hdiutil create -volname "Maverything $VER" -srcfolder "$STAGE" -ov -format UDZO 
 # (APP_PASSWORD is an app-specific password from appleid.apple.com, or use
 #  `xcrun notarytool store-credentials` and swap the flags for --keychain-profile.)
 if [ "${MV_NOTARIZE:-0}" = "1" ]; then
-    : "${APPLE_ID:?MV_NOTARIZE=1 needs APPLE_ID (Apple ID email)}"
-    : "${TEAM_ID:?MV_NOTARIZE=1 needs TEAM_ID (10-char Developer Team ID)}"
-    : "${APP_PASSWORD:?MV_NOTARIZE=1 needs APP_PASSWORD (app-specific password)}"
     echo "▸ notarizing $DMG (this waits for Apple)"
     xcrun notarytool submit "$DMG" \
-        --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PASSWORD" \
+        --keychain-profile "AC_PASSWORD" \
         --wait
     echo "▸ stapling ticket"
     xcrun stapler staple "$DMG"
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Sparkle Signature ────────────────────────────────────────────────────────
+if [ -x ".build/artifacts/sparkle/Sparkle/bin/sign_update" ]; then
+    echo "▸ computing Sparkle signature:"
+    .build/artifacts/sparkle/Sparkle/bin/sign_update "$DMG" | sed 's/^/   /'
 fi
 # ─────────────────────────────────────────────────────────────────────────────
 

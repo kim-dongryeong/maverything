@@ -57,26 +57,36 @@ if [ "$SIGN_ID" != "-" ] && [ -f "$SIGNKC" ]; then
     security unlock-keychain -p mav "$SIGNKC" 2>/dev/null || true
     # Sign by SHA-1 hash so a same-named cert lingering in the login keychain
     # doesn't make the identity ambiguous.
-    H=$(security find-certificate -c "$SIGN_ID" -Z "$SIGNKC" 2>/dev/null | awk '/SHA-1 hash:/{print $NF}')
-    [ -n "$H" ] && SIGN_ID="$H"
-    KCARG=(--keychain "$SIGNKC")
+    H=$( (security find-certificate -c "$SIGN_ID" -Z "$SIGNKC" 2>/dev/null || true) | awk '/SHA-1 hash:/{print $NF}')
+    if [ -n "$H" ]; then
+        SIGN_ID="$H"
+        KCARG=(--keychain "$SIGNKC")
+    fi
 fi
 # Nested helper executables (Contents/Helpers/*) are auxiliary Mach-O and must be
 # signed BEFORE the outer bundle — codesign refuses to seal a bundle that contains
 # an unsigned nested code object.
 for helper in "$APP/Contents/Helpers/"*; do
     [ -f "$helper" ] || continue
-    codesign --force --options runtime --sign "$SIGN_ID" "${KCARG[@]}" "$helper" 2>&1 | sed 's/^/   /' || \
-    codesign --force --sign "$SIGN_ID" "${KCARG[@]}" "$helper" 2>&1 | sed 's/^/   /' || true
+    echo "▸ codesign helper: $helper"
+    if [ ${#KCARG[@]} -eq 0 ]; then
+        codesign --force --options runtime --sign "$SIGN_ID" "$helper"
+    else
+        codesign --force --options runtime --sign "$SIGN_ID" "${KCARG[@]}" "$helper"
+    fi
 done
-codesign --force --options runtime \
-    --entitlements Resources/Maverything.entitlements \
-    --sign "$SIGN_ID" "${KCARG[@]}" \
-    "$APP" 2>&1 | sed 's/^/   /' || {
-        echo "   (runtime-hardened sign failed; retrying without hardened runtime)"
-        codesign --force --entitlements Resources/Maverything.entitlements \
-            --sign "$SIGN_ID" "${KCARG[@]}" "$APP"
-    }
+echo "▸ codesign app: $APP"
+if [ ${#KCARG[@]} -eq 0 ]; then
+    codesign --force --options runtime \
+        --entitlements Resources/Maverything.entitlements \
+        --sign "$SIGN_ID" \
+        "$APP"
+else
+    codesign --force --options runtime \
+        --entitlements Resources/Maverything.entitlements \
+        --sign "$SIGN_ID" "${KCARG[@]}" \
+        "$APP"
+fi
 
 echo "✓ built $APP"
 codesign -dv "$APP" 2>&1 | sed 's/^/   /' || true

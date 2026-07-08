@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import MaverythingCore
+import Sparkle
 import SwiftUI
 
 @main
@@ -48,7 +49,7 @@ struct MaverythingApp: App {
         MenuBarExtra("Maverything", systemImage: "magnifyingglass.circle") {
             Button("Show Maverything") { delegate.summon() }
             Button("Reindex Now") { model.reindex() }
-            Button("Check for Updates…") { model.checkForUpdates(userInitiated: true) }
+            Button("Check for Updates…") { delegate.updaterController.checkForUpdates(nil) }
             SettingsLink { Text("Settings…") }
             Divider()
             Button("Quit Maverything") { NSApp.terminate(nil) }   // willTerminate saves the snapshot once
@@ -231,7 +232,9 @@ struct HelpCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
-            Button("Check for Updates…") { model.checkForUpdates(userInitiated: true) }
+            Button("Check for Updates…") { 
+                (NSApp.delegate as? AppDelegate)?.updaterController.checkForUpdates(nil) 
+            }
             Divider()
             Button("Search Syntax") { model.showSyntax = true }
                 .keyboardShortcut("/")
@@ -245,6 +248,12 @@ struct HelpCommands: Commands {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     weak var mainWindow: NSWindow?
+    let updaterController: SPUStandardUpdaterController
+
+    override init() {
+        updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)

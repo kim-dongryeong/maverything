@@ -30,5 +30,9 @@
     <string>Maverything — instant, system-wide file search.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Maverything uses Finder to show the Get Info window for a selected file.</string>
+    <key>SUFeedURL</key>
+    <string>https://kim-dongryeong.github.io/maverything/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>I/toDjXooY4vVrPNFiKz4+9uPR/vsViZelhgC7dGrIw=</string>
 </dict>
 </plist>

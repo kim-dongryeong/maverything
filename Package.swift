@@ -10,13 +10,19 @@ import PackageDescription
 let package = Package(
     name: "Maverything",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.4")
+    ],
     targets: [
         .target(
             name: "MaverythingCore"
         ),
         .executableTarget(
             name: "Maverything",
-            dependencies: ["MaverythingCore"]
+            dependencies: [
+                "MaverythingCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ]
         ),
         .executableTarget(
             name: "mvtest",

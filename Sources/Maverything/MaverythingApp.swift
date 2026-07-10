@@ -46,14 +46,11 @@ struct MaverythingApp: App {
             SettingsView().environmentObject(model)
         }
 
-        MenuBarExtra("Maverything", systemImage: "magnifyingglass.circle") {
-            Button("Show Maverything") { delegate.summon() }
-            Button("Reindex Now") { model.reindex() }
-            Button("Check for Updates…") { delegate.updaterController.checkForUpdates(nil) }
-            SettingsLink { Text("Settings…") }
-            Divider()
-            Button("Quit Maverything") { NSApp.terminate(nil) }   // willTerminate saves the snapshot once
-        }
+        // No MenuBarExtra: the app is summoned by the global hotkey (⌥Space) or by
+        // launching it again (Spotlight/Finder → applicationShouldHandleReopen). While
+        // hidden it drops to the accessory activation policy — gone from the Dock and
+        // ⌘Tab, "feels quit", yet stays resident so the index keeps updating live.
+        // Check-for-Updates and Quit moved into the gear (Options) menu.
     }
 }
 
@@ -232,8 +229,8 @@ struct HelpCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .help) {
-            Button("Check for Updates…") { 
-                (NSApp.delegate as? AppDelegate)?.updaterController.checkForUpdates(nil) 
+            Button("Check for Updates…") {
+                AppDelegate.shared?.updaterController.checkForUpdates(nil)
             }
             Divider()
             Button("Search Syntax") { model.showSyntax = true }
@@ -246,17 +243,35 @@ struct HelpCommands: Commands {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// The adaptor-created instance. ⚠️ Never reach it via `NSApp.delegate as? AppDelegate`:
+    /// @NSApplicationDelegateAdaptor can install SwiftUI's own wrapper as NSApp.delegate,
+    /// making that cast silently nil (bit us: adoptMainWindow never ran, mainWindow stayed
+    /// nil, and every caller limped along on keyWindow fallbacks).
+    static private(set) weak var shared: AppDelegate?
     weak var model: AppModel?
     weak var mainWindow: NSWindow?
     let updaterController: SPUStandardUpdaterController
+    /// True when THIS launch came from the login item (Settings ▸ Start at login):
+    /// the app then starts silently — accessory policy, main window ordered out on
+    /// attach — and just keeps the index warm until the hotkey summons it.
+    private(set) var launchedAtLogin = false
+    private var startHiddenPending = false
 
     override init() {
         updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
         super.init()
+        AppDelegate.shared = self
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        // A login-item launch carries the launched-as-login-item Apple event — the
+        // only supported way to tell "user opened me" from "launchd opened me at login".
+        let ev = NSAppleEventManager.shared().currentAppleEvent
+        launchedAtLogin = ev?.eventID == kAEOpenApplication
+            && ev?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+        startHiddenPending = launchedAtLogin
+        NSApp.setActivationPolicy(launchedAtLogin ? .accessory : .regular)
+
         HotkeyController.shared.onTrigger = { [weak self] in self?.toggle() }
         HotkeyController.shared.reregister()   // user-configurable global hotkey (default ⌥Space)
         // Re-register on activation so granting Accessibility upgrades us to the
@@ -264,6 +279,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(onActive),
             name: NSApplication.didBecomeActiveNotification, object: nil)
+        // Any window closing (e.g. ESC closing a ⌘N window while the main one is already
+        // hidden) may leave nothing on screen → drop out of the Dock/⌘Tab then too.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(someWindowWillClose),
+            name: NSWindow.willCloseNotification, object: nil)
     }
 
     @objc private func onActive() {
@@ -272,18 +292,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func someWindowWillClose() {
+        // willClose fires while the window still counts as visible — re-check next tick.
+        DispatchQueue.main.async { [weak self] in self?.updateActivationPolicy() }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         summon(); return true
     }
 
-    /// Everything semantics: ESC hides the window (⌘W-style); reopen via the
-    /// menu-bar icon, the Dock (ShouldHandleReopen), or the global hotkey.
+    /// Called by AppModel.attachWindow when the PRIMARY window lands. For a login-item
+    /// launch this is where the silent start is enforced: SwiftUI has just created the
+    /// window, so order it right back out before the user ever sees it.
+    func adoptMainWindow(_ w: NSWindow) {
+        Diag.log("adoptMainWindow: #\(w.windowNumber) startHidden=\(startHiddenPending)")
+        mainWindow = w
+        if startHiddenPending {
+            startHiddenPending = false
+            w.orderOut(nil)
+        }
+    }
+
+    /// Everything semantics: ESC hides the window (⌘W-style); reopen via the Dock/
+    /// Spotlight (ShouldHandleReopen) or the global hotkey. Once nothing is on screen
+    /// the app also leaves the Dock and ⌘Tab (accessory) — "feels quit", stays indexing.
     func hideMainWindow() {
-        (mainWindow ?? NSApp.keyWindow)?.orderOut(nil)
+        let w = mainWindow ?? NSApp.keyWindow
+        // A window with an attached sheet (onboarding, Sparkle's update prompt) silently
+        // REFUSES orderOut — dismiss sheets first. SwiftUI sheets are state-driven, so
+        // e.g. onboarding simply re-presents when the window next shows.
+        if let w { for s in w.sheets { w.endSheet(s) } }
+        w?.orderOut(nil)
         if model?.clearSearchOnClose == true { model?.query = "" }   // Everything's option
+        updateActivationPolicy()
+    }
+
+    /// Accessory (no Dock icon, no ⌘Tab entry) whenever NO window is visible; regular
+    /// as soon as anything shows. The index/watcher never notice — they run either way.
+    func updateActivationPolicy() {
+        let anyVisible = NSApp.windows.contains { $0.isVisible }
+        let want: NSApplication.ActivationPolicy = anyVisible ? .regular : .accessory
+        if NSApp.activationPolicy() != want { NSApp.setActivationPolicy(want) }
     }
 
     func summon() {
+        NSApp.setActivationPolicy(.regular)    // back into the Dock + ⌘Tab before showing
         NSApp.activate(ignoringOtherApps: true)
         if let w = mainWindow ?? NSApp.windows.first {
             w.makeKeyAndOrderFront(nil)        // keep the user's position; no re-center
@@ -293,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func toggle() {
         if let w = mainWindow, w.isVisible, w.isKeyWindow {
-            w.orderOut(nil)
+            hideMainWindow()                   // same path as ESC → also leaves Dock/⌘Tab
         } else {
             summon()
         }

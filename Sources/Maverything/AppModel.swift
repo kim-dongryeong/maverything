@@ -414,7 +414,7 @@ final class AppModel: ObservableObject {
         installEscMonitor()
         w.level = .normal
         w.isMovableByWindowBackground = true
-        if isPrimary { (NSApp.delegate as? AppDelegate)?.mainWindow = w }
+        if isPrimary { AppDelegate.shared?.adoptMainWindow(w) }   // login-item launch: orders it back out (silent start)
         if !isPrimary, !grantedInitialFocus, w.isKeyWindow {
             grantedInitialFocus = true
             Diag.log("attachWindow: already key → granting search-field focus")
@@ -1000,7 +1000,7 @@ final class AppModel: ObservableObject {
         // still drop it from the list promptly; only fully defer when our window is hidden,
         // where there's nothing to update and no reason to burn a core on background churn.
         let windowVisible = window?.isVisible
-            ?? ((NSApp.delegate as? AppDelegate)?.mainWindow?.isVisible ?? false)
+            ?? (AppDelegate.shared?.mainWindow?.isVisible ?? false)
         guard NSApp.isActive || windowVisible else { pendingLiveRefresh = true; return }
         guard !liveRefreshScheduled else { return }
         liveRefreshScheduled = true

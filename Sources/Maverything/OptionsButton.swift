@@ -58,7 +58,14 @@ struct OptionsButton: NSViewRepresentable {
             item(m, "Copy All Paths", cmd: "copypaths")
             item(m, "Export Results as CSV…", cmd: "export")
             m.addItem(.separator())
+            item(m, "Check for Updates…", cmd: "update")
             item(m, "Settings…", cmd: "settings")
+            m.addItem(.separator())
+            // With no menu-bar icon, the gear is the app's only clickable Quit
+            // (⌘Q still works whenever a window is frontmost).
+            let quit = NSMenuItem(title: "Quit Maverything", action: #selector(pick(_:)), keyEquivalent: "q")
+            quit.target = self; quit.representedObject = "quit:0"
+            m.addItem(quit)
             m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
         }
 
@@ -136,7 +143,9 @@ struct OptionsButton: NSViewRepresentable {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(s, forType: .string)
             case "export":  exportCSV()
+            case "update":  AppDelegate.shared?.updaterController.checkForUpdates(nil)
             case "settings": model.requestOpenSettings()
+            case "quit":    NSApp.terminate(nil)   // willTerminate saves the snapshot once
             default: break
             }
         }

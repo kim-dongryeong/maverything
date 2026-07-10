@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import MaverythingCore
+import ServiceManagement
 import SwiftUI
 
 /// Persisted global-hotkey configuration (Carbon virtual keycode + Carbon modifier
@@ -169,6 +170,9 @@ struct HotkeyRecorder: NSViewRepresentable {
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var hotkeyDisplay = HotkeyConfig.current.display
+    /// Live login-item state, read from the system (SMAppService), not UserDefaults —
+    /// the user can also flip it in System Settings ▸ General ▸ Login Items.
+    @State private var startAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
         TabView {
@@ -184,6 +188,24 @@ struct SettingsView: View {
 
     private var general: some View {
         Form {
+            Section("Startup") {
+                Toggle("Start at login", isOn: Binding(
+                    get: { startAtLogin },
+                    set: { on in
+                        do {
+                            if on { try SMAppService.mainApp.register() }
+                            else { try SMAppService.mainApp.unregister() }
+                            startAtLogin = on
+                        } catch {
+                            // e.g. blocked in System Settings — re-read the truth and beep.
+                            startAtLogin = SMAppService.mainApp.status == .enabled
+                            NSSound.beep()
+                        }
+                    }))
+                Text("Launches silently in the background at login (no window, no Dock icon) so the index is always up to date — summon it anytime with the global hotkey.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Hotkey") {
                 LabeledContent("Global hotkey") {
                     HStack {

@@ -2,37 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>Maverything</string>
-    <key>CFBundleDisplayName</key>
-    <string>Maverything</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.maverything.app</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
-    <key>CFBundleExecutable</key>
-    <string>Maverything</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
-    <key>NSHumanReadableCopyright</key>
-    <string>Maverything — instant, system-wide file search.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Maverything uses Finder to show the Get Info window for a selected file.</string>
-    <key>SUFeedURL</key>
-    <string>https://kim-dongryeong.github.io/maverything/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>I/toDjXooY4vVrPNFiKz4+9uPR/vsViZelhgC7dGrIw=</string>
+	<key>CFBundleDisplayName</key>
+	<string>Maverything</string>
+	<key>CFBundleExecutable</key>
+	<string>Maverything</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.maverything.app</string>
+	<key>CFBundleName</key>
+	<string>Maverything</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Maverything uses Finder to show the Get Info window for a selected file.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Maverything — instant, system-wide file search.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>SUFeedURL</key>
+	<string>https://kim-dongryeong.github.io/maverything/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>I/toDjXooY4vVrPNFiKz4+9uPR/vsViZelhgC7dGrIw=</string>
 </dict>
 </plist>

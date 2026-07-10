@@ -5,5 +5,14 @@
     <!-- Intentionally NOT sandboxed: whole-disk indexing is incompatible with
          App Sandbox. Full Disk Access is granted by the user via System Settings.
          No com.apple.security.cs.* opt-outs are needed merely to READ files. -->
+
+    <!-- Sparkle.framework is bundled and re-signed with OUR identity, but the
+         hardened runtime's library validation matches by TEAM ID — and the
+         self-signed dev cert has none, so dyld refuses the framework ("different
+         Team IDs") and the app dies at launch. This standard, notarization-
+         accepted exception lets the bundled framework load under every signing
+         identity (ad-hoc, dev cert, Developer ID). -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
 </dict>
 </plist>

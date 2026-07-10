@@ -48,6 +48,25 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/" || true
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# ── Sparkle.framework ────────────────────────────────────────────────────────
+# The binary links @rpath/Sparkle.framework (SPM binary artifact). A raw
+# `swift build` run finds it next to the binary via @loader_path, but the .app
+# bundle does NOT — shipping without bundling it makes the installed app die at
+# launch with dyld "Library missing" (the v0.1 DMG bug). Bundle the framework
+# and point an rpath at Contents/Frameworks like a normal Mac app.
+SPARKLE_SRC=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+if [ -d "$SPARKLE_SRC" ]; then
+    echo "▸ bundling Sparkle.framework"
+    mkdir -p "$APP/Contents/Frameworks"
+    # -R preserves the framework's internal symlink structure (Versions/Current …);
+    # a plain cp -r would materialize duplicates and break codesign's bundle layout.
+    cp -R "$SPARKLE_SRC" "$APP/Contents/Frameworks/"
+    install_name_tool -add_rpath "@executable_path/../Frameworks" \
+        "$APP/Contents/MacOS/Maverything" 2>/dev/null || true
+else
+    echo "  (warning: Sparkle artifact not found at $SPARKLE_SRC — app will not launch as a bundle)"
+fi
+
 echo "▸ codesign (identity: $SIGN_ID)"
 # When using the dedicated dev cert, unlock its keychain and sign against it so
 # TCC grants (FDA/Accessibility) persist across rebuilds.
@@ -63,6 +82,29 @@ if [ "$SIGN_ID" != "-" ] && [ -f "$SIGNKC" ]; then
         KCARG=(--keychain "$SIGNKC")
     fi
 fi
+sign() {   # sign <path> [extra codesign args…]
+    local target="$1"; shift
+    if [ ${#KCARG[@]} -eq 0 ]; then
+        codesign --force --options runtime --sign "$SIGN_ID" "$@" "$target"
+    else
+        codesign --force --options runtime --sign "$SIGN_ID" "${KCARG[@]}" "$@" "$target"
+    fi
+}
+
+# Sparkle.framework nests its own executables (XPC services, Autoupdate, Updater.app);
+# per Sparkle's signing guidance, sign those innermost-first, then the framework —
+# all BEFORE the outer bundle seal.
+SPK="$APP/Contents/Frameworks/Sparkle.framework"
+if [ -d "$SPK" ]; then
+    echo "▸ codesign Sparkle.framework (nested-first)"
+    for xpc in "$SPK/Versions/B/XPCServices/"*.xpc; do
+        [ -e "$xpc" ] && sign "$xpc" --preserve-metadata=entitlements
+    done
+    [ -e "$SPK/Versions/B/Autoupdate" ]   && sign "$SPK/Versions/B/Autoupdate"
+    [ -e "$SPK/Versions/B/Updater.app" ]  && sign "$SPK/Versions/B/Updater.app"
+    sign "$SPK"
+fi
+
 # Nested helper executables (Contents/Helpers/*) are auxiliary Mach-O and must be
 # signed BEFORE the outer bundle — codesign refuses to seal a bundle that contains
 # an unsigned nested code object.

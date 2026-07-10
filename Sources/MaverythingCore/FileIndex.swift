@@ -134,11 +134,20 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     // Locked (safe to call from the main thread while the reconciler mutates).
+    // Bounds-guarded like `row(_:)`: SwiftUI (GridResults et al.) can render one frame
+    // with result ids from the PREVIOUS index generation while a reindex has already
+    // clear()ed the arrays — an out-of-range subscript here killed the whole app
+    // (crash: "Index out of range" in FileIndex.isDir ← GridResults.cell). Out of
+    // range answers as "not there": false / deleted / empty string.
     @inline(__always) public func isDir(_ i: Int) -> Bool {
-        rdlock(); defer { unlock() }; return objType[i] == VNODE_VDIR
+        rdlock(); defer { unlock() }
+        guard i >= 0, i < objType.count else { return false }
+        return objType[i] == VNODE_VDIR
     }
     @inline(__always) public func isDeleted(_ i: Int) -> Bool {
-        rdlock(); defer { unlock() }; return deleted[i]
+        rdlock(); defer { unlock() }
+        guard i >= 0, i < deleted.count else { return true }
+        return deleted[i]
     }
 
     /// Empties the index (for a full re-crawl).
@@ -368,11 +377,19 @@ public final class FileIndex: @unchecked Sendable {
         return result.isEmpty ? "/" : result
     }
 
-    /// The bare file/dir name of entry `i`.
-    public func name(_ i: Int) -> String { rdlock(); defer { unlock() }; return _name(i) }
+    /// The bare file/dir name of entry `i`. Bounds-guarded (stale-generation render — see isDir).
+    public func name(_ i: Int) -> String {
+        rdlock(); defer { unlock() }
+        guard i >= 0, i < nameOff.count else { return "" }
+        return _name(i)
+    }
 
-    /// Reconstructs the absolute path of entry `i` by walking parents.
-    public func path(_ i: Int) -> String { rdlock(); defer { unlock() }; return _path(i) }
+    /// Reconstructs the absolute path of entry `i` by walking parents. Bounds-guarded (see isDir).
+    public func path(_ i: Int) -> String {
+        rdlock(); defer { unlock() }
+        guard i >= 0, i < nameOff.count else { return "" }
+        return _path(i)
+    }
 
     /// Resolve a folder's absolute path to its entry index (for folder-scoped search).
     /// NFC-normalizes first: the map is keyed by NFC bytes, whereas the old String
@@ -492,9 +509,10 @@ public final class FileIndex: @unchecked Sendable {
         return total
     }
 
-    /// The parent directory's absolute path (for display).
+    /// The parent directory's absolute path (for display). Bounds-guarded (see isDir).
     public func directory(_ i: Int) -> String {
         rdlock(); defer { unlock() }
+        guard i >= 0, i < parent.count else { return "" }
         let p = parent[i]
         return p < 0 ? _path(i) : _path(Int(p))
     }

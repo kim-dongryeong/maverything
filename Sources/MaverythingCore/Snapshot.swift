@@ -34,7 +34,16 @@ public enum Snapshot {
         let m = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
         guard m == zMagic else { return data }   // not compressed → pass through
         let rawSize = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt64.self) }
-        guard rawSize > 0, rawSize <= 32_000_000_000 else { return nil }
+        // Trust the header's rawSize ONLY within sane bounds before allocating it: a corrupt
+        // or tampered snapshot could otherwise name a value up to 32 GB and OOM-kill the app
+        // at launch (Codex). Cap by BOTH an absolute ceiling AND a decompression-ratio vs the
+        // actual compressed payload — real LZFSE index data compresses a few ×, so a tiny file
+        // claiming gigabytes is definitionally corrupt. (The decode below still verifies the
+        // exact size; this only bounds the pre-decode allocation.) A generous 1000× + 1 MB
+        // floor clears every legitimate snapshot with huge margin.
+        let compressedPayload = UInt64(data.count - 12)
+        let maxRaw = min(UInt64(32_000_000_000), compressedPayload &* 1000 &+ 1_000_000)
+        guard rawSize > 0, rawSize <= maxRaw else { return nil }
         var raw = Data(count: Int(rawSize))
         let ok: Bool = raw.withUnsafeMutableBytes { dst in
             data.withUnsafeBytes { src in

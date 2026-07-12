@@ -213,7 +213,15 @@ public final class FileEnumerator: @unchecked Sendable {
             let count = withUnsafeMutablePointer(to: &attr) { alp in
                 getattrlistbulk(fd, alp, buf, bufSize, options)
             }
-            if count <= 0 { break }
+            if count == 0 { break }                 // 0 = genuine end of directory
+            if count < 0 {                          // <0 = error mid-enumeration
+                if errno == EINTR { continue }      // interrupted syscall → retry, don't lose the rest
+                // A transient I/O error is NOT EOF: recording it as a clean finish would
+                // silently persist a partially-indexed directory into the snapshot. Count it
+                // and stop this dir (matches listDirectory's reconcile-path handling).
+                local.openErrors += 1
+                break
+            }
             var p = UnsafeRawPointer(buf)
             for _ in 0..<count {
                 let entryLen = Int(p.loadUnaligned(fromByteOffset: 0, as: UInt32.self))

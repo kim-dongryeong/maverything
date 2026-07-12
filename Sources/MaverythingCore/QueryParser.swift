@@ -286,7 +286,16 @@ public enum QueryParser {
             if s.hasSuffix(suf) { mult = m; s.removeLast(suf.count); break }
         }
         guard let num = Double(s.trimmingCharacters(in: .whitespaces)) else { return nil }
-        return (op, Int64(num * Double(mult)))
+        // `Int64(Double)` TRAPS on nan/inf and on any finite value outside Int64's range —
+        // so `size:nan`, `size:inf`, `size:1e309`, `size:9e99`, even `size:1e5gb` would
+        // crash the whole app (and, via QueryServer, a headless mvfind/MCP query could kill
+        // the resident process). Clamp into range and reject non-finite instead of trapping.
+        let bytes = num * Double(mult)
+        guard bytes.isFinite else { return nil }
+        let clamped = bytes.rounded()
+        if clamped >= 9.223372036854776e18 { return (op, Int64.max) }   // ≥ Int64.max → saturate
+        if clamped <= -9.223372036854776e18 { return (op, Int64.min) }
+        return (op, Int64(clamped))
     }
 
     /// Returns (from, to) mtime-ns bounds (half-open [from, to)). Uses the LOCAL
@@ -297,7 +306,15 @@ public enum QueryParser {
         let cal = Calendar.current
         let day: TimeInterval = 86_400
         let startOfToday = cal.startOfDay(for: Date(timeIntervalSince1970: now)).timeIntervalSince1970
-        func ns(_ t: TimeInterval) -> Int64 { Int64(t * 1e9) }
+        // Guard like parseSize: a 4-digit year (e.g. `dm:9999-01-01`) makes t·1e9 exceed
+        // Int64's range, and `Int64(Double)` traps — clamp instead of crashing.
+        func ns(_ t: TimeInterval) -> Int64 {
+            let v = (t * 1e9).rounded()
+            guard v.isFinite else { return 0 }
+            if v >= 9.223372036854776e18 { return .max }
+            if v <= -9.223372036854776e18 { return .min }
+            return Int64(v)
+        }
         switch s {
         case "today":            return (ns(startOfToday), ns(startOfToday + day))
         case "yesterday":        return (ns(startOfToday - day), ns(startOfToday))

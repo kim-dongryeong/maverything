@@ -154,18 +154,27 @@ struct RowThumb: View {
 enum BundleSizeCache {
     private static var cache: [String: Int64] = [:]
     private static var inflight: Set<String> = []
+    private static var cacheGen = -1        // the index mutationGeneration the cache was built at
     private static let lock = NSLock()
 
     static func size(path: String, dirIdx: Int32, index: MaverythingCore.FileIndex,
                      onReady: @escaping () -> Void) -> Int64? {
+        // Keyed by path alone, this cache would show a STALE .app/.bundle size forever after
+        // its contents change (Codex). Tie it to the index's mutation generation: any content
+        // change bumps the gen, so we drop the whole cache and recompute on next access.
+        let gen = index.mutationGeneration()
         lock.lock()
+        if gen != cacheGen { cache.removeAll(keepingCapacity: true); inflight.removeAll(keepingCapacity: true); cacheGen = gen }
         if let c = cache[path] { lock.unlock(); return c }
         if inflight.contains(path) { lock.unlock(); return nil }
         inflight.insert(path); lock.unlock()
         DispatchQueue.global(qos: .utility).async {
             let s = index.subtreeSize(of: dirIdx)
+            let genNow = index.mutationGeneration()   // the gen `s` actually reflects
             lock.lock()
-            if cache.count < 20_000 { cache[path] = s }
+            // Only cache if the generation still matches — otherwise the index changed while
+            // we summed, and this size is already stale (a fresh request will recompute).
+            if genNow == cacheGen, cache.count < 20_000 { cache[path] = s }
             inflight.remove(path)
             lock.unlock()
             DispatchQueue.main.async { onReady() }

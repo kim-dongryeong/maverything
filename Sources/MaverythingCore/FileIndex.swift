@@ -91,6 +91,9 @@ public final class FileIndex: @unchecked Sendable {
     @inline(__always) private func bumpMut() { _mutationGen &+= 1 }   // caller holds wrlock
     func bumpMutationLocked() { _mutationGen &+= 1 }                  // internal: Snapshot.swift, caller holds wrlock
     public func bumpMutation() { wrlock(); _mutationGen &+= 1; unlock() }   // external "refresh now"
+    /// Locked snapshot of the mutation generation — bumped on every content change. Caches
+    /// keyed only by path (e.g. BundleSizeCache) compare against this to self-invalidate.
+    public func mutationGeneration() -> Int { rdlock(); defer { unlock() }; return _mutationGen }
 
     /// Bumped on every clear() so an in-flight reconcile from a previous crawl
     /// generation can detect it's stale and no-op instead of corrupting the fresh index.

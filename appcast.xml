@@ -3,6 +3,14 @@
     <channel>
         <title>Maverything</title>
         <item>
+            <title>0.1.2</title>
+            <pubDate>Sun, 12 Jul 2026 21:11:47 +0300</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/kim-dongryeong/maverything/releases/download/v0.1.2/Maverything-0.1.2.dmg" length="5789740" type="application/octet-stream" sparkle:edSignature="qoZ74gNyW9XdJrcNzYW/DMWBAZrNJztQl6MnH5hzEerNkp+/McpsdY8SyYJBAKg/UieoQW46LiKFOx+q2SPCAA=="/>
+        </item>
+        <item>
             <title>0.1.1</title>
             <pubDate>Fri, 10 Jul 2026 08:10:32 +0300</pubDate>
             <sparkle:version>2</sparkle:version>

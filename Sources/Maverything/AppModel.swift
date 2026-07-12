@@ -290,10 +290,15 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let searchQueue = DispatchQueue(label: "maverything.search", qos: .userInteractive)
     private let indexQueue = DispatchQueue(label: "maverything.index", qos: .userInitiated)
-    private var searchSeq = 0
+    // `searchSeq` is read/written from BOTH the main actor and the background search queue,
+    // always under `seqLock` — so the accessors are `nonisolated` (a lock-guarded shared
+    // counter, not actor state). This lets the engine's `@Sendable isStale` closure poll it
+    // off-main to abort a superseded scan. `nonisolated(unsafe)` = "I hold the invariant
+    // (always via seqLock) that the compiler can't verify."
+    private nonisolated(unsafe) var searchSeq = 0
     private let seqLock = NSLock()   // guards searchSeq so the search queue can pre-check staleness
-    private func nextSearchSeq() -> Int { seqLock.lock(); searchSeq &+= 1; let v = searchSeq; seqLock.unlock(); return v }
-    private func currentSearchSeq() -> Int { seqLock.lock(); defer { seqLock.unlock() }; return searchSeq }
+    private nonisolated func nextSearchSeq() -> Int { seqLock.lock(); searchSeq &+= 1; let v = searchSeq; seqLock.unlock(); return v }
+    private nonisolated func currentSearchSeq() -> Int { seqLock.lock(); defer { seqLock.unlock() }; return searchSeq }
     private var started = false
     private var currentEnumerator: FileEnumerator?
     private var indexGen = 0
@@ -491,25 +496,49 @@ final class AppModel: ObservableObject {
 
     private var progressTimer: Timer?
 
-    /// Path prefixes to skip. Cloud File Providers are excluded unless the user
-    /// opts in; the autofs home map is always skipped.
-    private func currentExclusions() -> [String] {
-        // always skip our own snapshot dir + autofs; cloud only when not opted in
-        let base = includeCloud ? Volumes.alwaysExclusions() : Volumes.defaultExclusions()
-        return base + customExcludes.map {
+    /// An immutable snapshot of the user-editable crawl settings. Captured on the MAIN
+    /// actor (via `crawlConfig`) and handed to the background indexQueue, so the crawl
+    /// never reads @Published state concurrently with a Settings edit (Codex red-team:
+    /// reading Swift String/Array storage off-main while it's mutated is a data race →
+    /// undefined behaviour, from wrong config to memory corruption). `Sendable` because
+    /// every field is a value type.
+    struct CrawlConfig: Sendable {
+        var includeCloud: Bool
+        var customExcludes: [String]
+        var customRoots: [String]
+        var filePatterns: [[UInt8]]
+        var includeOnly: [[UInt8]]
+    }
+
+    /// Capture the live settings. MUST be read on the main actor (it touches @Published).
+    var crawlConfig: CrawlConfig {
+        CrawlConfig(includeCloud: includeCloud, customExcludes: customExcludes,
+                    customRoots: customRoots, filePatterns: parsedFilePatterns,
+                    includeOnly: parsedIncludeOnly)
+    }
+
+    /// Path prefixes to skip. Cloud File Providers are excluded unless the user opts in;
+    /// the autofs home map is always skipped. Pure over a captured config — safe off-main
+    /// (only reads process-global `Volumes.*`, no @Published state).
+    nonisolated static func exclusions(_ c: CrawlConfig) -> [String] {
+        let base = c.includeCloud ? Volumes.alwaysExclusions() : Volumes.defaultExclusions()
+        return base + c.customExcludes.map {
             ($0 as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
         }
     }
+    /// Main-actor convenience: snapshot the config and compute exclusions.
+    private func currentExclusions() -> [String] { AppModel.exclusions(crawlConfig) }
 
     /// Every root we WANT indexed: the local volumes plus user-added folders that the
     /// volume scan doesn't reach (network shares/NAS are not MNT_LOCAL, so they only
     /// get in this way). Custom roots already covered by an indexed volume are skipped
     /// (they'd double-index); vanished ones (unreachable share) drop out, which routes
     /// their cleanup through the same volume-sync tombstone path as an unplug.
-    func desiredCrawlRoots() -> [CrawlRoot] {
+    /// Pure over a captured config — safe to call from the background crawl.
+    nonisolated static func desiredCrawlRoots(_ c: CrawlConfig) -> [CrawlRoot] {
         var roots = Volumes.localCrawlRoots()
         var seen = Set(roots.map(\.displayPath))
-        let excl = currentExclusions()
+        let excl = exclusions(c)
         let mounts = Volumes.allMountPoints()
         // The volume that actually CONTAINS p (crawls never descend into other mounts,
         // so "under /" alone does not mean covered — a NAS at /Volumes/NAS is not).
@@ -520,7 +549,7 @@ final class AppModel: ObservableObject {
             }
             return best
         }
-        for raw in customRoots {
+        for raw in c.customRoots {
             let p = (raw as NSString).expandingTildeInPath.precomposedStringWithCanonicalMapping
             guard !seen.contains(p), FileManager.default.fileExists(atPath: p) else { continue }
             let coveredByLocal = seen.contains(enclosingMount(p))
@@ -531,6 +560,8 @@ final class AppModel: ObservableObject {
         }
         return roots
     }
+    /// Main-actor convenience: snapshot the config and compute desired roots.
+    func desiredCrawlRoots() -> [CrawlRoot] { AppModel.desiredCrawlRoots(crawlConfig) }
 
     func start() {
         guard !started else { return }
@@ -642,6 +673,12 @@ final class AppModel: ObservableObject {
 
         let roots = self.desiredCrawlRoots()
         let exclude = currentExclusions()
+        // Snapshot the user-editable crawl config on the MAIN actor now — reading these
+        // @Published/computed properties from the background indexQueue would race a
+        // concurrent Settings edit (Codex red-team). Everything the crawl needs is captured
+        // here as immutable locals and passed in.
+        let filePatterns = parsedFilePatterns
+        let includeOnly = parsedIncludeOnly
         Diag.log("crawl[\(gen)] roots: \(roots.map { "\($0.fsPath)→\($0.displayPath)" }.joined(separator: ", "))  FDA=\(hasFullDiskAccess) cloud=\(includeCloud)")
 
         progressTimer?.invalidate()
@@ -672,8 +709,8 @@ final class AppModel: ObservableObject {
             let sinceId = FSEventsGetCurrentEventId()
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
                                  mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns,
-                                 includeOnlyFiles: self.parsedIncludeOnly)
+                                 excludeFilePatterns: filePatterns,
+                                 includeOnlyFiles: includeOnly)
             if en.isCancelled { return }                     // superseded; skip extra work
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
@@ -785,7 +822,8 @@ final class AppModel: ObservableObject {
 
         volumeRefreshInFlight = true
         let gen = indexGen
-        let exclude = currentExclusions()
+        let config = crawlConfig               // main-actor snapshot for the background crawl
+        let exclude = AppModel.exclusions(config)
         let expectedRoots = watchedRoots.filter { desiredByPath[$0.displayPath] != nil } + additions
         let dynamicEnumerator = additions.isEmpty ? nil : FileEnumerator(index: index)
         if let dynamicEnumerator { currentEnumerator = dynamicEnumerator }
@@ -815,8 +853,8 @@ final class AppModel: ObservableObject {
             if let en = dynamicEnumerator {
                 let stats = en.crawl(roots: additions, restrictToVolume: false, exclude: exclude,
                                      mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns,
-                                 includeOnlyFiles: self.parsedIncludeOnly)
+                                 excludeFilePatterns: config.filePatterns,
+                                 includeOnlyFiles: config.includeOnly)
                 if !en.isCancelled {
                     self.index.buildLiveIndexes()
                     // A stale reconciler racing the mount may have indexed the volume AGAIN
@@ -833,14 +871,16 @@ final class AppModel: ObservableObject {
 
             var finalRoots = expectedRoots
             if dynamicEnumerator?.isCancelled != true {
-                let stillMounted = Set(self.desiredCrawlRoots().map { $0.displayPath })
+                // Re-evaluated post-crawl to catch volumes unmounted DURING the crawl: pure
+                // over the captured config, so only the live mount state (Volumes.*) varies.
+                let stillMounted = Set(AppModel.desiredCrawlRoots(config).map { $0.displayPath })
                 for r in finalRoots where !stillMounted.contains(r.displayPath) {
                     removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
                 }
                 finalRoots.removeAll { !stillMounted.contains($0.displayPath) }
             }
             let finalRootKeys = Set(finalRoots.map { $0.displayPath })
-            let desiredKeysAfterWork = Set(self.desiredCrawlRoots().map { $0.displayPath })
+            let desiredKeysAfterWork = Set(AppModel.desiredCrawlRoots(config).map { $0.displayPath })
             let needsAnotherPass = finalRootKeys != desiredKeysAfterWork
             let cancelled = dynamicEnumerator?.isCancelled == true
 
@@ -925,7 +965,8 @@ final class AppModel: ObservableObject {
 
         volumeRefreshInFlight = true
         let gen = indexGen
-        let exclude = currentExclusions()
+        let config = crawlConfig               // main-actor snapshot for the background crawl
+        let exclude = AppModel.exclusions(config)
         let en = FileEnumerator(index: index)
         currentEnumerator = en
         Diag.log("custom-root rescan starting: [\(roots.map(\.displayPath).joined(separator: ", "))] (every \(customRootRescanMinutes) min)")
@@ -944,8 +985,8 @@ final class AppModel: ObservableObject {
             }
             let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
                                  mountPoints: Volumes.allMountPoints(),
-                                 excludeFilePatterns: self.parsedFilePatterns,
-                                 includeOnlyFiles: self.parsedIncludeOnly)
+                                 excludeFilePatterns: config.filePatterns,
+                                 includeOnlyFiles: config.includeOnly)
             if !en.isCancelled { self.index.buildLiveIndexes() }
             let cancelled = en.isCancelled
 
@@ -1387,7 +1428,8 @@ final class AppModel: ObservableObject {
                 return
             }
             let res = engine.search(q, mode: mm, scope: sc, sortKey: sk, ascending: asc,
-                                    now: now, scopeRoot: rootIdx)
+                                    now: now, scopeRoot: rootIdx,
+                                    isStale: { [weak self] in self?.currentSearchSeq() != seq })
             DispatchQueue.main.async {
                 guard self.currentSearchSeq() == seq else { return }   // drop stale
                 self.resultsStore.ids = res.ids

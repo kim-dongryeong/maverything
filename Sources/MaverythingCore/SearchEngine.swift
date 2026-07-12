@@ -139,9 +139,14 @@ public final class SearchEngine: @unchecked Sendable {
     /// prove the prepass returns exactly the same set as the ground-truth scan.
     public var _debugForceGeneralPath = false
 
+    /// `isStale`: an optional, thread-safe predicate the caller sets to "has a newer search
+    /// superseded me?". The long post-lock scans (content: reads up to 200k files; regex runs
+    /// a pattern per candidate) poll it and bail early, so the serial search queue isn't
+    /// blocked by a search whose result will be discarded anyway (Codex — responsiveness).
     public func search(_ query: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly,
                        sortKey: SortKey = .name, ascending: Bool = true,
-                       limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil) -> SearchResults {
+                       limit: Int = 100_000, now: TimeInterval = 0, scopeRoot: Int32? = nil,
+                       isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
         // content:/tag: are post-filters that do FILE I/O (read contents / xattrs), so they
         // must run OUTSIDE the index read lock — a long scan must never block the reconciler.
         // The name/metadata scan first narrows candidates under the lock as usual.
@@ -162,7 +167,7 @@ public final class SearchEngine: @unchecked Sendable {
         // Resolve the frecency map and run the scan in the SAME read-lock acquisition
         // so the tracked ids line up with the exact index the scan saw (Codex review).
         var frecency: [Int32: Double] = [:]
-        var res = index.withReadLock { () -> SearchResults in
+        let res = index.withReadLock { () -> SearchResults in
             if sortKey == .relevance || sortKey == .runCount {
                 frecency = resolveFrecencyLocked(now: now)
             }
@@ -171,7 +176,7 @@ public final class SearchEngine: @unchecked Sendable {
             let innerLimit = needFull ? max(limit, index.count) : limit
             return _search(query, mode: mode, scope: scope, sortKey: sortKey,
                            ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
-                           frecency: frecency)
+                           frecency: frecency, isStale: isStale)
         }
         // From here every stage works on the FULL set; `total` tracks live match count.
         var ids = res.ids
@@ -183,7 +188,8 @@ public final class SearchEngine: @unchecked Sendable {
             let clock = ContinuousClock(); let t0 = clock.now
             if !p.tagGroups.isEmpty { ids = Self.filterByTags(ids, groups: p.tagGroups, index: index) }
             if let needle = p.contentNeedle {
-                let c = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive, index: index)
+                let c = Self.filterByContent(ids, needle: needle, caseSensitive: p.caseSensitive,
+                                             index: index, isStale: isStale)
                 ids = c.ids; contentIncomplete = c.incomplete; contentSkippedLarge = c.skippedLarge
             }
             total = ids.count
@@ -241,14 +247,18 @@ public final class SearchEngine: @unchecked Sendable {
     /// On-demand file-content substring (ASCII case-insensitive unless case:on) — the
     /// same 64 KiB-window streaming model Cardinal uses; no content index is kept.
     static func filterByContent(_ ids: [Int32], needle: [UInt8], caseSensitive: Bool,
-                                index: FileIndex) -> (ids: [Int32], incomplete: Bool, skippedLarge: Int) {
+                                index: FileIndex,
+                                isStale: (@Sendable () -> Bool)? = nil) -> (ids: [Int32], incomplete: Bool, skippedLarge: Int) {
         guard !needle.isEmpty else { return (ids, false, 0) }
         let folded = caseSensitive ? needle : needle.map(asciiLower)
         var out: [Int32] = []
         var scanned = 0
         var skippedLarge = 0
         var incomplete = false
-        for id in ids {
+        for (i, id) in ids.enumerated() {
+            // Superseded by a newer query? Stop reading files — the result is about to be
+            // dropped, and each iteration can be a full file open+scan.
+            if i & 0xFF == 0, isStale?() == true { break }
             let r = index.row(Int(id))
             if r.isDir { continue }
             if r.size > contentMaxFileBytes { skippedLarge += 1; continue }
@@ -347,7 +357,8 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func _search(_ query: String, mode: MatchMode, scope: SearchScope,
                          sortKey: SortKey, ascending: Bool, limit: Int, now: TimeInterval,
-                         scopeRoot: Int32?, frecency: [Int32: Double] = [:]) -> SearchResults {
+                         scopeRoot: Int32?, frecency: [Int32: Double] = [:],
+                         isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
         // Regex mode treats the whole query as one pattern (no term-splitting).
@@ -357,7 +368,7 @@ public final class SearchEngine: @unchecked Sendable {
             return regexSearch(pattern: query.precomposedStringWithCanonicalMapping,
                                scope: scope, sortKey: sortKey,
                                ascending: ascending, limit: limit, start: start, clock: clock,
-                               scopeRoot: scopeRoot)
+                               scopeRoot: scopeRoot, isStale: isStale)
         }
 
         let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
@@ -968,7 +979,7 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func regexSearch(pattern: String, scope: SearchScope, sortKey: SortKey, ascending: Bool,
                              limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
-                             scopeRoot: Int32?) -> SearchResults {
+                             scopeRoot: Int32?, isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return SearchResults(ids: [], total: 0, truncated: false,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
@@ -991,6 +1002,9 @@ public final class SearchEngine: @unchecked Sendable {
                     if lo >= hi { return }
                     var ids = [Int32](); var total = 0
                     for k in lo..<hi {
+                        // A per-candidate regex match is costly; bail the whole chunk once a
+                        // newer query supersedes this one (checked cheaply every 512 rows).
+                        if (k - lo) & 0x1FF == 0, isStale?() == true { break }
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones (parity with other paths)
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }

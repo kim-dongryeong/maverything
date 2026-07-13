@@ -238,6 +238,15 @@ struct ResultsTableView: NSViewRepresentable {
         table.usesAutomaticRowHeights = false
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         table.registerForDraggedTypes([.fileURL])   // drop a folder onto the list → scope to it
+        // Drag-source operations for OTHER apps. Finder maps these to its standard drag
+        // modifiers (Option = copy shows the + cursor, Command = move, ⌥⌘ = alias), and
+        // editors like VS Code accept a .generic "open this file" drop. Without this call
+        // NSTableView's external default is far more restrictive, so Finder silently
+        // ignored modifiers and VS Code rejected the drop. NOTE: this is THE api —
+        // a `tableView(_:draggingSession:sourceOperationMaskFor:)` "delegate method" does
+        // not exist in NSTableViewDataSource; we shipped exactly that dead code once and
+        // it compiled fine but was never called.
+        table.setDraggingSourceOperationMask([.copy, .move, .link, .generic], forLocal: false)
 
         for col in Self.columns {
             addColumn(table, id: col.id, title: col.title, width: col.width,
@@ -416,14 +425,15 @@ struct ResultsTableView: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { ids.count }
 
-        // Drag a row out as a file URL → Finder/other apps copy (or move with ⌘).
+        // Drag a row out as a file URL. The allowed operations for external drops
+        // (Finder copy/move/alias, VS Code open) are set once on the table via
+        // setDraggingSourceOperationMask(_:forLocal:) in makeNSView — do NOT re-add a
+        // `tableView(_:draggingSession:sourceOperationMaskFor:)` method here: that
+        // signature is not part of NSTableViewDataSource, so it compiles but is never
+        // called (the bug that silently broke modifier-drags to Finder).
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
             guard row < ids.count else { return nil }
             return URL(fileURLWithPath: model.path(ids[row])) as NSURL
-        }
-        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
-                       sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-            [.copy, .move]
         }
 
         // Drop a folder onto the list → scope the search to that folder.

@@ -349,6 +349,7 @@ struct ResultsTableView: NSViewRepresentable {
                 : Set((tv?.selectedRowIndexes ?? []).compactMap {
                     $0 < coord.renderedIDs.count ? coord.renderedIDs[$0] : nil })
             coord.renderedIDs = model.resultsStore.ids   // adopt the new result set
+            coord.invalidateRowMemo()                    // reconcile may have changed a shown id's size/mtime in place
             tv?.reloadData()
             if newQuery {
                 tv?.deselectAll(nil)   // reloadData keeps selection by position → drop it on a new query
@@ -425,6 +426,22 @@ struct ResultsTableView: NSViewRepresentable {
 
         func numberOfRows(in tableView: NSTableView) -> Int { ids.count }
 
+        // Per-render-pass memo of RowInfo: viewFor:row: is called once PER COLUMN, and each
+        // index.row() re-takes the index read lock + rebuilds name/path/directory by walking
+        // the parent chain (String allocs). ~40 visible rows × ~6 columns = ~240 locked
+        // reconstructions on the main thread per reload/scroll frame — the dominant scroll cost
+        // and lock pressure vs the reconciler. Memoize by id so all columns of a row share ONE
+        // lookup. Capped (self-limits during a long scroll) and CLEARED on every full reload:
+        // a reconcile mutates size/mtime in place for an existing id, so a stale RowInfo must
+        // never outlive the reloadData that a live refresh triggers.
+        private var rowMemo: [Int32: FileIndex.RowInfo] = [:]
+        @inline(__always) func rowInfo(_ id: Int32) -> FileIndex.RowInfo {
+            if let r = rowMemo[id] { return r }
+            if rowMemo.count > 512 { rowMemo.removeAll(keepingCapacity: true) }
+            let r = model.index.row(Int(id)); rowMemo[id] = r; return r
+        }
+        func invalidateRowMemo() { rowMemo.removeAll(keepingCapacity: true) }
+
         // Drag a row out as a file URL. The allowed operations for external drops
         // (Finder copy/move/alias, VS Code open) are set once on the table via
         // setDraggingSourceOperationMask(_:forLocal:) in makeNSView — do NOT re-add a
@@ -462,7 +479,7 @@ struct ResultsTableView: NSViewRepresentable {
             let id = ids[row]
             let colID = tableColumn.identifier.rawValue
             let cell = makeCell(tableView, colID: colID)
-            let r = model.index.row(Int(id))   // one locked snapshot; never subscript arrays off-lock
+            let r = rowInfo(id)   // memoized per render pass — one index.row() lock per row, not per column
             func date(_ ns: Int64) -> String {
                 ns == 0 ? "--" : dateFormatter.string(from: Date(timeIntervalSince1970: Double(ns) / 1e9))
             }

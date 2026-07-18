@@ -182,6 +182,14 @@ public final class FileIndex: @unchecked Sendable {
 
     public func reserveCapacity(_ n: Int) {
         wrlock(); defer { unlock() }   // reallocation must not race a concurrent reader
+        // The byte blobs + typeClass were omitted here, so they grew from empty during the
+        // crawl — ~log2(60MB) reallocations each, memcpy'ing ~120MB+ of redundant data UNDER
+        // the write lock (stalling every append + concurrent reader). Reserve a rough average
+        // name length so the large blobs don't repeatedly realloc. (~24 B/entry is generous;
+        // over-reservation just wastes transient RAM, which grows-past normally anyway.)
+        nameBlob.reserveCapacity(n * 24); foldBlob.reserveCapacity(n * 24)
+        unicodeFoldBlob.reserveCapacity(n)   // conservative — only a few % of names carry a fold
+        typeClass.reserveCapacity(n)
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
         unicodeFoldOff.reserveCapacity(n); unicodeFoldLen.reserveCapacity(n)
         nameMask.reserveCapacity(n)
@@ -245,18 +253,10 @@ public final class FileIndex: @unchecked Sendable {
         let n = batch.len.count
         for _ in 0..<n { parent.append(parentIdx); deleted.append(false) }
         nameMask.append(contentsOf: repeatElement(.max, count: n))   // filled by buildLiveIndexes
-        // typeClass is a FILTER (not a prefilter), so compute it EXACT now — a search
-        // during the crawl (narrow-as-you-type on the growing index) must not miss these.
-        // batch.fold shares batch.off/batch.len with the blob (ASCII fold preserves length).
-        batch.fold.withUnsafeBufferPointer { fb in
-            if let fbBase = fb.baseAddress {
-                for i in 0..<n {
-                    typeClass.append(FileTypeClass.mask(foldedName: fbBase, Int(batch.off[i]), Int(batch.len[i])))
-                }
-            } else {
-                typeClass.append(contentsOf: repeatElement(0, count: n))
-            }
-        }
+        // typeClass is a FILTER (not a prefilter) computed EXACT at append time (a search during
+        // the crawl must not miss these). Now computed in ChildBatch.appendName off the write
+        // lock (parallel scan phase) — here we just splice the precomputed masks in.
+        typeClass.append(contentsOf: batch.typeClass)
         return base
     }
 
@@ -841,6 +841,7 @@ struct ChildBatch {
     var objType: [UInt8] = []
     var flags: [UInt32] = []
     var hidden: [Bool] = []
+    var typeClass: [UInt8] = []   // media-category mask, computed here (parallel) not under the write lock
     /// (localIndex, name) of child directories, to enqueue for further crawling.
     var subdirs: [(Int32, String)] = []
 
@@ -863,7 +864,14 @@ struct ChildBatch {
         off.append(UInt64(blob.count))
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
+        let foldStart = fold.count
         for b in nameBytes { fold.append(asciiLower(b)) }
+        // typeClass computed HERE (parallel per-worker scan) instead of in appendChildren under
+        // the exclusive index write lock — same exact folded bytes + rule, just off the lock.
+        let tcMask = fold.withUnsafeBufferPointer {
+            FileTypeClass.mask(foldedName: $0.baseAddress!, foldStart, nameBytes.count)
+        }
+        typeClass.append(tcMask)
         appendUnicodeFoldStorage(for: nameBytes, blob: &unicodeFoldBlob,
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)

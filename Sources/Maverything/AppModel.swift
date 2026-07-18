@@ -1110,7 +1110,10 @@ final class AppModel: ObservableObject {
                 return
             }
             self.lastLiveRefreshAt = ProcessInfo.processInfo.systemUptime
-            self.engine.invalidate()
+            // NOTE: no engine.invalidate() here — the reconciler already bumped the index
+            // mutationGen when it mutated (FileIndex.applyDirDiff), which invalidates the
+            // gen-keyed engine caches. A second bump here would needlessly re-stale an order
+            // another window/warm may have rebuilt for this gen, forcing a redundant re-sort.
             self.indexedCount = self.index.safeCount()   // reconciler may still be appending
             self.runSearch()                             // background live refresh (re-runs same inputs → no blink)
             self.broadcastResultsRefresh()               // other search windows show the same index — refresh them

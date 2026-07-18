@@ -135,6 +135,7 @@ public final class FileIndex: @unchecked Sendable {
     /// deleted=false; clear() and snapshot-load reset it (load compacts tombstones away).
     /// Maintained under the write lock. (internal so Snapshot.swift's load can reset it.)
     var _deletedCount = 0
+    var deletedCountLocked: Int { _deletedCount }   // caller holds the lock
     /// (total slots, tombstoned) — for deciding when to compact away dead entries. O(1): the
     /// 120s periodic compaction check used to scan all ~2M rows on the main thread under the
     /// read lock every 2 minutes (a multi-ms hitch + lock hold); now a plain counter read.

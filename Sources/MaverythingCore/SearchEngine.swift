@@ -407,14 +407,26 @@ public final class SearchEngine: @unchecked Sendable {
 
         let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
 
-        // empty query → return the chosen order directly (unless scoped to a folder)
+        // empty query → return the chosen order directly (unless scoped to a folder).
+        // MUST skip tombstones: the name/path order cache is no longer rebuilt on deletion
+        // (it's keyed on epoch+count — see orderArray), so the cached order can retain ids
+        // that were tombstoned since it was built. The general scan already skips delB; this
+        // fast path must too, or the default "show all" view shows deleted files (Codex
+        // cross-review caught this regression from the epoch+count keying). `total` = live
+        // count via the O(1) running deleted counter (no O(n) rescan).
         if parsed.isEmpty && scopeRoot == nil {
             let order = orderArray(for: scanOrderKey(sortKey))
             let n = order.count
+            let del = index.deleted   // COW snapshot under the read lock
             var out = [Int32](); out.reserveCapacity(min(limit, n))
-            if ascending { for k in 0..<min(limit, n) { out.append(order[k]) } }
-            else { for k in 0..<min(limit, n) { out.append(order[n - 1 - k]) } }
-            return SearchResults(ids: out, total: n, truncated: n > limit,
+            var k = 0
+            while k < n && out.count < limit {
+                let id = ascending ? order[k] : order[n - 1 - k]
+                if Int(id) >= del.count || !del[Int(id)] { out.append(id) }
+                k += 1
+            }
+            let total = index.count - index.deletedCountLocked   // live entries (tombstones excluded)
+            return SearchResults(ids: out, total: total, truncated: total > out.count,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
 

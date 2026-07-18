@@ -316,7 +316,20 @@ do {
     let warm = eI.search("", sortKey: .name, limit: 100_000, now: now).ids
     let fresh = SearchEngine(index: idxI).search("", sortKey: .name, limit: 100_000, now: now).ids
     check("incremental: warm name order == from-scratch order after append", warm == fresh)
+    // DELETION with a WARM order that isn't rebuilt (epoch+count unchanged on delete): the
+    // empty-query "show all" fast path must SKIP the tombstoned id and count total correctly
+    // (Codex cross-review regression). Warm again, delete via reconcile, re-check empty query.
+    _ = eI.search("", sortKey: .name, limit: 100_000, now: now)   // ensure order cached
+    let liveBefore = eI.search("", sortKey: .name, limit: 100_000, now: now).total
     try? fm.removeItem(atPath: root + "/" + uniqueName)
+    _ = recI.reconcile(eventPaths: [root])                        // tombstone — NO invalidate, count unchanged
+    let emptyAfter = eI.search("", sortKey: .name, limit: 100_000, now: now)
+    let namesAfter = emptyAfter.ids.map { idxI.name(Int($0)) }
+    check("empty-query fast path skips a tombstoned id (deleted file not shown)",
+          !namesAfter.contains(uniqueName))
+    check("empty-query total excludes tombstones (== live count)",
+          emptyAfter.total == liveBefore - 1 && emptyAfter.ids.count == emptyAfter.total,
+          "total=\(emptyAfter.total) liveBefore=\(liveBefore) shown=\(emptyAfter.ids.count)")
 }
 
 // Everything's "Include only files" whitelist + live hide-hidden toggle

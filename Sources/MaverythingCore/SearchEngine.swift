@@ -406,7 +406,7 @@ public final class SearchEngine: @unchecked Sendable {
 
         return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
                        limit: limit, start: start, clock: clock, scopeRoot: scopeRoot,
-                       frecency: frecency)
+                       frecency: frecency, now: now)
     }
 
     /// Walk parent links up from `id`; true if `root` is an ancestor (or is `id`).
@@ -1029,8 +1029,17 @@ public final class SearchEngine: @unchecked Sendable {
 
     private func general(parsed: ParsedQuery, mode: MatchMode, sortKey: SortKey, ascending: Bool,
                          limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
-                         scopeRoot: Int32?, frecency: [Int32: Double] = [:]) -> SearchResults {
+                         scopeRoot: Int32?, frecency: [Int32: Double] = [:],
+                         now: TimeInterval = 0) -> SearchResults {
         let relevance = (sortKey == .relevance)
+        // Recency boost for relevance (ProFind's trick, via the FAF author): what you search
+        // for is disproportionately something you JUST worked with, so recently-modified
+        // files get a bounded bump. Precomputed step thresholds (ns) so the per-candidate
+        // cost is two integer compares against the mtime we already have in RAM.
+        let nowNs = now > 0 ? Int64(min(now, 9.2e9) * 1e9) : 0
+        let recentHourNs = nowNs - 3_600_000_000_000           // ≤ 1 hour ago
+        let recentDayNs  = nowNs - 86_400_000_000_000          // ≤ 1 day ago
+        let recentWeekNs = nowNs - 604_800_000_000_000         // ≤ 1 week ago
         // Frecency boost for relevance: a run-history hit adds a bounded bump to the
         // match score BEFORE the top-K prune (Codex review: boosting after prune is too
         // late). log2 keeps it from swamping match quality; only touches matched ids.
@@ -1296,6 +1305,15 @@ public final class SearchEngine: @unchecked Sendable {
                                 // +0..~120: log2(1+frecency) scaled; a daily-opened file
                                 // gets a firm bump without drowning a much better name match.
                                 score += Int(30.0 * log2(1.0 + f))
+                            }
+                            // Recency bump — stepped so it reorders TIES and near-ties
+                            // (equal-quality name matches) without letting a random file
+                            // touched today beat a clearly better name match.
+                            if nowNs > 0 {
+                                let mt = mtB[id]
+                                if mt >= recentHourNs { score += 60 }
+                                else if mt >= recentDayNs { score += 40 }
+                                else if mt >= recentWeekNs { score += 20 }
                             }
                             pairs.append((id: Int32(id), score: Int32(clamping: score)))
                             if pairs.count > pruneThreshold {

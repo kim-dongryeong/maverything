@@ -58,20 +58,39 @@ public final class SearchEngine: @unchecked Sendable {
     // "refresh now" that simply advances that counter.
     public func invalidate() { index.bumpMutation() }
 
+    // These four toggles are WRITTEN by the app on the main actor (engine.foldersFirst = …)
+    // and READ on the background search/warm queues. Unsynchronized cross-thread access to
+    // shared mutable state is a data race (UB in Swift's memory model; a Swift-6 error). They
+    // are lock-guarded computed properties so every get/set is atomic — read only a handful of
+    // times per search (never per-candidate), so the lock cost is negligible. `search()`
+    // additionally SNAPSHOTS foldersFirst/hideHidden into locals once at the top, so a toggle
+    // landing mid-search can't apply folders-first/hide-hidden to a needFull-truncated set.
+    private let optLock = NSLock()
+    private var _useFolderSizes = true, _foldersFirst = false, _hideHidden = false, _wholeNameWildcards = true
+
     /// Everything 1.5-style folder-size sorting: when on, the Size order ranks a
     /// directory by its live subtree TOTAL (from FileIndex's cached bottom-up pass)
     /// instead of 0. Set from the app's "Index folder sizes" toggle.
-    public var useFolderSizes = true
+    public var useFolderSizes: Bool {
+        get { optLock.lock(); defer { optLock.unlock() }; return _useFolderSizes }
+        set { optLock.lock(); _useFolderSizes = newValue; optLock.unlock() }
+    }
 
     /// Everything 1.5's "Folders first": group directories above files in every sort
     /// (each group keeps the chosen order). Applied at RESULT level pre-cap, so it
     /// holds for ascending AND descending traversals of the cached orders.
-    public var foldersFirst = false
+    public var foldersFirst: Bool {
+        get { optLock.lock(); defer { optLock.unlock() }; return _foldersFirst }
+        set { optLock.lock(); _foldersFirst = newValue; optLock.unlock() }
+    }
 
     /// Live "hide hidden files" (dotfiles/UF_HIDDEN) — a RESULT-level filter, so
     /// toggling is instant with NO reindex (better than Everything's index-level
     /// exclude-hidden). The index always stays complete.
-    public var hideHidden = false
+    public var hideHidden: Bool {
+        get { optLock.lock(); defer { optLock.unlock() }; return _hideHidden }
+        set { optLock.lock(); _hideHidden = newValue; optLock.unlock() }
+    }
 
     /// Run-history provider (Everything's Run Count / frecency). When set, the
     /// `.runCount` sort floats most-run-first and `.relevance` gets a frecency boost.
@@ -132,7 +151,11 @@ public final class SearchEngine: @unchecked Sendable {
     /// and here). OFF = a wildcard pattern matches ANYWHERE in the name: mic?o
     /// behaves like *mic?o* and now finds "microsoft". Implemented by star-
     /// wrapping glob terms at compile time — the matcher itself stays anchored.
-    public var wholeNameWildcards = true
+    /// Lock-guarded like the other option toggles (written on main, read on the search queue).
+    public var wholeNameWildcards: Bool {
+        get { optLock.lock(); defer { optLock.unlock() }; return _wholeNameWildcards }
+        set { optLock.lock(); _wholeNameWildcards = newValue; optLock.unlock() }
+    }
 
     /// TEST-ONLY: when true, eligible path-scope queries skip `fastPathScope` and run
     /// through `general` (the full-path-materializing evaluator). mvsim flips this to
@@ -155,11 +178,15 @@ public final class SearchEngine: @unchecked Sendable {
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
+        // Snapshot the two result-stage toggles ONCE so every stage sees a consistent value —
+        // a toggle landing between computing needFull and applying the reorder/filter below
+        // would otherwise apply folders-first/hide-hidden to a limit-truncated set.
+        let ffOpt = foldersFirst, hhOpt = hideHidden
         // needFull: any post-filter or reorder below needs the WHOLE match set, not a
         // limit-capped prefix — the display `limit` is applied ONCE at the very end
         // (both reviewers: capping between stages dropped a most-run file past `limit`
         // before the run-count reorder could float it up).
-        let needFull = post != nil || foldersFirst || hideHidden || sortKey == .runCount
+        let needFull = post != nil || ffOpt || hhOpt || sortKey == .runCount
         // Run Count scans in a STABLE name-ascending base; the `ascending` flag then
         // orders only the tracked prefix (most-run ↔ least), leaving the untracked tail
         // in a fixed a→z order rather than flipping it with the frecency direction.
@@ -195,7 +222,7 @@ public final class SearchEngine: @unchecked Sendable {
             total = ids.count
             extraMillis += secondsBetween(t0, clock.now) * 1000
         }
-        if hideHidden {
+        if hhOpt {
             let hid = index.withReadLock { index.hidden }   // COW snapshot, race-free
             ids = ids.filter { Int($0) < hid.count && !hid[Int($0)] }
             total = ids.count
@@ -216,7 +243,7 @@ public final class SearchEngine: @unchecked Sendable {
             }
             ids = tracked.map(\.id); ids.append(contentsOf: rest)
         }
-        if foldersFirst {
+        if ffOpt {
             // Stable dir/file partition. NOTE: this runs AFTER the run-count reorder, so
             // with both on, folders group above files and frecency ordering holds only
             // WITHIN each group — Folders First is an explicit override (red-team review).

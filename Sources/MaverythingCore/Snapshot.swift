@@ -222,6 +222,7 @@ extension FileIndex {
             flags = loadedFlags
             hidden = loadedHiddenBytes.map { $0 != 0 }
             deleted = [Bool](repeating: false, count: count)
+            _deletedCount = 0   // snapshot compacts tombstones away on save → none live on load
             // Mask/typeClass are never persisted (format-stable); the "match everything"
             // sentinels (.max / 0xFF) are a safe passthrough until the caller's
             // buildLiveIndexes() fills the authoritative values.

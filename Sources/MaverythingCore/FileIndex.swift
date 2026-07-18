@@ -128,12 +128,17 @@ public final class FileIndex: @unchecked Sendable {
     /// Lock-safe count for live progress polling while a crawl is appending.
     public func safeCount() -> Int { rdlock(); defer { unlock() }; return nameOff.count }
 
-    /// (total slots, tombstoned) — for deciding when to compact away dead entries.
+    /// Running count of tombstoned rows, so liveStats() is O(1) instead of an O(n) scan.
+    /// The ONLY place a row flips deleted=true is `_markDeletedSubtree`; appends are always
+    /// deleted=false; clear() and snapshot-load reset it (load compacts tombstones away).
+    /// Maintained under the write lock. (internal so Snapshot.swift's load can reset it.)
+    var _deletedCount = 0
+    /// (total slots, tombstoned) — for deciding when to compact away dead entries. O(1): the
+    /// 120s periodic compaction check used to scan all ~2M rows on the main thread under the
+    /// read lock every 2 minutes (a multi-ms hitch + lock hold); now a plain counter read.
     public func liveStats() -> (total: Int, deleted: Int) {
         rdlock(); defer { unlock() }
-        var d = 0
-        for x in deleted where x { d += 1 }
-        return (nameOff.count, d)
+        return (nameOff.count, _deletedCount)
     }
 
     // Locked (safe to call from the main thread while the reconciler mutates).
@@ -170,6 +175,7 @@ public final class FileIndex: @unchecked Sendable {
         objType.removeAll(keepingCapacity: false)
         flags.removeAll(keepingCapacity: false); hidden.removeAll(keepingCapacity: false)
         deleted.removeAll(keepingCapacity: false)
+        _deletedCount = 0
         childrenOf.removeAll(keepingCapacity: false)
         dirIndexByHash.removeAll(keepingCapacity: false)
     }
@@ -713,6 +719,7 @@ public final class FileIndex: @unchecked Sendable {
             }
             if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
         }
+        _deletedCount += removed   // keep liveStats() O(1) (caller holds the write lock)
         return removed
     }
 }

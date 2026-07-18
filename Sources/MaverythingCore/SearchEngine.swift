@@ -32,8 +32,15 @@ public final class SearchEngine: @unchecked Sendable {
     // mutation reuses a stale size order (Codex + red-team review: a real bug even
     // single-threaded, e.g. two socket requests with different useFolderSizes).
     private struct OrderKey: Hashable { let sort: SortKey; let folderSizes: Bool }
-    private var orderCache: [OrderKey: [Int32]] = [:]
-    private var cacheGen: Int = -1     // the FileIndex.mutationGen the orderCache was built at
+    // Each cached order stores the gen it was built at, keyed PER ORDER (no global dump). The
+    // relevant gen differs by sort: name/path/relevance/runCount orders are attribute-
+    // INDEPENDENT (a name is immutable per id; a rename is tombstone+append; a deletion leaves
+    // a tombstone the scan skips), so they change ONLY on an append or a wholesale replace —
+    // keyed on (epoch, count). The overwhelmingly common FS event (an mtime/size touch on an
+    // existing file) leaves (epoch, count) unchanged → the ~2M name/path re-sort is SKIPPED
+    // entirely, which is the bulk of the idle-CPU "live-refresh storm". size/date orders DO
+    // depend on attributes (and folder-subtree totals), so they stay on the full mutationGen.
+    private var orderCache: [OrderKey: (gen: Int, ids: [Int32])] = [:]
     private let cacheLock = NSLock()
 
     // Incremental "narrow as you type": remember the FULL match set of the last simple
@@ -1504,16 +1511,21 @@ public final class SearchEngine: @unchecked Sendable {
     // MARK: - sort order (argsort) with caching
 
     private func orderArray(for key: SortKey) -> [Int32] {
-        let gen = index.mutationGenLocked   // safe: called inside the index read lock
+        // safe: called inside the index read lock. Attribute-dependent orders (size/date) use
+        // the full mutationGen; name/path (attribute-independent) use (epoch, count) so an
+        // attr touch or deletion — which don't change name/path order — don't invalidate them.
+        let attrDependent = (key == .size || key == .dateModified || key == .dateCreated)
+        let gen = attrDependent
+            ? index.mutationGenLocked
+            : index.epochLocked &* 0x1_0000_0000 &+ index.count   // count grows only on append
         // only .size varies with useFolderSizes; other keys ignore it (folderSizes:false).
         let ck = OrderKey(sort: key, folderSizes: key == .size && useFolderSizes)
         cacheLock.lock()
-        if cacheGen != gen { orderCache.removeAll(); cacheGen = gen }
-        if let cached = orderCache[ck] { cacheLock.unlock(); return cached }
+        if let cached = orderCache[ck], cached.gen == gen { let ids = cached.ids; cacheLock.unlock(); return ids }
         cacheLock.unlock()
         let order = computeOrder(key)
         cacheLock.lock()
-        if cacheGen == gen { orderCache[ck] = order }
+        orderCache[ck] = (gen, order)   // per-key gen: no global removeAll, so unrelated orders stay warm
         cacheLock.unlock()
         return order
     }

@@ -295,6 +295,30 @@ check("exclude-files: *.tmp skipped by reconcile too", eP.search("later", limit:
 try? fm.removeItem(atPath: root + "/junky.tmp"); try? fm.removeItem(atPath: root + "/later.tmp")
 try? fm.removeItem(atPath: root + "/later.txt")
 
+// Incremental order-cache invalidation (name/path keyed on epoch+count, not mutationGen):
+// a reconcile APPEND must appear in a WARM name order WITHOUT an explicit invalidate (count
+// grew → the order recomputes), and the result must equal a from-scratch order.
+do {
+    let idxI = FileIndex()
+    _ = FileEnumerator(index: idxI).crawl(roots: [root], exclude: [], mountPoints: [])
+    idxI.buildLiveIndexes()
+    let eI = SearchEngine(index: idxI)
+    _ = eI.search("", sortKey: .name, limit: 100_000, now: now)     // WARM the name order cache
+    let uniqueName = "mvsim_incremental_marker_kqx.dat"
+    writeAbs(root + "/" + uniqueName, bytes: 3)
+    let recI = Reconciler(index: idxI, exclude: [])
+    _ = recI.reconcile(eventPaths: [root])                          // append — NO eI.invalidate()
+    let after = eI.search("mvsim_incremental_marker", sortKey: .name, limit: 10, now: now)
+                  .ids.map { idxI.name(Int($0)) }
+    check("incremental: reconcile-append shows in WARM name order (no manual invalidate)",
+          after.contains(uniqueName), "got \(after)")
+    // full order equals a from-scratch engine over the same (mutated) index
+    let warm = eI.search("", sortKey: .name, limit: 100_000, now: now).ids
+    let fresh = SearchEngine(index: idxI).search("", sortKey: .name, limit: 100_000, now: now).ids
+    check("incremental: warm name order == from-scratch order after append", warm == fresh)
+    try? fm.removeItem(atPath: root + "/" + uniqueName)
+}
+
 // Everything's "Include only files" whitelist + live hide-hidden toggle
 write("music_a.mp3", bytes: 2); write("music_b.flac", bytes: 2); write("notes_w.txt", bytes: 2)
 let onlyPats = FileEnumerator.parseFilePatterns("*.mp3;*.flac")

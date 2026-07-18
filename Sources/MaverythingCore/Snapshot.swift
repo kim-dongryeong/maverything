@@ -207,6 +207,7 @@ extension FileIndex {
 
             wrlock(); defer { unlock() }   // replaces all arrays only after validation succeeds
             bumpMutationLocked()           // new generation → search caches rebuild
+            bumpEpochLocked()              // wholesale replace → name/path order caches (keyed on epoch+count) rebuild
             nameBlob = loadedNameBlob
             foldBlob = loadedFoldBlob
             unicodeFoldBlob = loadedUnicodeFoldBlob

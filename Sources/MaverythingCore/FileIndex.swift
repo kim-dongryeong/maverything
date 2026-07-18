@@ -99,6 +99,8 @@ public final class FileIndex: @unchecked Sendable {
     /// generation can detect it's stale and no-op instead of corrupting the fresh index.
     private var epochValue = 0
     public func currentEpoch() -> Int { rdlock(); defer { unlock() }; return epochValue }
+    var epochLocked: Int { epochValue }                 // caller holds the lock (SearchEngine order cache)
+    func bumpEpochLocked() { epochValue &+= 1 }          // internal: Snapshot load, caller holds wrlock
 
     public init() {}
 

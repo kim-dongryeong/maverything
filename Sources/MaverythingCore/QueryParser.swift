@@ -95,11 +95,22 @@ public enum QueryParser {
             q.caseSensitive = true
         }
 
+        var pendingNot = false   // Everything's `NOT` keyword: negates the NEXT token
         for tokEntry in tokens {
             var tok = tokEntry.text
             let quoted = tokEntry.quoted
             if tok.isEmpty { continue }
-            var negated = false
+            // Everything treats a standalone (unquoted) `NOT`/`not` as negation of whatever
+            // follows — `report NOT pdf` ≡ `report !pdf`, and it also composes with filters
+            // (`NOT ext:pdf` ≡ `-ext:pdf`) and quoted phrases (`NOT "some name"`). A literal
+            // search for the word is still possible with quotes ("not"). A trailing lone NOT
+            // (mid-typing) is simply ignored.
+            if !quoted, tok.lowercased() == "not" {
+                pendingNot = true
+                continue
+            }
+            var negated = pendingNot
+            pendingNot = false
             if !quoted, tok.count > 1, let f = tok.first, f == "-" || f == "!" { negated = true; tok.removeFirst() }
 
             // A quoted token is a LITERAL phrase: no filter parsing, no OR-split,

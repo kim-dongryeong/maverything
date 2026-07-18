@@ -10,6 +10,13 @@ public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "maverything.fsevents")
     // onBatch(dirtyPaths, mustReindexAll, rootChanged, batchMaxEventId)
+    // Written by start() on MAIN, read by deliver() on the fsevents queue. A resident session
+    // restarts the watcher constantly (every volume mount/unmount, reindex, custom-root rescan,
+    // exclude change), and while watching `/` events fire continuously — so an in-flight
+    // deliver() can overlap start()'s reassignment. A concurrent read+write of a Swift closure
+    // reference is a data race (torn 2-word read + ARC retain/release of the old captured box)
+    // → refcount corruption / use-after-free. Serialize both sides with this lock.
+    private let onBatchLock = NSLock()
     fileprivate var onBatch: (([String], Bool, Bool, UInt64) -> Void)?
     private let eventIdLock = NSLock()
     // The resume cursor we PERSIST. Critically it advances only when a batch's changes
@@ -33,7 +40,7 @@ public final class FSWatcher: @unchecked Sendable {
                       sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow),
                       onBatch: @escaping ([String], Bool, Bool, UInt64) -> Void) {
         stop()
-        self.onBatch = onBatch
+        onBatchLock.lock(); self.onBatch = onBatch; onBatchLock.unlock()
         var ctx = FSEventStreamContext(version: 0,
                                        info: Unmanaged.passUnretained(self).toOpaque(),
                                        retain: nil, release: nil, copyDescription: nil)
@@ -83,7 +90,8 @@ public final class FSWatcher: @unchecked Sendable {
             if f & kFSEventStreamEventFlagRootChanged != 0 { rootChanged = true }
             if ids[i] > batchMax { batchMax = ids[i] }
         }
-        onBatch?(paths, mustScanAll, rootChanged, batchMax)
+        onBatchLock.lock(); let cb = onBatch; onBatchLock.unlock()   // atomic read → local retains it
+        cb?(paths, mustScanAll, rootChanged, batchMax)
     }
 }
 

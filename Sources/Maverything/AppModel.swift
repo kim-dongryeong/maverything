@@ -162,6 +162,39 @@ final class AppModel: ObservableObject {
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
     @Published var includeCloud = false        // index ~/Library/CloudStorage etc.
+    /// Everything 1.5-style OFFLINE VOLUMES (r/macapps ask; the paid "Offline Disks File
+    /// Searcher" app's whole value prop): keep an unplugged volume's entries in the index —
+    /// searchable, dimmed — instead of tombstoning them on unmount. Re-plugging re-crawls
+    /// the volume fresh (the existing addition path already tombstones the stale copy first).
+    @Published var keepOfflineVolumes: Bool =
+        (UserDefaults.standard.object(forKey: "mv.keepOffline") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(keepOfflineVolumes, forKey: "mv.keepOffline")
+            if !keepOfflineVolumes {
+                // Turning OFF: purge entries of volumes that are offline right now — they are
+                // no longer in watchedRoots, so no future volume sync would clean them up.
+                let mounted = Set(desiredCrawlRoots().map(\.displayPath))
+                var removed = 0
+                for rp in index.liveRootPaths() where !mounted.contains(rp) {
+                    removed += index.markDeletedSubtree(displayPath: rp)
+                }
+                if removed > 0 { scheduleLiveRefresh() }
+            }
+            updateOfflineRoots()
+        }
+    }
+    /// Roots present in the index but not currently mounted (offline). Read by the table
+    /// to dim their rows. Maintained on the main actor after every crawl/volume change.
+    private(set) var offlineRootPaths: Set<String> = []
+    func updateOfflineRoots() {
+        let mounted = Set(desiredCrawlRoots().map(\.displayPath))
+        offlineRootPaths = Set(index.liveRootPaths()).subtracting(mounted)
+    }
+    /// Is this path under an offline (unplugged) volume root?
+    func isOffline(_ path: String) -> Bool {
+        guard !offlineRootPaths.isEmpty else { return false }
+        return offlineRootPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
     /// Everything's "folder indexing": user-added index roots for locations the local-
     /// volume scan doesn't cover — above all NETWORK shares/NAS mounts (non-MNT_LOCAL).
     @Published var customRoots: [String] = UserDefaults.standard.stringArray(forKey: "mv.customRoots") ?? [] {
@@ -621,12 +654,16 @@ final class AppModel: ObservableObject {
                 Diag.log("LOADED snapshot \(self.index.count) items, resume@\(meta.lastEventId)")
                 let roots = self.desiredCrawlRoots()
                 // Roots that were in the snapshot but are NO LONGER mounted would otherwise
-                // survive forever (the sync only diffs against currently-watched roots).
+                // survive forever (the sync only diffs against currently-watched roots) —
+                // unless Keep-offline-volumes is ON, where surviving is exactly the feature.
                 let mountedNow = Set(roots.map(\.displayPath))
-                for rp in self.index.liveRootPaths() where !mountedNow.contains(rp) {
-                    let n = self.index.markDeletedSubtree(displayPath: rp)
-                    Diag.log("snapshot root '\(rp)' no longer mounted → tombstoned \(n) rows")
+                if !self.keepOfflineVolumes {
+                    for rp in self.index.liveRootPaths() where !mountedNow.contains(rp) {
+                        let n = self.index.markDeletedSubtree(displayPath: rp)
+                        Diag.log("snapshot root '\(rp)' no longer mounted → tombstoned \(n) rows")
+                    }
                 }
+                self.updateOfflineRoots()
                 let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
                 self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
@@ -729,6 +766,7 @@ final class AppModel: ObservableObject {
                 Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(stats.seconds)s (\(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
                 self.startWatching(roots: roots, exclude: exclude, sinceWhen: sinceId)
+                self.updateOfflineRoots()   // a full recrawl only covers mounted volumes
                 self.saveSnapshot()   // so the next launch is instant
                 if self.pendingVolumeRefresh {
                     self.pendingVolumeRefresh = false
@@ -824,6 +862,7 @@ final class AppModel: ObservableObject {
         let gen = indexGen
         let config = crawlConfig               // main-actor snapshot for the background crawl
         let exclude = AppModel.exclusions(config)
+        let keepOffline = keepOfflineVolumes   // main-actor snapshot (read in the background block)
         let expectedRoots = watchedRoots.filter { desiredByPath[$0.displayPath] != nil } + additions
         let dynamicEnumerator = additions.isEmpty ? nil : FileEnumerator(index: index)
         if let dynamicEnumerator { currentEnumerator = dynamicEnumerator }
@@ -838,8 +877,13 @@ final class AppModel: ObservableObject {
             // silently and permanently dropping those files.
             let preCrawlId: UInt64? = additions.isEmpty ? nil : FSEventsGetCurrentEventId()
             var removedRows = 0
-            for r in removals {
-                removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+            // Keep-offline: an unplugged volume's rows STAY in the index (dimmed, searchable);
+            // only stop watching it. Re-plugging goes through `additions`, which tombstones
+            // the stale copy below before the fresh crawl — so no duplicates either way.
+            if !keepOffline {
+                for r in removals {
+                    removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+                }
             }
             // If /Volumes delivered an event before NSWorkspace did, a mount point may
             // already exist as a child stub. Remove it before adding the real root.
@@ -874,8 +918,10 @@ final class AppModel: ObservableObject {
                 // Re-evaluated post-crawl to catch volumes unmounted DURING the crawl: pure
                 // over the captured config, so only the live mount state (Volumes.*) varies.
                 let stillMounted = Set(AppModel.desiredCrawlRoots(config).map { $0.displayPath })
-                for r in finalRoots where !stillMounted.contains(r.displayPath) {
-                    removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+                if !keepOffline {
+                    for r in finalRoots where !stillMounted.contains(r.displayPath) {
+                        removedRows += self.index.markDeletedSubtree(displayPath: r.displayPath)
+                    }
                 }
                 finalRoots.removeAll { !stillMounted.contains($0.displayPath) }
             }
@@ -904,7 +950,9 @@ final class AppModel: ObservableObject {
                     ?? self.watcher.appliedEventId
                 self.startWatching(roots: finalRoots, exclude: self.currentExclusions(),
                                    sinceWhen: resumeId)
-                if removedRows > 0 || addedRows > 0 {
+                self.updateOfflineRoots()
+                // keepOffline removals mutate nothing, but the rows must repaint dimmed.
+                if removedRows > 0 || addedRows > 0 || (keepOffline && !removals.isEmpty) {
                     self.indexedCount = self.index.safeCount()
                     self.scheduleLiveRefresh()
                     self.saveSnapshot()

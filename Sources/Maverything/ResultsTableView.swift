@@ -482,6 +482,9 @@ struct ResultsTableView: NSViewRepresentable {
                     if let dots { base.append(dots) }
                     cell.textField?.attributedStringValue = base
                 }
+                // Offline-volume rows render dimmed (searchable but the disk is unplugged).
+                // Cells are reused, so the normal color must be re-asserted explicitly.
+                cell.textField?.textColor = model.isOffline(r.path) ? .tertiaryLabelColor : .labelColor
                 // Finder's "Show icon preview": tiny QL thumbnails for media rows
                 // (Everything's Details view shows only icons — this is Finder
                 // muscle memory). The async result is written STRAIGHT into the

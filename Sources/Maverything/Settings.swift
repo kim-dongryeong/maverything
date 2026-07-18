@@ -293,6 +293,9 @@ struct SettingsView: View {
                 Toggle("Show & sort real folder sizes", isOn: $model.indexFolderSizes)
                 Text("Folders sort and display by their total contents (Everything 1.5's folder-size indexing). Off = folders show -- and sort as 0.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("Keep unplugged volumes searchable (offline)", isOn: $model.keepOfflineVolumes)
+                Text("An ejected disk's files stay in the index, dimmed — search external drives without plugging them in. Reconnecting re-scans the volume fresh.")
+                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("Indexed items") {
                     Text(model.indexedCount.formatted()).monospacedDigit()
                 }

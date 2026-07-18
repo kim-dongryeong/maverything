@@ -385,10 +385,14 @@ public final class SearchEngine: @unchecked Sendable {
         }
 
         // fast path: a single positive exact name term, no filters, no folder scope.
-        // Skipped when a relevance-frecency boost is active, so the boost (applied in
-        // `general`'s scorer) actually reaches an exact single-term relevance query.
+        // Relevance sort is EXCLUDED (mirrors the path fast path below): fastExact returns the
+        // chosen argsort order (i.e. NAME order for relevance's name scan base), so routing a
+        // relevance query here silently showed ALPHABETICAL order while the UI said "Relevance"
+        // — the single most common relevance query was unranked. `general` scores exact/prefix/
+        // boundary/short + frecency + recency, so relevance flows there instead. Name/size/date
+        // sorts keep the fast path (and its per-keystroke incremental narrowing).
         if mode == .exact, let needle = parsed.simpleName, !parsed.caseSensitive, scopeRoot == nil,
-           !(sortKey == .relevance && !frecency.isEmpty) {
+           sortKey != .relevance {
             return fastExact(needle: needle, sortKey: sortKey, ascending: ascending,
                              limit: limit, start: start, clock: clock)
         }
@@ -741,6 +745,15 @@ public final class SearchEngine: @unchecked Sendable {
             // Character bloom prefilter for the cold full scan (a single exact needle):
             // reject names that can't contain the needle's chars before the byte scan.
             let needleMask = FileIndex.maskOf(needle)
+            // For a SINGLE ascii a-z/0-9 needle, the bloom bit is collision-free (charBit maps
+            // each such char to its own bit), and nameMask is the OR of char-presence over both
+            // fold blobs — exactly what foldedNameContains verifies. So a passing bloom test IS
+            // a definite match: skip the redundant per-candidate memmem over ~2M names. (Only
+            // alnum: non-alnum single chars like '.'/'-' share collision buckets, so they keep
+            // the memmem.)
+            let b0 = needle.first ?? 0
+            let singleCharExact = needle.count == 1 &&
+                ((b0 >= 97 && b0 <= 122) || (b0 >= 48 && b0 <= 57))
 
             index.foldBlob.withUnsafeBufferPointer { fb in
             index.unicodeFoldBlob.withUnsafeBufferPointer { ufb in
@@ -765,6 +778,9 @@ public final class SearchEngine: @unchecked Sendable {
                             let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                             if delB[id] { continue }   // defensive tombstone skip
                             if needleMask & maskB[id] != needleMask { continue }   // bloom reject
+                            if singleCharExact {          // bloom pass == match (see above)
+                                ids.append(Int32(id)); continue
+                            }
                             if self.foldedNameContains(id: id, asciiBase: hayBase,
                                                        offB: offB, lenB: lenB,
                                                        unicodeBase: unicodeBase,

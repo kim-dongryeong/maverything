@@ -60,9 +60,17 @@ public enum Matcher {
         guard hayLen >= needleLen else { return .no }
         guard let hit = memmem(hay, hayLen, needle, needleLen) else { return .no }
         let pos = UnsafeRawPointer(hit) - UnsafeRawPointer(hay)
-        // earlier match + boundary start scores higher
+        // Ranking (relevance): earlier match wins, and — matching Everything and user intent —
+        // a PREFIX match beats an interior word-boundary match beats a mid-word match, and a
+        // SHORTER / whole-filename match beats a longer one at equal position. These are pure
+        // constant additions (no extra scanning), so exact-mode name-sort — which calls this
+        // for every candidate just to test `matched` — pays nothing. (Deliberately left out:
+        // scanning past the first hit for a better boundary occurrence, which would add a
+        // memmem to every candidate on the hot path; revisit behind a scoring-only gate.)
         var score = 1000 - min(pos, 900)
-        if pos == 0 || isBoundary(hay, pos) { score += 80 }
+        if pos == 0 { score += 150 }                        // prefix — strongly preferred
+        else if isBoundary(hay, pos) { score += 60 }        // interior word-boundary start
+        score += max(0, 40 - (hayLen - needleLen))          // shorter / whole-name preferred
         return MatchOutcome(true, score, pos)
     }
 
@@ -101,7 +109,13 @@ public enum Matcher {
         let star = UInt8(ascii: "*"), q = UInt8(ascii: "?")
         var s = 0, p = 0, starP = -1, sTmp = 0
         while s < hayLen {
-            if p < patLen && (pat[p] == hay[s] || pat[p] == q) {
+            if p < patLen && pat[p] == q {
+                // `?` matches ONE character, not one byte: consume a full UTF-8 code point so
+                // `?.txt` matches `가.txt` (3 bytes) as users expect for non-ASCII names.
+                s += 1
+                while s < hayLen && (hay[s] & 0xC0) == 0x80 { s += 1 }   // skip continuation bytes
+                p += 1
+            } else if p < patLen && pat[p] == hay[s] {
                 s += 1; p += 1
             } else if p < patLen && pat[p] == star {
                 starP = p; sTmp = s; p += 1

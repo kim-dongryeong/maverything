@@ -52,9 +52,11 @@ for i in 1...20 { write(String(format: "img/image_%03d.png", i), bytes: 100, mti
 write("data/data.json", bytes: 1_048_576)              // exactly 1 MB
 write("data/big.bin", bytes: 5 * 1_048_576, mtime: oldTime)
 write("data/tiny.txt", bytes: 10)
-write("intl/한글파일.txt", bytes: 30)                   // unicode
+write("intl/한글파일.txt", bytes: 30)                   // unicode (4 syllables)
+write("intl/가.txt", bytes: 12)                         // SINGLE non-ASCII codepoint (3 bytes) — ? wildcard
 write("intl/café.md", bytes: 30)
 write("intl/CAFÉ.txt", bytes: 30)
+write("annual_report_summary.txt", bytes: 20)          // longer "report" match — relevance ranking
 write("src/a/b/c/d/leaf.txt", bytes: 5)                // deep nesting
 write(".hidden/.secret.txt", bytes: 5)                 // hidden
 // path-column sort fixture (OQ1A): basename order and full-path order DISAGREE here —
@@ -118,6 +120,23 @@ check("wildcard: '*.png' matches image_001.png", has("*.png", "image_001.png", m
 check("wildcard: '*.png' excludes report.txt", !has("*.png", "report.txt", mode: .wildcard))
 check("wildcard: 'report*' matches report.txt", has("report*", "report.txt", mode: .wildcard))
 check("wildcard: '?eport.txt' matches report.txt", has("?eport.txt", "report.txt", mode: .wildcard))
+// '?' = one CHARACTER, not one byte: a single '?' matches a 3-byte Korean syllable, and TWO
+// '?' must NOT match a one-character name.
+check("wildcard: '?.txt' matches single-syllable 가.txt (? = one codepoint)",
+      has("?.txt", "가.txt", mode: .wildcard))
+check("wildcard: '??.txt' does NOT match one-char 가.txt", !has("??.txt", "가.txt", mode: .wildcard))
+check("wildcard: '????.txt' matches 4-syllable 한글파일.txt",
+      has("????.txt", "한글파일.txt", mode: .wildcard))
+
+// exact single-term Relevance is RANKED, not alphabetical (regression: fastExact used to
+// return name order for relevance, so 'report' surfaced Report.PNG/annual_report first).
+// Relevance is a descending sort in the UI (best-first), so query ascending:false.
+let relReport = engine.search("report", mode: .exact, sortKey: .relevance, ascending: false,
+                              limit: 10_000, now: now).ids.map { index.name(Int($0)) }
+check("relevance(exact): 'report' ranks short prefix report.txt FIRST",
+      relReport.first == "report.txt", "got \(relReport.prefix(3))")
+check("relevance(exact): report.txt outranks longer annual_report_summary.txt",
+      (relReport.firstIndex(of: "report.txt") ?? 99) < (relReport.firstIndex(of: "annual_report_summary.txt") ?? 99))
 
 // filters
 check("filter: 'ext:png' → 20 images + Report.PNG = 21", names("ext:png").count == 21,

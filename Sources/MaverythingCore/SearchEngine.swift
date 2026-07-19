@@ -740,12 +740,17 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func matchTerm(hay: UnsafePointer<UInt8>, hayLen: Int,
                            needle: UnsafePointer<UInt8>, needleLen: Int,
-                           mode: MatchMode, wholeWord: Bool) -> MatchOutcome {
+                           mode: MatchMode, wholeWord: Bool, camelBits: UInt64 = 0) -> MatchOutcome {
         wholeWord && mode == .exact
             ? Matcher.wholeWordExact(hay, hayLen, needle, needleLen)
-            : Matcher.match(hay: hay, hayLen: hayLen, needle: needle, needleLen: needleLen, mode: mode)
+            : Matcher.match(hay: hay, hayLen: hayLen, needle: needle, needleLen: needleLen,
+                            mode: mode, camelBits: camelBits)
     }
 
+    // [28] camelBits applies to the ASCII/cased scan only — the Unicode-fold segment has
+    // different byte offsets/lengths, so camelBits does NOT align there (pass 0, separator-
+    // only; ASCII segment is scanned first and is primary, and camelCase is an ASCII-case
+    // concept). See FileIndex.swift §2 coordinate-space note.
     @inline(__always)
     private func matchFoldedName(id: Int,
                                  asciiBase: UnsafePointer<UInt8>,
@@ -757,16 +762,62 @@ public final class SearchEngine: @unchecked Sendable {
                                  needle: UnsafePointer<UInt8>,
                                  needleLen: Int,
                                  mode: MatchMode,
-                                 wholeWord: Bool = false) -> MatchOutcome {
+                                 wholeWord: Bool = false,
+                                 camelBits: UInt64 = 0) -> MatchOutcome {
         let o = Int(offB[id]); let l = Int(lenB[id])
         var best = matchTerm(hay: asciiBase + o, hayLen: l,
-                             needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord)
+                             needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord,
+                             camelBits: camelBits)
         guard unicodeOffB[id] != noUnicodeFoldOffset, let unicodeBase else { return best }
         let uo = Int(unicodeOffB[id]); let ul = Int(unicodeLenB[id])
         let folded = matchTerm(hay: unicodeBase + uo, hayLen: ul,
-                               needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord)
+                               needle: needle, needleLen: needleLen, mode: mode, wholeWord: wholeWord,
+                               camelBits: 0)
         if !best.matched || (folded.matched && folded.score > best.score) { best = folded }
         return best
+    }
+
+    /// [26] DP-refine counterpart of `matchFoldedName`, fuzzy-only: re-scores an
+    /// ALREADY-GREEDY-MATCHED candidate's name (both fold segments, best-of, mirroring
+    /// OI-A) with the bounded DP scorer. Called only on the retained per-chunk survivors
+    /// (§4 S1: refine-after-prune), never on the full scan.
+    @inline(__always)
+    private func matchFoldedNameDP(id: Int,
+                                   asciiBase: UnsafePointer<UInt8>,
+                                   offB: UnsafeBufferPointer<UInt64>,
+                                   lenB: UnsafeBufferPointer<UInt16>,
+                                   unicodeBase: UnsafePointer<UInt8>?,
+                                   unicodeOffB: UnsafeBufferPointer<UInt64>,
+                                   unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                   needle: UnsafePointer<UInt8>,
+                                   needleLen: Int,
+                                   camelBits: UInt64,
+                                   dp: SearchEngine.DPScratchPtrs) -> MatchOutcome {
+        let o = Int(offB[id]); let l = Int(lenB[id])
+        let greedyA = Matcher.fuzzy(asciiBase + o, l, needle, needleLen, camelBits)
+        var best = greedyA.matched
+            ? Matcher.fuzzyDPRefine(hay: asciiBase + o, hayLen: l, needle: needle, needleLen: needleLen,
+                                    camelBits: camelBits, prev: dp.prev, curr: dp.curr,
+                                    prevStart: dp.prevStart, currStart: dp.currStart,
+                                    prevRun: dp.prevRun, currRun: dp.currRun, greedy: greedyA)
+            : MatchOutcome.no
+        guard unicodeOffB[id] != noUnicodeFoldOffset, let unicodeBase else { return best }
+        let uo = Int(unicodeOffB[id]); let ul = Int(unicodeLenB[id])
+        let greedyU = Matcher.fuzzy(unicodeBase + uo, ul, needle, needleLen, 0)
+        let folded = greedyU.matched
+            ? Matcher.fuzzyDPRefine(hay: unicodeBase + uo, hayLen: ul, needle: needle, needleLen: needleLen,
+                                    camelBits: 0, prev: dp.prev, curr: dp.curr,
+                                    prevStart: dp.prevStart, currStart: dp.currStart,
+                                    prevRun: dp.prevRun, currRun: dp.currRun, greedy: greedyU)
+            : MatchOutcome.no
+        if !best.matched || (folded.matched && folded.score > best.score) { best = folded }
+        return best
+    }
+
+    /// Bundle of the six per-chunk DP scratch row pointers ([26] §4/§9: allocated once
+    /// per chunk, reused across candidates — passed by value since it's just 6 pointers).
+    struct DPScratchPtrs {
+        let prev, curr, prevStart, currStart, prevRun, currRun: UnsafeMutableBufferPointer<Int32>
     }
 
     // MARK: - fast exact substring path
@@ -1238,16 +1289,18 @@ public final class SearchEngine: @unchecked Sendable {
         index.parent.withUnsafeBufferPointer { parB in
         index.nameMask.withUnsafeBufferPointer { maskB in
         index.typeClass.withUnsafeBufferPointer { tcB in
+        index.camelBits.withUnsafeBufferPointer { cbB in
         order.withUnsafeBufferPointer { ordB in
         termBlob.withUnsafeBufferPointer { tblobB in
         termRefs.withUnsafeBufferPointer { trefsB in
             let fbBase = fb.baseAddress!, nbBase = nb.baseAddress!
             let unicodeBase = ufb.baseAddress
             let tblobBase = tblobB.baseAddress   // non-nil whenever termCount > 0
-            // startwith:/endwith: match the ASCII-folded blob (cased blob if case:on),
-            // mirroring how terms pick hayBase. The independent Unicode fold lives at
-            // different offsets, so non-ASCII names match affixes by their stored bytes
-            // only (v1 limitation, same spirit as extMatches).
+            // startwith:/endwith: primarily match the ASCII-folded blob (cased blob if
+            // case:on), mirroring how terms pick hayBase. [32]: affixMatches/excludedByAffix
+            // ALSO consult the independent Unicode-fold segment (own offsets/lengths) on an
+            // ASCII miss, so non-ASCII names (e.g. café/CAFÉ) match affixes via their diacritic-
+            // folded form too — no longer a v1 "stored bytes only" limitation.
             let affixBase = caseSensitive ? nbBase : fbBase
             chunkIDs.withUnsafeMutableBufferPointer { outIDs in
             chunkScores.withUnsafeMutableBufferPointer { outScores in
@@ -1266,8 +1319,25 @@ public final class SearchEngine: @unchecked Sendable {
                     // Reused across every candidate in the chunk → no per-candidate allocation.
                     var pathScratch = [UInt8](repeating: 0, count: 8192)
                     var idxStack = [Int32](repeating: 0, count: 1024)
+                    // [26] §4/§9: DP-refine scratch — six Int32 rows sized to the 255-byte hay
+                    // cap, allocated ONCE per chunk and reused across every refined candidate
+                    // (fuzzy mode only; unused/untouched for exact/wildcard/regex chunks).
+                    var dpPrev = [Int32](repeating: 0, count: 255)
+                    var dpCurr = [Int32](repeating: 0, count: 255)
+                    var dpPrevStart = [Int32](repeating: 0, count: 255)
+                    var dpCurrStart = [Int32](repeating: 0, count: 255)
+                    var dpPrevRun = [Int32](repeating: 0, count: 255)
+                    var dpCurrRun = [Int32](repeating: 0, count: 255)
                     pathScratch.withUnsafeMutableBufferPointer { psb in
                     idxStack.withUnsafeMutableBufferPointer { isb in
+                    dpPrev.withUnsafeMutableBufferPointer { dpv in
+                    dpCurr.withUnsafeMutableBufferPointer { dcv in
+                    dpPrevStart.withUnsafeMutableBufferPointer { dpvs in
+                    dpCurrStart.withUnsafeMutableBufferPointer { dcvs in
+                    dpPrevRun.withUnsafeMutableBufferPointer { dpvr in
+                    dpCurrRun.withUnsafeMutableBufferPointer { dcvr in
+                    let dp = DPScratchPtrs(prev: dpv, curr: dcv, prevStart: dpvs, currStart: dcvs,
+                                           prevRun: dpvr, currRun: dcvr)
                     for k in lo..<hi {
                         let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
@@ -1355,20 +1425,24 @@ public final class SearchEngine: @unchecked Sendable {
                                                                              parB: parB, stack: isb, out: psb)
                                     }
                                 }
+                                // path-scope scan: reconstructed path breaks per-entry camelBits
+                                // alignment ([28] §2) — pass 0 (separator-only).
                                 out = self.matchTerm(hay: psb.baseAddress!, hayLen: pathLen,
                                                      needle: needlePtr, needleLen: tr.len,
-                                                     mode: effMode, wholeWord: effWW)
+                                                     mode: effMode, wholeWord: effWW, camelBits: 0)
                             } else if caseSensitive {
+                                // caseSensitive scan is over nbBase (CASED bytes) — camelBits aligns.
                                 out = self.matchTerm(hay: nbBase + o, hayLen: l,
                                                      needle: needlePtr, needleLen: tr.len,
-                                                     mode: effMode, wholeWord: effWW)
+                                                     mode: effMode, wholeWord: effWW, camelBits: cbB[id])
                             } else {
                                 out = self.matchFoldedName(id: id, asciiBase: fbBase,
                                                            offB: offB, lenB: lenB,
                                                            unicodeBase: unicodeBase,
                                                            unicodeOffB: uOffB, unicodeLenB: uLenB,
                                                            needle: needlePtr, needleLen: tr.len,
-                                                           mode: effMode, wholeWord: effWW)
+                                                           mode: effMode, wholeWord: effWW,
+                                                           camelBits: cbB[id])
                             }
                             if tr.negated {
                                 // negated group: NO alternative may match
@@ -1387,10 +1461,14 @@ public final class SearchEngine: @unchecked Sendable {
                         }
                         if !ok { continue }
                         // anchored name-affix filters (startwith:/endwith:)
-                        if hasAffixes && !self.affixMatches(affixBase, o, l,
+                        if hasAffixes && !self.affixMatches(id, affixBase, o, l,
+                                                            unicodeBase: caseSensitive ? nil : unicodeBase,
+                                                            uOffB: uOffB, uLenB: uLenB,
                                                             prefixes: parsed.prefixes,
                                                             suffixes: parsed.suffixes) { continue }
-                        if hasNotAffixes && self.excludedByAffix(affixBase, o, l,
+                        if hasNotAffixes && self.excludedByAffix(id, affixBase, o, l,
+                                                                 unicodeBase: caseSensitive ? nil : unicodeBase,
+                                                                 uOffB: uOffB, uLenB: uLenB,
                                                                  notPrefixes: parsed.notPrefixes,
                                                                  notSuffixes: parsed.notSuffixes) { continue }
                         total += 1
@@ -1409,18 +1487,111 @@ public final class SearchEngine: @unchecked Sendable {
                                 else if mt >= recentDayNs { score += 40 }
                                 else if mt >= recentWeekNs { score += 20 }
                             }
-                            pairs.append((id: Int32(id), score: Int32(clamping: score)))
-                            if pairs.count > pruneThreshold {
+                            // [36] shallow-first, demoted to a strict exact-score tie-break (S2: an
+                            // additive depth penalty crosses G1 once it stacks with recency — see
+                            // spec §1/§7). Walked on matched candidates only, ≤16 parent hops.
+                            var depth = 0; var pcur = parB[id]
+                            while pcur >= 0 && depth < 16 { depth += 1; pcur = parB[Int(pcur)] }
+                            // Codex P2: cap BEFORE ×64 so pathological many-term totals can't
+                            // saturate Int32 and collapse distinct scores into a tie.
+                            let cappedScore = min(score, Int(Int32.max) / 64 - 16)
+                            let scaledScore = cappedScore * 64 - min(depth, 16)   // DEPTH_SCALE=64 > DEPTH_CAP=16
+                            pairs.append((id: Int32(id), score: Int32(scaledScore)))
+                            // Codex P1: the collection prune must KEEP the full pruneThreshold
+                            // survivor window (DP re-ranks it below — cutting to `limit` here made
+                            // the top result depend on limit). 2× trigger = amortized sorting.
+                            if pairs.count > pruneThreshold &* 2 {
                                 pairs.sort { a, b in
                                     if a.score != b.score {
                                         return ascending ? a.score < b.score : a.score > b.score
                                     }
-                                    return a.id < b.id
+                                    return self.nameLess(a.id, b.id, fbBase, offB, lenB)   // agy#1: was a.id < b.id
                                 }
-                                pairs.removeSubrange(limit..<pairs.count)
+                                pairs.removeSubrange(pruneThreshold..<pairs.count)
                             }
                         } else if ids.count < limit {
                             ids.append(Int32(id))
+                        }
+                    }
+                    // [26] §4 S1: refine-after-prune (the DEFAULT, not conditional) — DP-refine
+                    // ONLY the retained per-chunk survivors (≤ pruneThreshold), re-summing each
+                    // candidate's term score with the DP scorer instead of greedy, then reapplying
+                    // frecency/recency/depth exactly as the main pass did. Greedy already gated
+                    // existence above (the match SET never changes); this only reorders ties within
+                    // it. A broad 2/3-char fuzzy surviving on a huge fraction of 2M would make
+                    // inline-per-candidate DP billions of ops — refining only the survivors keeps
+                    // this bounded to ≤ pruneThreshold × termCount DP calls per chunk.
+                    if relevance, mode == .fuzzy, termCount > 0 {
+                        for pi in pairs.indices {
+                            let id = Int(pairs[pi].id)
+                            let o = Int(offB[id]); let l = Int(lenB[id])
+                            var newScore = 0
+                            var pathLen = -1
+                            var ti = 0
+                            while ti < termCount {
+                                let tr = trefsB[ti]
+                                if tr.negated { ti += 1; continue }   // never contributes score
+                                let needlePtr = tblobBase! + tr.off
+                                let out: MatchOutcome
+                                if tr.isPath {
+                                    if pathLen < 0 {
+                                        pathLen = caseSensitive
+                                            ? self.foldedPathBytes(id, blob: nbBase, offB: offB, lenB: lenB,
+                                                                   parB: parB, stack: isb, out: psb)
+                                            : self.searchFoldedPathBytes(id, asciiBlob: fbBase, offB: offB,
+                                                                         lenB: lenB, unicodeBlob: unicodeBase,
+                                                                         unicodeOffB: uOffB, unicodeLenB: uLenB,
+                                                                         parB: parB, stack: isb, out: psb)
+                                    }
+                                    // path-scope: reconstructed path breaks per-entry camelBits
+                                    // alignment ([28] §2) — 0 (separator-only), same as the main pass.
+                                    let greedy = Matcher.fuzzy(psb.baseAddress!, pathLen, needlePtr, tr.len, 0)
+                                    out = greedy.matched
+                                        ? Matcher.fuzzyDPRefine(hay: psb.baseAddress!, hayLen: pathLen,
+                                                                needle: needlePtr, needleLen: tr.len, camelBits: 0,
+                                                                prev: dp.prev, curr: dp.curr,
+                                                                prevStart: dp.prevStart, currStart: dp.currStart,
+                                                                prevRun: dp.prevRun, currRun: dp.currRun,
+                                                                greedy: greedy)
+                                        : .no
+                                } else if caseSensitive {
+                                    let greedy = Matcher.fuzzy(nbBase + o, l, needlePtr, tr.len, cbB[id])
+                                    out = greedy.matched
+                                        ? Matcher.fuzzyDPRefine(hay: nbBase + o, hayLen: l,
+                                                                needle: needlePtr, needleLen: tr.len,
+                                                                camelBits: cbB[id],
+                                                                prev: dp.prev, curr: dp.curr,
+                                                                prevStart: dp.prevStart, currStart: dp.currStart,
+                                                                prevRun: dp.prevRun, currRun: dp.currRun,
+                                                                greedy: greedy)
+                                        : .no
+                                } else {
+                                    out = self.matchFoldedNameDP(id: id, asciiBase: fbBase, offB: offB, lenB: lenB,
+                                                                 unicodeBase: unicodeBase, unicodeOffB: uOffB,
+                                                                 unicodeLenB: uLenB, needle: needlePtr,
+                                                                 needleLen: tr.len, camelBits: cbB[id], dp: dp)
+                                }
+                                if out.matched {
+                                    newScore += out.score
+                                    ti += 1
+                                    while ti < termCount && trefsB[ti].group == tr.group { ti += 1 }
+                                } else {
+                                    ti += 1
+                                }
+                            }
+                            if boostOn, let f = frecency[Int32(id)], f > 0 {
+                                newScore += Int(30.0 * log2(1.0 + f))
+                            }
+                            if nowNs > 0 {
+                                let mt = mtB[id]
+                                if mt >= recentHourNs { newScore += 60 }
+                                else if mt >= recentDayNs { newScore += 40 }
+                                else if mt >= recentWeekNs { newScore += 20 }
+                            }
+                            var depth = 0; var pcur = parB[id]
+                            while pcur >= 0 && depth < 16 { depth += 1; pcur = parB[Int(pcur)] }
+                            let capped = min(newScore, Int(Int32.max) / 64 - 16)   // Codex P2
+                            pairs[pi].score = Int32(capped * 64 - min(depth, 16))
                         }
                     }
                     if relevance && pairs.count > limit {
@@ -1428,7 +1599,7 @@ public final class SearchEngine: @unchecked Sendable {
                             if a.score != b.score {
                                     return ascending ? a.score < b.score : a.score > b.score
                             }
-                            return a.id < b.id
+                            return self.nameLess(a.id, b.id, fbBase, offB, lenB)   // agy#1: was a.id < b.id
                         }
                         pairs.removeSubrange(limit..<pairs.count)
                     }
@@ -1439,10 +1610,10 @@ public final class SearchEngine: @unchecked Sendable {
                         outIDs[c] = ids
                     }
                     outTot[c] = total
-                    }}
+                    }}}}}}}}
                 }
             }}}
-        }}}}}}}}}}}}}}}}}
+        }}}}}}}}}}}}}}}}}}
 
         let total = chunkTotals.reduce(0, +)
         var out: [Int32]
@@ -1453,8 +1624,17 @@ public final class SearchEngine: @unchecked Sendable {
                 let ids = chunkIDs[c], scs = chunkScores[c]
                 for j in 0..<ids.count { pairs.append((ids[j], scs[j])) }
             }
-            // relevance is conventionally high→low, but honor the ascending flag; stable by id
-            pairs.sort { a, b in a.1 != b.1 ? (ascending ? a.1 < b.1 : a.1 > b.1) : a.0 < b.0 }
+            // relevance is conventionally high→low, but honor the ascending flag; tie-break by
+            // folded name (agy#1: was a.0 < b.0 — id/crawl order, not user-visible order).
+            index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+                let base = fb.baseAddress!
+                pairs.sort { a, b in
+                    a.1 != b.1 ? (ascending ? a.1 < b.1 : a.1 > b.1)
+                               : self.nameLess(a.0, b.0, base, offB, lenB)
+                }
+            }}}
             out = pairs.prefix(limit).map { $0.0 }
         } else {
             out = []; out.reserveCapacity(min(total, limit))
@@ -1508,30 +1688,56 @@ public final class SearchEngine: @unchecked Sendable {
         return true
     }
 
-    /// `startwith:`/`endwith:` — the name bytes must begin/end with EVERY affix.
     @inline(__always)
-    private func affixMatches(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+    private func prefixHit(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int, _ p: [UInt8]) -> Bool {
+        p.withUnsafeBufferPointer { $0.isEmpty || ($0.count <= l && memcmp(base + o, $0.baseAddress!, $0.count) == 0) }
+    }
+    @inline(__always)
+    private func suffixHit(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int, _ s: [UInt8]) -> Bool {
+        s.withUnsafeBufferPointer { $0.isEmpty || ($0.count <= l && memcmp(base + o + l - $0.count, $0.baseAddress!, $0.count) == 0) }
+    }
+
+    /// `startwith:`/`endwith:` — the name bytes must begin/end with EVERY affix. [32]: consults
+    /// BOTH fold segments (ASCII-fold, and on miss the Unicode fold) mirroring `matchFoldedName`
+    /// (OI-A) — so `startwith:café` matches CAFÉ.txt (ASCII fold "cafe" won't have the diacritic,
+    /// but the Unicode-fold segment does). case:on stays ASCII/cased-only (unicodeBase nil there).
+    @inline(__always)
+    private func affixMatches(_ id: Int, _ affixBase: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+                              unicodeBase: UnsafePointer<UInt8>?,
+                              uOffB: UnsafeBufferPointer<UInt64>, uLenB: UnsafeBufferPointer<UInt32>,
                               prefixes: [[UInt8]], suffixes: [[UInt8]]) -> Bool {
+        let hasU = unicodeBase != nil && uOffB[id] != noUnicodeFoldOffset
+        let uo = hasU ? Int(uOffB[id]) : 0, ul = hasU ? Int(uLenB[id]) : 0
         for p in prefixes {
-            if p.count > l { return false }
-            if !p.withUnsafeBufferPointer({ $0.isEmpty || memcmp(base + o, $0.baseAddress!, $0.count) == 0 }) { return false }
+            if p.isEmpty { continue }                                    // isEmpty ⇒ no constraint
+            var ok = prefixHit(affixBase, o, l, p)                       // ASCII/cased segment
+            if !ok && hasU { ok = prefixHit(unicodeBase!, uo, ul, p) }   // Unicode segment (on miss)
+            if !ok { return false }
         }
-        for s in suffixes {
-            if s.count > l { return false }
-            if !s.withUnsafeBufferPointer({ $0.isEmpty || memcmp(base + o + l - $0.count, $0.baseAddress!, $0.count) == 0 }) { return false }
+        for s in suffixes {   // suffix uses the SEGMENT's own length (l for ASCII, ul for Unicode)
+            if s.isEmpty { continue }
+            var ok = suffixHit(affixBase, o, l, s)
+            if !ok && hasU { ok = suffixHit(unicodeBase!, uo, ul, s) }
+            if !ok { return false }
         }
         return true
     }
 
-    /// Negated affixes: exclude if the name begins/ends with ANY of them.
+    /// Negated affixes: exclude if EITHER fold segment begins/ends with ANY not-affix (red-team 4).
     @inline(__always)
-    private func excludedByAffix(_ base: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+    private func excludedByAffix(_ id: Int, _ affixBase: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
+                                 unicodeBase: UnsafePointer<UInt8>?,
+                                 uOffB: UnsafeBufferPointer<UInt64>, uLenB: UnsafeBufferPointer<UInt32>,
                                  notPrefixes: [[UInt8]], notSuffixes: [[UInt8]]) -> Bool {
-        for p in notPrefixes where !p.isEmpty && p.count <= l {
-            if p.withUnsafeBufferPointer({ memcmp(base + o, $0.baseAddress!, $0.count) == 0 }) { return true }
+        let hasU = unicodeBase != nil && uOffB[id] != noUnicodeFoldOffset
+        let uo = hasU ? Int(uOffB[id]) : 0, ul = hasU ? Int(uLenB[id]) : 0
+        for p in notPrefixes where !p.isEmpty {
+            if p.count <= l && prefixHit(affixBase, o, l, p) { return true }
+            if hasU && p.count <= ul && prefixHit(unicodeBase!, uo, ul, p) { return true }
         }
-        for s in notSuffixes where !s.isEmpty && s.count <= l {
-            if s.withUnsafeBufferPointer({ memcmp(base + o + l - $0.count, $0.baseAddress!, $0.count) == 0 }) { return true }
+        for s in notSuffixes where !s.isEmpty {
+            if s.count <= l && suffixHit(affixBase, o, l, s) { return true }
+            if hasU && s.count <= ul && suffixHit(unicodeBase!, uo, ul, s) { return true }
         }
         return false
     }

@@ -230,6 +230,9 @@ extension FileIndex {
             // buildLiveIndexes() fills the authoritative values.
             nameMask = [UInt64](repeating: .max, count: count)
             typeClass = [UInt8](repeating: 0xFF, count: count)
+            // 0 = separator-only boundary rule (no camel starts known yet) — "no worse than
+            // today" safe passthrough until buildLiveIndexes fills the authoritative bits.
+            camelBits = [UInt64](repeating: 0, count: count)
             csrChildIds.removeAll(); csrChildOff.removeAll(); childOverlay.removeAll()
             dirIndexByHash.removeAll()
             resetFsizeLocked()   // [N2] defense-in-depth

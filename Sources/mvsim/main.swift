@@ -57,7 +57,36 @@ write("intl/가.txt", bytes: 12)                         // SINGLE non-ASCII cod
 write("intl/café.md", bytes: 30)
 write("intl/CAFÉ.txt", bytes: 30)
 write("annual_report_summary.txt", bytes: 20)          // longer "report" match — relevance ranking
-write("src/a/b/c/d/leaf.txt", bytes: 5)                // deep nesting
+write("src/a/b/c/d/leaf.txt", bytes: 5, mtime: now)    // deep nesting ([36] depth tie-break partner below)
+// [28] camelCase boundary: "user" hits a camel start ('U' at idx 3, after lowercase 'Get') vs
+// interior (no boundary, non-prefix) in the other.
+write("code/GetUserName.js", bytes: 20)
+write("code/abuser.txt", bytes: 20)
+// [36] depth: same NAME + mtime as the pre-existing deep src/a/b/c/d/leaf.txt (relevance score
+// depends on name length, not file size — see OI-D), differing only in nesting depth — root
+// should outrank the deep one purely on the depth tie-break. 400B so `size:<20` still finds
+// ONLY the deep 5B leaf.txt (unchanged collision-avoidance, spec OI-D).
+write("leaf.txt", bytes: 400, mtime: now)
+// [22] best-occurrence: "test" hits an early interior position in both, but latest_test.md
+// ALSO has a real boundary occurrence after '_' — contested.md has interior-only occurrences.
+write("occ/latest_test.md", bytes: 20)
+write("occ/contested.md", bytes: 20)
+// agy#1 alphabetical tie — bravo written FIRST so id(bravo) < id(alpha); name order must WIN.
+// Same size/mtime so score is otherwise identical (depth also identical — same directory).
+write("tie/tie_bravo.txt", bytes: 8, mtime: now)
+write("tie/tie_alpha.txt", bytes: 8, mtime: now)
+// [26] fuzzy DP: scattered decoy so the DP has something to beat (app.swift already exists above).
+write("scatter/a_p_p.txt", bytes: 8)
+// Codex P1 prune-pressure fixture: >2×pruneThreshold(limit:1) weak fuzzy-'app' matches force
+// the collection prune to actually fire; .zzz/4096B dodges the ext:/size: count assertions.
+for i in 0..<1100 { write("prune/zap_p_\(i).zzz", bytes: 4096) }
+// [22]+[28] VERIFIER extra: best-occurrence must find a CAMEL boundary (not just a separator) after
+// an interior first hit. "cat" first hits interior @1 in scatCatalog ("s|cat|..."), then again @4 at
+// the camelCase 'C' (t→C is a camel start) → [22] rescan lifts it to a boundary score (~1084). muscat
+// has "cat" interior-only @3 (~1030). WITHOUT camel-boundary detection scatCatalog's interior floor
+// (~1027) LOSES to muscat — so this discriminates the isBoundaryX camel path inside the [22] scan.
+write("cam/scatCatalog.txt", bytes: 8, mtime: now)
+write("cam/muscat.txt", bytes: 8, mtime: now)
 write(".hidden/.secret.txt", bytes: 5)                 // hidden
 // path-column sort fixture (OQ1A): basename order and full-path order DISAGREE here —
 // by name apple<zebra, but by path adir/…<zdir/…, so the two files swap order.
@@ -182,8 +211,16 @@ check("unicode-fold: 'cafe' finds CAFÉ.txt", has("cafe", "CAFÉ.txt"))
 check("unicode-fold: uppercase accented query finds café.md", has("CAFÉ", "café.md"))
 check("unicode-fold: path:cafe finds CAFÉ.txt via folded path", has("path:cafe", "CAFÉ.txt"))
 
-// relevance sort sanity (fuzzy: exact-ish beats scattered)
-let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, limit: 10, now: now).ids.map { index.name(Int($0)) }
+// relevance sort sanity (fuzzy: exact-ish beats scattered). G4 (SPEC-B4-FINAL OI-D): this
+// call omitted `ascending: false` — relevance is conventionally high(best)→low (SearchEngine
+// comment at the global-merge sort), so it was silently sorting WORST-first and passing only
+// by the weak OR condition (AppModel.swift happened to land 2nd-from-bottom under the OLD
+// un-refined greedy scores, with only 3 candidates). [26]'s new scatter/a_p_p.txt fixture
+// (a 4th "app" fuzzy candidate, deliberately LOW-scoring per the M1 DP verification) exposed
+// this: ascending(worst-first) now surfaces marker_apple.txt/a_p_p.txt instead. Fixed to
+// `ascending: false` to match the assertion's actual intent ("ranks ... on top").
+let rel = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false,
+                        limit: 10, now: now).ids.map { index.name(Int($0)) }
 check("relevance: 'app' ranks app.swift/AppModel.swift on top",
       rel.prefix(2).contains("app.swift") || rel.prefix(2).contains("AppModel.swift"), rel.prefix(3).joined(separator: ","))
 
@@ -208,6 +245,73 @@ let relAllLimitMatches = (1...min(5, relFull.count)).allSatisfy { lim in
     return limIds == Array(relFull.prefix(lim))
 }
 check("relevance top-K: any limit matches prefix of full search", relAllLimitMatches)
+
+// Codex P1 regression: with the prune/ fixture (1100 fuzzy-'app' matches > 2×pruneThreshold at
+// limit:1) the collection prune fires — it must keep the FULL pruneThreshold survivor window for
+// DP re-ranking, so limit-1's top result equals the full search's top (was limit-dependent).
+let relPruneFull = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false,
+                                 limit: 2000, now: now).ids
+let relPrune1 = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false,
+                              limit: 1, now: now).ids
+check("relevance prune: limit-1 top survives 1100-match prune pressure",
+      relPrune1.first == relPruneFull.first)
+
+// ---- SPEC-B4-FINAL §8 golden tests: [28] camel, [22] best-occurrence, [36] depth,
+// agy#1 name tie-break, [32] dual-blob affix, [26] fuzzy DP ----
+
+// relevance order by PATH (some fixtures here share a basename, e.g. leaf.txt).
+func relPaths(_ q: String, mode: MatchMode = .exact) -> [String] {
+    engine.search(q, mode: mode, scope: .nameOnly, sortKey: .relevance, ascending: false,
+                 limit: 10_000, now: now).ids.map { index.path(Int($0)) }
+}
+
+// [28] camel boundary beats interior (both non-prefix); prefix-less query "user"
+let u = relPaths("user")
+check("[28] camel: GetUserName ranks above interior abuser",
+      u.firstIndex { $0.hasSuffix("GetUserName.js") }! < u.firstIndex { $0.hasSuffix("abuser.txt") }!)
+
+// [22] boundary occurrence beats interior-only for the same term "test"
+let t = relPaths("test")
+check("[22] occurrence: latest_test (boundary) outranks contested (interior)",
+      t.firstIndex { $0.hasSuffix("latest_test.md") }! < t.firstIndex { $0.hasSuffix("contested.md") }!)
+
+// [22]+[28] VERIFIER: best-occurrence rescan must recognize a CAMEL boundary occurrence (not only a
+// separator) — scatCatalog (interior @1, camel-boundary @4) must outrank muscat (interior-only @3).
+let cc = relPaths("cat")
+check("[22]+[28] camel-boundary occurrence: scatCatalog outranks interior-only muscat",
+      cc.firstIndex { $0.hasSuffix("scatCatalog.txt") }! < cc.firstIndex { $0.hasSuffix("muscat.txt") }!)
+
+// [36] depth: root leaf.txt outranks deep src/a/b/c/d/leaf.txt (identical name-match ⇒ tie ⇒ depth)
+let lf = relPaths("leaf")
+check("[36] depth: root leaf.txt outranks deep src/a/b/c/d/leaf.txt",
+      lf.firstIndex { $0.hasSuffix("/leaf.txt") && !$0.contains("/src/") }!
+        < lf.firstIndex { $0.contains("/src/a/b/c/d/leaf.txt") }!)
+
+// agy#1 equal-score tie → alphabetical (name), NOT id/crawl order (bravo written first, same depth)
+let tie = relPaths("tie_")
+check("[agy#1] equal-score tie breaks alphabetically: alpha before bravo",
+      tie.firstIndex { $0.hasSuffix("tie_alpha.txt") }! < tie.firstIndex { $0.hasSuffix("tie_bravo.txt") }!)
+
+// [32] non-ASCII affix (dual-blob): folded "café"→"cafe" must match CAFÉ/café via Unicode segment
+check("[32] startwith:café finds CAFÉ.txt", has("startwith:café", "CAFÉ.txt"))
+check("[32] startwith:café finds café.md",  has("startwith:café", "café.md"))
+check("[32] startwith:café excludes non-matching report.txt", !has("startwith:café", "report.txt"))
+check("[32] -startwith:café excludes CAFÉ.txt", !has("-startwith:café", "CAFÉ.txt"))
+// [32] non-ASCII affix under case:on: hasU becomes false ⇒ ASCII/cased-only comparison, byte-exact
+// (§5 "case:on" note) — the Unicode-fold segment is NOT consulted, so only the byte-identical-case
+// name matches, and the negation only excludes that same byte-identical-case name.
+check("[32] case:on startwith:café matches only exact-case café.md",
+      has("case:on startwith:café", "café.md") && !has("case:on startwith:café", "CAFÉ.txt"))
+check("[32] case:on -startwith:café excludes exact-case café.md",
+      !has("case:on -startwith:café", "café.md"))
+check("[32] case:on -startwith:café does NOT exclude differently-cased CAFÉ.txt (no fold consulted)",
+      has("case:on -startwith:café", "CAFÉ.txt"))
+
+// [26] fuzzy DP: tight consecutive cluster outranks a scattered early alignment (fzf model)
+let fz = engine.search("app", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 50, now: now)
+             .ids.map { index.path(Int($0)) }
+check("[26] fuzzy DP: tight app.swift (DP 136) outranks scattered a_p_p.txt (DP 128)",
+      fz.firstIndex { $0.hasSuffix("app.swift") }! < fz.firstIndex { $0.hasSuffix("a_p_p.txt") }!)
 
 // path-column sort (OQ1A): the "Path" header must sort by true folded full path,
 // NOT by basename. The fixture is built so the two orders provably disagree.
@@ -648,12 +752,40 @@ do {
         mkdir(dp)
         for i in 0..<perDir { fastWrite(dp + "/f\(i).dat", bytes: 1) }
     }
+    // [agy#1, chunk-spanning] two equal-score tie candidates planted in the FIRST and LAST decoy
+    // dirs so their ids land ~1M apart — guaranteed to fall in DIFFERENT relevance chunks
+    // (nChunks = min(workerCount, n/8_000+1), SearchEngine:1271) regardless of the exact split.
+    // Same name length (19 bytes), both pos-0 prefix hits on "chunktie", both one dir below
+    // benchRoot (equal depth) ⇒ identical pre-tie-break score; only §6's global-merge nameLess
+    // (site 3, outside any single chunk) can put them in alphabetical order.
+    fastWrite(benchRoot + "/b0/chunktie_apple.txt", bytes: 1)
+    fastWrite(benchRoot + "/b\(dirs - 1)/chunktie_zebra.txt", bytes: 1)
     let idxB = FileIndex()
     _ = FileEnumerator(index: idxB).crawl(roots: [benchRoot], exclude: [], mountPoints: [])
     let csr0 = ContinuousClock().now
     idxB.buildLiveIndexes()                                             // CSR (csrChildIds/csrChildOff) build
     let csr1 = ContinuousClock().now
     let eB = SearchEngine(index: idxB); eB.useFolderSizes = false
+
+    let chunkTie = eB.search("chunktie", mode: .exact, sortKey: .relevance, ascending: false,
+                             limit: 10, now: now).ids.map { idxB.name(Int($0)) }
+    check("[agy#1] chunk-spanning tie (n=\(idxB.count)): alphabetical across chunk boundary",
+          chunkTie == ["chunktie_apple.txt", "chunktie_zebra.txt"], chunkTie.joined(separator: ","))
+
+    // [26] fuzzy latency at 1M scale: a 2-char query can NEVER enter the DP domain (§4 requires
+    // 3 ≤ needleLen ≤ 32) so it is greedy-existence-scan ONLY; a 3-char broad query of the same
+    // shape additionally pays refine-after-prune DP on each chunk's retained top-K survivors.
+    // Both queries are near-universal subsequence matches over "fNNN.dat" (f + digits + .dat).
+    let fz2c0 = ContinuousClock().now
+    let fz2c = eB.search("fd", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 50, now: now)
+    let fz2c1 = ContinuousClock().now
+    let fz3c0 = ContinuousClock().now
+    let fz3c = eB.search("fda", mode: .fuzzy, sortKey: .relevance, ascending: false, limit: 50, now: now)
+    let fz3c1 = ContinuousClock().now
+    print("fuzzyPerf(1M) n=\(idxB.count) " +
+          "2char-greedyOnly('fd')=\(fz2c0.duration(to: fz2c1)) matches=\(fz2c.total) " +
+          "3char-DPrefined('fda')=\(fz3c0.duration(to: fz3c1)) matches=\(fz3c.total)")
+
     let tb0 = ContinuousClock().now
     _ = eB.search("", sortKey: .name, limit: 1_000_000, now: now)      // cold full computeOrder over ~1M
     let tb1 = ContinuousClock().now
@@ -865,9 +997,12 @@ engine.foldersFirst = false
 // Everything's duplicate finder (dupe:)
 check("dupe: finds twin_name.txt (exists twice)", has("dupe: twin", "twin_name.txt"))
 check("dupe: excludes unique report.txt", !has("dupe: report", "report.txt"))
+// G4 (SPEC-B4-FINAL OI-D): [36]'s golden-test corpus deliberately adds a second "leaf.txt"
+// (root, vs. the pre-existing deep src/a/b/c/d/leaf.txt) to exercise the depth tie-break —
+// that is now ALSO a legitimate duplicate name, so the bare dupe: filter's name set grows.
 check("dupe: bare filter returns only duplicated names",
       engine.search("dupe:", limit: 100_000, now: now).ids
-          .allSatisfy { index.name(Int($0)) == "twin_name.txt" }
+          .allSatisfy { ["twin_name.txt", "leaf.txt"].contains(index.name(Int($0))) }
       && engine.search("dupe:", limit: 100_000, now: now).total >= 2)
 
 // Everything 1.4 filters: empty: (empty folders), len: (name length), startwith:/endwith:

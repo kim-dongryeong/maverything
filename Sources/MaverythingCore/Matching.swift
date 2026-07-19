@@ -39,46 +39,78 @@ public struct MatchOutcome {
 public enum Matcher {
 
     /// Dispatch one term (already ASCII-folded bytes) against a folded haystack.
+    /// `camelBits` bit i set ⇔ cased-byte position i is a camelCase word start ([28]);
+    /// 0 = separator-only (safe default — see FileIndex.camelBits doc).
     @inline(__always)
     public static func match(hay: UnsafePointer<UInt8>, hayLen: Int,
                              needle: UnsafePointer<UInt8>, needleLen: Int,
-                             mode: MatchMode) -> MatchOutcome {
+                             mode: MatchMode, camelBits: UInt64 = 0) -> MatchOutcome {
         if needleLen == 0 { return MatchOutcome(true, 0, 0) }
         switch mode {
-        case .exact:    return exact(hay, hayLen, needle, needleLen)
-        case .fuzzy:    return fuzzy(hay, hayLen, needle, needleLen)
+        case .exact:    return exact(hay, hayLen, needle, needleLen, camelBits)
+        case .fuzzy:    return fuzzy(hay, hayLen, needle, needleLen, camelBits)
         case .wildcard: return wildcard(hay, hayLen, needle, needleLen)
         case .regex:    return .no   // regex is handled by SearchEngine.regexSearch, not here
         }
     }
 
+    // a byte position is a boundary if it's a separator boundary OR a camelCase word
+    // start ([28]). `camelBits` is built from the CASED origin bytes but aligns 1:1
+    // with the folded scan position (asciiLower is byte-length-preserving) — see
+    // FileIndex.swift §2 coordinate-space note. Pass 0 for the Unicode-fold segment
+    // and path-scope scans (no per-entry alignment there).
+    @inline(__always)
+    static func isBoundaryX(_ hay: UnsafePointer<UInt8>, _ i: Int, _ camelBits: UInt64) -> Bool {
+        if isBoundary(hay, i) { return true }
+        return i < 64 && (camelBits >> UInt64(i)) & 1 == 1
+    }
+
     // MARK: exact substring (memmem)
 
     @inline(__always)
+    static func exactScore(_ pos: Int, _ needleLen: Int, _ hayLen: Int, prefix: Bool, boundary: Bool) -> Int {
+        var s = 1000 - min(pos, 900)
+        if prefix { s += 150 } else if boundary { s += 60 }
+        s += max(0, 40 - (hayLen - needleLen))
+        return s
+    }
+
+    /// [22] bounded best-occurrence scan: the first hit is used unless it's interior AND
+    /// a nearby boundary occurrence exists (≤4 extra probes, G5) — a boundary hit anywhere
+    /// beats an interior hit, but we never scan unboundedly for one.
+    @inline(__always)
     static func exact(_ hay: UnsafePointer<UInt8>, _ hayLen: Int,
-                      _ needle: UnsafePointer<UInt8>, _ needleLen: Int) -> MatchOutcome {
+                      _ needle: UnsafePointer<UInt8>, _ needleLen: Int,
+                      _ camelBits: UInt64 = 0) -> MatchOutcome {
         guard hayLen >= needleLen else { return .no }
         guard let hit = memmem(hay, hayLen, needle, needleLen) else { return .no }
         let pos = UnsafeRawPointer(hit) - UnsafeRawPointer(hay)
-        // Ranking (relevance): earlier match wins, and — matching Everything and user intent —
-        // a PREFIX match beats an interior word-boundary match beats a mid-word match, and a
-        // SHORTER / whole-filename match beats a longer one at equal position. These are pure
-        // constant additions (no extra scanning), so exact-mode name-sort — which calls this
-        // for every candidate just to test `matched` — pays nothing. (Deliberately left out:
-        // scanning past the first hit for a better boundary occurrence, which would add a
-        // memmem to every candidate on the hot path; revisit behind a scoring-only gate.)
-        var score = 1000 - min(pos, 900)
-        if pos == 0 { score += 150 }                        // prefix — strongly preferred
-        else if isBoundary(hay, pos) { score += 60 }        // interior word-boundary start
-        score += max(0, 40 - (hayLen - needleLen))          // shorter / whole-name preferred
-        return MatchOutcome(true, score, pos)
+        if pos == 0 { return MatchOutcome(true, exactScore(pos, needleLen, hayLen, prefix: true, boundary: false), pos) }
+        if isBoundaryX(hay, pos, camelBits) {
+            return MatchOutcome(true, exactScore(pos, needleLen, hayLen, prefix: false, boundary: true), pos)
+        }
+        var best = exactScore(pos, needleLen, hayLen, prefix: false, boundary: false)   // interior floor
+        var bestPos = pos
+        var from = pos + 1, probes = 0
+        while from + needleLen <= hayLen && probes < 4 {        // ≤4 extra memmem (bounded, G5)
+            guard let h2 = memmem(hay + from, hayLen - from, needle, needleLen) else { break }
+            let p2 = UnsafeRawPointer(h2) - UnsafeRawPointer(hay)
+            if isBoundaryX(hay, p2, camelBits) {                // boundary occurrence found
+                let s2 = exactScore(p2, needleLen, hayLen, prefix: false, boundary: true)
+                if s2 > best { best = s2; bestPos = p2 }        // §1 proves s2 ≤1099 < any prefix
+                break                                           // first boundary hit is enough
+            }
+            from = p2 + 1; probes += 1
+        }
+        return MatchOutcome(true, best, bestPos)
     }
 
     // MARK: fuzzy subsequence (greedy, boundary/consecutive-aware)
 
     @inline(__always)
     static func fuzzy(_ hay: UnsafePointer<UInt8>, _ hayLen: Int,
-                      _ needle: UnsafePointer<UInt8>, _ needleLen: Int) -> MatchOutcome {
+                      _ needle: UnsafePointer<UInt8>, _ needleLen: Int,
+                      _ camelBits: UInt64 = 0) -> MatchOutcome {
         var ni = 0, hi = 0
         var score = 0, firstPos = -1
         var prevMatchIdx = -2
@@ -87,7 +119,7 @@ public enum Matcher {
                 if firstPos < 0 { firstPos = hi }
                 var bonus = 16
                 if hi == prevMatchIdx + 1 { bonus += 12 }          // consecutive
-                if hi == 0 || isBoundary(hay, hi) { bonus += 18 }  // word boundary
+                if hi == 0 || isBoundaryX(hay, hi, camelBits) { bonus += 18 }  // word boundary
                 score += bonus
                 prevMatchIdx = hi
                 ni += 1
@@ -97,6 +129,90 @@ public enum Matcher {
         guard ni == needleLen else { return .no }
         score -= firstPos                                          // prefer early start
         score += max(0, 40 - (hayLen - needleLen))                // prefer tight match
+        return MatchOutcome(true, max(score, 1), firstPos)
+    }
+
+    // MARK: [26] fuzzy DP — bounded affine-gap Smith-Waterman (fzf FuzzyMatchV2 model),
+    // ranking-only refinement over the greedy existence match. See spec §4: M1's fzf
+    // consecutive-inheritance rule (a run's bonus is the boundary strength of whichever
+    // character STARTED the run, not a flat per-consecutive-char bonus) is THE fix that
+    // keeps a tight prefix match (app.swift) outranking a fully-delimited scattered one
+    // (a_p_p.txt).
+    static let dpMatch: Int32 = 16
+    // fzf-scale (agy cross-review): with gapStart −3 / gapExtend −1 a gap of g costs g+2, so 10
+    // cancels a boundary at g≈8 — fzf's balance point. 18 doubled it, over-rewarding scattered
+    // boundary matches (a_b_c) vs tight interior runs (xabc).
+    static let dpBoundaryBonus: Int32 = 10
+    static let dpConsecFloor: Int32 = 4
+    static let dpGapStart: Int32 = -3
+    static let dpGapExtend: Int32 = -1
+    static let dpNegInf: Int32 = Int32.min / 4
+
+    /// DP domain: caller must have a matching GREEDY outcome already (existence gate never
+    /// changes) and pass fixed-capacity scratch rows (≥255, the path-scope/name-scope hay
+    /// cap — S1). Outside `3 ≤ needleLen ≤ 32` or `hayLen ≤ 255`, returns `greedy` unchanged
+    /// (fallback — S1: an unbounded DP width on 8192-byte path scratch would blow rows to
+    /// 32×8192 ≈ 262k ops/candidate and overflow the 255-sized scratch).
+    static func fuzzyDPRefine(hay: UnsafePointer<UInt8>, hayLen: Int,
+                              needle: UnsafePointer<UInt8>, needleLen: Int,
+                              camelBits: UInt64,
+                              prev: UnsafeMutableBufferPointer<Int32>, curr: UnsafeMutableBufferPointer<Int32>,
+                              prevStart: UnsafeMutableBufferPointer<Int32>, currStart: UnsafeMutableBufferPointer<Int32>,
+                              prevRun: UnsafeMutableBufferPointer<Int32>, currRun: UnsafeMutableBufferPointer<Int32>,
+                              greedy: MatchOutcome) -> MatchOutcome {
+        guard needleLen >= 3, needleLen <= 32, hayLen <= 255, hayLen >= needleLen,
+              hayLen <= prev.count else { return greedy }
+        let h = hayLen, m = needleLen
+        let NEG = dpNegInf
+        var pv = prev, cv = curr, pvS = prevStart, cvS = currStart, pvR = prevRun, cvR = currRun
+        for j in 0..<h { pv[j] = NEG; pvS[j] = -1; pvR[j] = 0 }
+        for i in 0..<m {
+            var run = NEG; var runStart: Int32 = -1
+            for j in 0..<h {
+                // fold prev[j-1] in as a gap-START candidate (≥1 hay char skipped before j)
+                if i > 0, j >= 1, pv[j - 1] != NEG, pv[j - 1] + dpGapStart > run {
+                    run = pv[j - 1] + dpGapStart; runStart = pvS[j - 1]   // gap path breaks the run
+                }
+                if hay[j] == needle[i] {
+                    let pb: Int32 = isBoundaryX(hay, j, camelBits) ? dpBoundaryBonus : 0
+                    var s = NEG; var st: Int32 = -1; var rb: Int32 = 0
+                    if i == 0 {
+                        // fzf bonusFirstCharMultiplier: how the term STARTS matters most; the
+                        // run inherits the UNdoubled bonus (parity with fzf's consecutive rule).
+                        s = dpMatch + pb &* 2; st = Int32(j); rb = pb
+                    } else {
+                        if j >= 1, pv[j - 1] != NEG {
+                            // consecutive (diagonal, no gap): inherit the run's boundary bonus
+                            let cb = max(pb, max(pvR[j - 1], dpConsecFloor))
+                            let cand = pv[j - 1] + dpMatch + cb
+                            if cand > s { s = cand; st = pvS[j - 1]; rb = max(pvR[j - 1], pb) }
+                        }
+                        if run != NEG {   // gapped (run just opened above): fresh run at this boundary
+                            let cand = run + dpMatch + pb
+                            if cand > s { s = cand; st = runStart; rb = pb }
+                        }
+                    }
+                    if s != NEG { cv[j] = s; cvS[j] = st; cvR[j] = rb }
+                    else { cv[j] = NEG; cvS[j] = -1; cvR[j] = 0 }
+                } else {
+                    cv[j] = NEG; cvS[j] = -1; cvR[j] = 0
+                }
+                if run != NEG { run += dpGapExtend }   // extend open gaps by one position
+            }
+            swap(&pv, &cv); swap(&pvS, &cvS); swap(&pvR, &cvR)
+        }
+        // best final alignment: maximize the RETURNED metric (raw − startPos), not raw alone —
+        // an alignment with slightly lower raw but a much earlier start wins the final score
+        // (Codex P1: argmax over raw discarded the true best before the penalty was applied).
+        var bestFinal = NEG, bestJ = -1
+        for j in 0..<h where pv[j] != NEG {
+            let fin = pv[j] - pvS[j]
+            if bestJ < 0 || fin > bestFinal { bestFinal = fin; bestJ = j }
+        }
+        guard bestJ >= 0 else { return greedy }
+        let firstPos = Int(pvS[bestJ])
+        var score = Int(pv[bestJ]) - firstPos                         // prefer early start (parity greedy)
+        score += max(0, 40 - (hayLen - needleLen))                   // tightness (parity greedy)
         return MatchOutcome(true, max(score, 1), firstPos)
     }
 

@@ -44,6 +44,33 @@ public final class FileIndex: @unchecked Sendable {
     // the caller's buildLiveIndexes fills it.
     public internal(set) var typeClass: [UInt8] = []
 
+    // [28] camelCase boundary bits — one UInt64 per entry, bit i set iff byte i of the
+    // entry's CASED name bytes is a camelCase word start (isLowerOrDigit(name[i-1]) &&
+    // isUpper(name[i])); covers bytes 0..63 (bit 0 never set — pos 0 is the PREFIX case,
+    // handled separately). Names >64 bytes: camel starts past byte 63 fall back to
+    // separator-only (documented cutoff). Mirrors typeClass's lifecycle exactly (see
+    // every append site below). Never persisted (recomputed like nameMask/typeClass);
+    // 0 = "no camel starts known yet" is a safe passthrough (separator-only boundary
+    // rule still applies) until buildLiveIndexes fills the authoritative values.
+    public internal(set) var camelBits: [UInt64] = []
+
+    /// Cased-byte camelCase word-start bitmap for `p[o..<o+len]` (bit i set ⇔ i is a
+    /// camel start). MUST be computed from CASED bytes (nameBlob/batch.blob/name), never
+    /// foldBlob (folding erases the case transition camelCase detection depends on).
+    @inline(__always) static func camelBitsOf(_ p: UnsafePointer<UInt8>, _ o: Int, _ len: Int) -> UInt64 {
+        var bits: UInt64 = 0
+        let m = min(len, 64)
+        var i = 1
+        while i < m {
+            let a = p[o + i - 1], b = p[o + i]
+            if ((a >= 97 && a <= 122) || (a >= 48 && a <= 57)) && (b >= 65 && b <= 90) {
+                bits |= (1 << UInt64(i))
+            }
+            i += 1
+        }
+        return bits
+    }
+
     // Per-entry attributes (parallel arrays).
     public internal(set) var parent: [Int32] = []     // index of parent entry, -1 for roots
     public internal(set) var size: [Int64] = []       // logical bytes (0 for dirs)
@@ -280,6 +307,7 @@ public final class FileIndex: @unchecked Sendable {
         unicodeFoldOff.removeAll(keepingCapacity: false); unicodeFoldLen.removeAll(keepingCapacity: false)
         nameMask.removeAll(keepingCapacity: false)
         typeClass.removeAll(keepingCapacity: false)
+        camelBits.removeAll(keepingCapacity: false)
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
@@ -302,6 +330,7 @@ public final class FileIndex: @unchecked Sendable {
         nameBlob.reserveCapacity(n * 24); foldBlob.reserveCapacity(n * 24)
         unicodeFoldBlob.reserveCapacity(n)   // conservative — only a few % of names carry a fold
         typeClass.reserveCapacity(n)
+        camelBits.reserveCapacity(n)
         nameOff.reserveCapacity(n); nameLen.reserveCapacity(n)
         unicodeFoldOff.reserveCapacity(n); unicodeFoldLen.reserveCapacity(n)
         nameMask.reserveCapacity(n)
@@ -333,6 +362,7 @@ public final class FileIndex: @unchecked Sendable {
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
         nameMask.append(.max)   // authoritative value filled by buildLiveIndexes (safe passthrough meanwhile)
         typeClass.append(fold.withUnsafeBufferPointer { FileTypeClass.mask(foldedName: $0.baseAddress!, 0, $0.count) })
+        camelBits.append(bytes.withUnsafeBufferPointer { Self.camelBitsOf($0.baseAddress!, 0, bytes.count) })
         logAppend(idx)   // real append site: crawl-start root + live volume mount (spec OI-1)
         return idx   // live-update maps are built in bulk post-crawl (buildLiveIndexes)
     }
@@ -370,6 +400,7 @@ public final class FileIndex: @unchecked Sendable {
         // the crawl must not miss these). Now computed in ChildBatch.appendName off the write
         // lock (parallel scan phase) — here we just splice the precomputed masks in.
         typeClass.append(contentsOf: batch.typeClass)
+        camelBits.append(contentsOf: batch.camelBits)
         for j in 0..<n { logAppend(base &+ Int32(j)) }   // crawl floods overflow the cap ⇒ chgBase
                                                           // jumps ⇒ consumers full-rebuild (today's behavior)
         return base
@@ -449,11 +480,14 @@ public final class FileIndex: @unchecked Sendable {
     private func computeNameMasksLocked(_ n: Int) {
         nameMask = [UInt64](repeating: 0, count: n)
         typeClass = [UInt8](repeating: 0, count: n)
+        camelBits = [UInt64](repeating: 0, count: n)
         foldBlob.withUnsafeBufferPointer { fb in
         unicodeFoldBlob.withUnsafeBufferPointer { ub in
+        nameBlob.withUnsafeBufferPointer { nbb in
         nameMask.withUnsafeMutableBufferPointer { mb in
         typeClass.withUnsafeMutableBufferPointer { tc in
-            let fbBase = fb.baseAddress!
+        camelBits.withUnsafeMutableBufferPointer { cb in
+            let fbBase = fb.baseAddress!, nbBase = nbb.baseAddress!
             for i in 0..<n {
                 var m: UInt64 = 0
                 let o = Int(nameOff[i]), e = o + Int(nameLen[i])
@@ -466,8 +500,12 @@ public final class FileIndex: @unchecked Sendable {
                 // typeClass reads the SAME folded name bytes (last-dot extension) that
                 // SearchEngine.extMatches uses → type: and ext: agree by construction.
                 tc[i] = FileTypeClass.mask(foldedName: fbBase, o, Int(nameLen[i]))
+                // camelBits reads CASED bytes (nameBlob) — folding erases the case
+                // transition camelCase detection depends on. nameOff/nameLen index
+                // both blobs identically (asciiLower is byte-length-preserving).
+                cb[i] = Self.camelBitsOf(nbBase, o, Int(nameLen[i]))
             }
-        }}}}
+        }}}}}}
     }
 
     /// TEST-ONLY: force every bloom mask to all-bits, disabling the prefilter so a
@@ -927,6 +965,8 @@ public final class FileIndex: @unchecked Sendable {
         typeClass.append(foldBlob.withUnsafeBufferPointer {
             $0.baseAddress.map { FileTypeClass.mask(foldedName: $0, fo, fl) } ?? 0
         })
+        // camelBits from the just-appended CASED name bytes (nameBlob), not foldBlob.
+        camelBits.append(name.withUnsafeBufferPointer { Self.camelBitsOf($0.baseAddress!, 0, name.count) })
         logAppend(idx)   // every reconcile insert + the file↔dir-flip re-add (via appendChild)
         return idx
     }
@@ -1075,6 +1115,7 @@ struct ChildBatch {
     var flags: [UInt32] = []
     var hidden: [Bool] = []
     var typeClass: [UInt8] = []   // media-category mask, computed here (parallel) not under the write lock
+    var camelBits: [UInt64] = []  // [28] camelCase boundary bitmap, computed here from CASED nameBytes
     /// (localIndex, name) of child directories, to enqueue for further crawling.
     var subdirs: [(Int32, String)] = []
 
@@ -1105,6 +1146,8 @@ struct ChildBatch {
             FileTypeClass.mask(foldedName: $0.baseAddress!, foldStart, nameBytes.count)
         }
         typeClass.append(tcMask)
+        // cased (not folded) — camelCase detection needs the original case transition.
+        camelBits.append(FileIndex.camelBitsOf(nameBytes.baseAddress!, 0, nameBytes.count))
         appendUnicodeFoldStorage(for: nameBytes, blob: &unicodeFoldBlob,
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)

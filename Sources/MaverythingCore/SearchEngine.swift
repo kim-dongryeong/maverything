@@ -87,6 +87,45 @@ public final class SearchEngine: @unchecked Sendable {
     private var incGen = -1
     private static let incMaxCacheIDs = 8_000_000   // memory bound for the narrowing cache
 
+    // [23] general-path "narrow as you type": remember the FULL match set of the last NON-relevance
+    // general() call so the next keystroke that provably REFINES it rescans only that set. Separate
+    // from fastExact's incLock (different query class, different lock to avoid cross-contention).
+    private let genNarrowLock = NSLock()
+    private var gnValid = false
+    private var gnIDs: [Int32] = []            // full, untruncated, in RETURNED (ascending-applied) order
+    private var gnParsed = ParsedQuery()       // signature: terms + filters of the cached query
+    private var gnMode: MatchMode = .exact
+    private var gnScope: SearchScope = .nameOnly
+    private var gnScopeRoot: Int32? = nil
+    private var gnSortKey: SortKey = .name
+    private var gnAscending = true
+    private var gnEpoch = -1
+    private var gnStructSeen = -1
+    private var gnAttrSeen = -1
+    private var gnLiveBuildSeen = -1
+    private var gnAttrDependent = false
+    // SHOULD-FIX 3: engine OPTION flags read inside general()/orderArray change the match set/order
+    // for a byte-identical query with an unchanged structSeq. `wholeNameWildcards` star-wraps glob
+    // terms when OFF (changes the glob MATCH SET); `useFolderSizes` flips `.size` between the
+    // fsSize and attr order families (changes ORDER). Both are per-request (QueryServer) and
+    // GUI-toggleable, so they MUST be part of the narrow key.
+    private var gnWholeNameWildcards = true
+    private var gnUseFolderSizes = false
+    // Reuse the same memory bound as fastExact (8M ids ≈ 32 MB). General sets are ≤ display limit
+    // (≤100k) in practice, so this bound is rarely the binding constraint — the untruncated
+    // condition (OI-2) is.
+
+    // [23] observability: mvsim asserts hits on a KNOWN-refining keystroke run and full scans
+    // on a KNOWN-widening edit. Guarded by statsLock (same pattern as the [13] order stats).
+    private var _gnHits = 0, _gnFull = 0
+    @inline(__always) private func bumpGnHit()  { statsLock.lock(); _gnHits += 1; statsLock.unlock() }
+    @inline(__always) private func bumpGnFull() { statsLock.lock(); _gnFull += 1; statsLock.unlock() }
+    public func _debugNarrowStats() -> (hits: Int, full: Int) {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return (_gnHits, _gnFull)
+    }
+    public func _debugResetNarrowStats() { statsLock.lock(); _gnHits = 0; _gnFull = 0; statsLock.unlock() }
+
     public init(index: FileIndex, workers: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.index = index
         self.workerCount = max(1, workers)
@@ -233,16 +272,40 @@ public final class SearchEngine: @unchecked Sendable {
         // Resolve the frecency map and run the scan in the SAME read-lock acquisition
         // so the tracked ids line up with the exact index the scan saw (Codex review).
         var frecency: [Int32: Double] = [:]
-        let res = index.withReadLock { () -> SearchResults in
-            if sortKey == .relevance || sortKey == .runCount {
-                frecency = resolveFrecencyLocked(now: now)
+        // [34] Regex is dispatched OUTSIDE the index read lock: `regexSearch` does its own
+        // bounded per-chunk locking (materialize under lock → match off-lock), so the
+        // unbounded/catastrophic regex match never blocks the reconciler's writer lock. Every
+        // other mode still runs `_search` inside one `withReadLock` acquisition as before. An
+        // EMPTY regex query (nothing to compile) is routed through the normal locked path instead
+        // — `_search` treats it like any other empty query (unchanged "show all" behavior).
+        let isNonEmptyRegex = mode == .regex && !query.trimmingCharacters(in: .whitespaces).isEmpty
+        let res: SearchResults
+        if isNonEmptyRegex {
+            let clock = ContinuousClock(); let start = clock.now
+            // Codex P1: the .runCount post-reorder below reads `frecency` for every mode — the
+            // regex branch must resolve it too or most-run files never float.
+            if sortKey == .runCount {
+                frecency = index.withReadLock { resolveFrecencyLocked(now: now) }
             }
-            // "all matches" ≈ every live entry (the true ceiling), read under the lock
-            // so it can't undercount vs the order array the scan walks.
-            let innerLimit = needFull ? max(limit, index.count) : limit
-            return _search(query, mode: mode, scope: scope, sortKey: sortKey,
-                           ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
-                           frecency: frecency, isStale: isStale)
+            // The "all matches" ceiling is computed INSIDE regexSearch, in the same lock
+            // acquisition as its order snapshot (Codex P1: a separately-read index.count can
+            // disagree with the order actually scanned).
+            res = regexSearch(pattern: query.precomposedStringWithCanonicalMapping, scope: scope,
+                              sortKey: sortKey, ascending: innerAscending, limit: limit,
+                              start: start, clock: clock, scopeRoot: scopeRoot,
+                              needFull: needFull, isStale: isStale)
+        } else {
+            res = index.withReadLock { () -> SearchResults in
+                if sortKey == .relevance || sortKey == .runCount {
+                    frecency = resolveFrecencyLocked(now: now)
+                }
+                // "all matches" ≈ every live entry (the true ceiling), read under the lock
+                // so it can't undercount vs the order array the scan walks.
+                let innerLimit = needFull ? max(limit, index.count) : limit
+                return _search(query, mode: mode, scope: scope, sortKey: sortKey,
+                               ascending: innerAscending, limit: innerLimit, now: now, scopeRoot: scopeRoot,
+                               frecency: frecency, isStale: isStale)
+            }
         }
         // From here every stage works on the FULL set; `total` tracks live match count.
         var ids = res.ids
@@ -427,15 +490,12 @@ public final class SearchEngine: @unchecked Sendable {
                          isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
         let clock = ContinuousClock()
         let start = clock.now
-        // Regex mode treats the whole query as one pattern (no term-splitting).
-        if mode == .regex, !query.trimmingCharacters(in: .whitespaces).isEmpty {
-            // NFC-normalize the pattern like the other modes, so a decomposed (NFD) literal
-            // pasted into regex still matches the NFC names stored in the index.
-            return regexSearch(pattern: query.precomposedStringWithCanonicalMapping,
-                               scope: scope, sortKey: sortKey,
-                               ascending: ascending, limit: limit, start: start, clock: clock,
-                               scopeRoot: scopeRoot, isStale: isStale)
-        }
+        // [34] Regex mode (whole query = one pattern, no term-splitting) is no longer dispatched
+        // from here: `search()` now routes it to `regexSearch` BEFORE acquiring the index read
+        // lock (regexSearch does its own per-chunk locking off the writer's back — see the
+        // "Critical call-site change" note at regexSearch's definition). A non-empty regex query
+        // never reaches `_search`; an EMPTY regex query still does and falls through below,
+        // behaving like any other empty query (unchanged).
 
         let parsed = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
 
@@ -486,7 +546,7 @@ public final class SearchEngine: @unchecked Sendable {
                                  limit: limit, start: start, clock: clock)
         }
 
-        return general(parsed: parsed, mode: mode, sortKey: sortKey, ascending: ascending,
+        return general(parsed: parsed, mode: mode, scope: scope, sortKey: sortKey, ascending: ascending,
                        limit: limit, start: start, clock: clock, scopeRoot: scopeRoot,
                        frecency: frecency, now: now)
     }
@@ -1122,61 +1182,228 @@ public final class SearchEngine: @unchecked Sendable {
 
     // MARK: - regex mode (power mode; builds a String per candidate, so slower)
 
+    /// [34] Single-flight, single-threaded (OI-4: NSRegularExpression parallelism dropped for
+    /// correctness — a follow-up could parallelize the off-lock match while keeping single-flight
+    /// per search, since `firstMatch` is documented thread-safe). Chunk = 64k candidates (16k for
+    /// `.fullPath`, SHOULD-FIX 5 — path strings are ~4KB vs. names' few bytes). Per chunk: lock →
+    /// materialize `(id, String)` → unlock → match OFF-lock. Superseded between and within chunks.
+    /// Final tombstone re-filter under one last lock.
+    ///
+    /// **Critical call-site change**: `search()` dispatches here BEFORE acquiring the index read
+    /// lock (unlike every other mode, which runs inside `_search` under `index.withReadLock`) —
+    /// same structural move `content:`/`tag:` already got. `regexSearch` must be called OUTSIDE
+    /// that lock; it does its own per-chunk locking below, so the unbounded/catastrophic part (the
+    /// actual regex match) NEVER holds the index lock, and the reconciler's writer lock can always
+    /// grab it in the inter-chunk gap.
     private func regexSearch(pattern: String, scope: SearchScope, sortKey: SortKey, ascending: Bool,
                              limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
-                             scopeRoot: Int32?, isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
+                             scopeRoot: Int32?, needFull: Bool = false,
+                             isStale: (@Sendable () -> Bool)? = nil) -> SearchResults {
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return SearchResults(ids: [], total: 0, truncated: false,
                                  queryMillis: secondsBetween(start, clock.now) * 1000)
         }
-        let order = orderArray(for: scanOrderKey(sortKey))
+        // Order array under the lock (cached; cheap). This is the ENGINE's own cached [Int32], NOT
+        // an index SoA buffer — reading it does NOT fork an index array on the writer's next
+        // mutation (that COW hazard is why we re-materialize names per chunk instead of
+        // snapshotting index.nameBlob/parent/etc.).
+        // epoch0 + effLimit captured in the SAME lock acquisition as the order snapshot (Codex
+        // P0/P1): within one epoch ids are append-only (never remapped/out-of-range), so chunks
+        // that verify the epoch may safely read _name/_path; a clear()/snapshot-load mid-scan
+        // bumps the epoch and the scan aborts instead of trapping or emitting remapped ids. The
+        // "all matches" ceiling likewise must come from THIS snapshot, not an earlier count read.
+        let (order, epoch0, effLimit): ([Int32], Int, Int) = index.withReadLock {
+            let o = orderArray(for: scanOrderKey(sortKey))
+            return (o, index.epochLocked, needFull ? max(limit, o.count) : limit)
+        }
+        let limit = effLimit
         let n = order.count
         let usePath = (scope == .fullPath)
-        let nChunks = max(1, min(workerCount, n / 8_000 + 1))
-        let chunkSize = (n + nChunks - 1) / nChunks
-        var chunkIDs = [[Int32]](repeating: [], count: nChunks)
-        var chunkTotals = [Int](repeating: 0, count: nChunks)
+        // SHOULD-FIX 5: fullPath materializes reconstructed PATH strings (up to ~4096 B each on a
+        // deep tree). At 64k rows that is ~256 MB transient per chunk, not the tens-of-MB the name-
+        // scope estimate implies. Bounded, but a real spike — use a 16k chunk for fullPath (≤~64 MB)
+        // and keep 64k for name scope (short strings). More lock cycles for fullPath (~128 at 2M)
+        // but each still holds only long enough to build ≤16k strings — the writer-starvation bound
+        // is per-chunk, not total, so this only IMPROVES writer interruptibility.
+        let chunk = usePath ? 16_000 : 64_000
 
-        index.parent.withUnsafeBufferPointer { parB in
-        index.deleted.withUnsafeBufferPointer { delB in
-        order.withUnsafeBufferPointer { ordB in
-            chunkIDs.withUnsafeMutableBufferPointer { outIDs in
-            chunkTotals.withUnsafeMutableBufferPointer { outTot in
-                DispatchQueue.concurrentPerform(iterations: nChunks) { c in
-                    let lo = c * chunkSize, hi = min(n, lo + chunkSize)
-                    if lo >= hi { return }
-                    var ids = [Int32](); var total = 0
-                    for k in lo..<hi {
-                        // A per-candidate regex match is costly; bail the whole chunk once a
-                        // newer query supersedes this one (checked cheaply every 512 rows).
-                        if (k - lo) & 0x1FF == 0, isStale?() == true { break }
-                        let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
-                        if delB[id] { continue }   // defensive: skip tombstones (parity with other paths)
+        var matched: [Int32] = []          // ids that matched, in scan (sort) order
+        var superseded = false
+        var k = 0
+        while k < n && !superseded {
+            if isStale?() == true { break }                    // new keystroke → abort remaining chunks
+            let hi = min(n, k + chunk)
+            // --- UNDER LOCK: materialize this chunk's candidates only (no big-array snapshot) ---
+            var batch: [(id: Int32, s: String)] = []
+            batch.reserveCapacity(hi - k)
+            index.withReadLock {
+                guard index.epochLocked == epoch0 else { superseded = true; return }   // Codex P0
+                index.parent.withUnsafeBufferPointer { parB in
+                index.deleted.withUnsafeBufferPointer { delB in
+                    for j in k..<hi {
+                        let id = Int(ascending ? order[j] : order[n - 1 - j])
+                        if id < delB.count, delB[id] { continue }              // current tombstone
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
-                        let s = usePath ? self.index._path(id) : self.index._name(id)
-                        let r = NSRange(s.startIndex..., in: s)
-                        if re.firstMatch(in: s, options: [], range: r) != nil {
-                            total += 1; if ids.count < limit { ids.append(Int32(id)) }
-                        }
+                        batch.append((Int32(id), usePath ? self.index._path(id) : self.index._name(id)))
                     }
-                    outIDs[c] = ids; outTot[c] = total
+                }}
+            }
+            // --- OFF LOCK: run the (potentially catastrophic) pattern; poll isStale every 512 rows ---
+            for (i, item) in batch.enumerated() {
+                if i & 0x1FF == 0, isStale?() == true { superseded = true; break }
+                let r = NSRange(item.s.startIndex..., in: item.s)
+                if re.firstMatch(in: item.s, options: [], range: r) != nil { matched.append(item.id) }
+            }
+            k = hi
+        }
+
+        // --- FINAL EMIT under one lock: re-filter tombstones with CURRENT delB, cap at limit ---
+        // An id tombstoned AFTER its chunk was materialized must not be emitted. `matched` is
+        // already in sort order; total = live-and-matched count.
+        let (out, total): ([Int32], Int) = index.withReadLock {
+            guard index.epochLocked == epoch0 else { return ([], 0) }   // Codex P0: dead-index ids
+            return index.deleted.withUnsafeBufferPointer { delB in
+                var o = [Int32](); o.reserveCapacity(min(matched.count, limit))
+                var t = 0
+                for id in matched {
+                    let i = Int(id)
+                    if i < delB.count, delB[i] { continue }
+                    t += 1
+                    if o.count < limit { o.append(id) }
                 }
-            }}
-        }}}
-        let total = chunkTotals.reduce(0, +)
-        var out = [Int32](); out.reserveCapacity(min(total, limit))
-        outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
+                return (o, t)
+            }
+        }
+        _ = superseded   // partial results from a superseded scan are still coherent (subset of order)
         return SearchResults(ids: out, total: total, truncated: total > out.count,
                              queryMillis: secondsBetween(start, clock.now) * 1000)
     }
 
+    // MARK: - [23] general-path narrow-as-you-type: refinement predicate (subset-proof)
+
+    /// Does `new` provably yield a SUBSET of `old`'s general match set? Conservative — any
+    /// uncertainty returns `false` (fall back to a full scan; the cache is an optimization,
+    /// never a semantic).
+    private func isGeneralRefinement(old: ParsedQuery, new: ParsedQuery, mode: MatchMode) -> Bool {
+        // caseSensitive changes how BOTH terms and filter values are folded → must match.
+        guard old.caseSensitive == new.caseSensitive else { return false }
+        // (1) All non-term filters byte-identical (OI-3: no filter-superset narrowing in MVP).
+        guard Self.generalFiltersIdentical(old, new) else { return false }
+        // (2) OLD's groups each matched POSITIONALLY by an equal-or-narrower NEW group; NEW may
+        //     APPEND extra groups — an appended positive group ANDs a new constraint and an
+        //     appended negated group excludes more, so ANY appended group only SHRINKS the set.
+        guard new.termGroups.count >= old.termGroups.count else { return false }
+        // caseSensitive already matched; wholeWord is required byte-equal by generalFiltersIdentical,
+        // so old.wholeWord == new.wholeWord — pass old's to the per-group check (MUST-FIX 1).
+        for i in old.termGroups.indices {
+            if !groupRefines(old: old.termGroups[i], new: new.termGroups[i],
+                             mode: mode, wholeWord: old.wholeWord) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func groupRefines(old: [QueryTerm], new: [QueryTerm], mode: MatchMode,
+                              wholeWord: Bool) -> Bool {
+        // Structure must line up alternative-for-alternative.
+        guard old.count == new.count else { return false }
+        for (o, nw) in zip(old, new) where
+            o.negated != nw.negated || o.scope != nw.scope || o.isGlob != nw.isGlob {
+            return false
+        }
+        let negated = old.first?.negated ?? false
+        // NEGATED group: narrowing holds only if the exclusion is UNCHANGED. Editing a negated
+        // needle (`-foo` → `-foob`) EXCLUDES FEWER names → WIDENS. Byte-identical only.
+        if negated { return Self.groupBytesIdentical(old, new) }
+        // WHOLE-WORD (ww:) positive group in EXACT mode: prefix extension is NON-MONOTONE
+        // (MUST-FIX 1). `Matcher.wholeWordExact` requires the hit not be flanked by a word byte
+        // (isWordByte: alnum or ≥0x80). A name `foob` does NOT match `foo ww:` (flanked by `b`) but
+        // DOES match `foob ww:` — extending the needle can make a name START matching. So the cached
+        // set S is NOT a superset. Restrict to byte-identical. effWW = wholeWord && effMode==.exact,
+        // so fuzzy/wildcard ignore ww: and need no extra handling; guard on mode==.exact.
+        if wholeWord && mode == .exact { return Self.groupBytesIdentical(old, new) }
+        // GLOB / wildcard-mode positive group: whole-name anchoring is non-monotonic
+        // (`a?` matches 2-char names, `a?c` matches 3-char — NOT a subset). Byte-identical only.
+        if mode == .wildcard || old.contains(where: { $0.isGlob }) {
+            return Self.groupBytesIdentical(old, new)
+        }
+        // MULTI-ALTERNATIVE OR group (`jpg|png`): per-alt subset reasoning is fragile (dropping an
+        // alt narrows, adding one widens). Byte-identical only.
+        if old.count != 1 { return Self.groupBytesIdentical(old, new) }
+        // SINGLE positive plain / fuzzy / path-substring term: NEW is OLD prefix-EXTENDED (or equal).
+        //   • exact substring: name ⊇ longer ⇒ name ⊇ prefix ⇒ matches(new) ⊆ matches(old).
+        //   • fuzzy subsequence: longer subseq present ⇒ its prefix subseq present ⇒ subset.
+        //   • path substring: identical substring monotonicity over the full folded path bytes.
+        // (Both alternatives folded identically since caseSensitive matched above.)
+        let o = old[0].bytes, nw = new[0].bytes
+        return nw.count >= o.count && nw.starts(with: o)
+    }
+
+    @inline(__always)
+    private static func groupBytesIdentical(_ a: [QueryTerm], _ b: [QueryTerm]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { $0.bytes == $1.bytes }
+    }
+
+    private static func generalFiltersIdentical(_ a: ParsedQuery, _ b: ParsedQuery) -> Bool {
+        // content:/tag: DELIBERATELY excluded — general() ignores them (post-filters applied in
+        // search()), so the cached general match set is independent of their value. This is a
+        // feature: typing the content needle does not invalidate the name-set cache.
+        a.exts == b.exts && a.notExts == b.notExts
+            && a.typeMasks == b.typeMasks && a.notTypeMasks == b.notTypeMasks
+            && a.sizes.elementsEqual(b.sizes, by: ==) && a.notSizes.elementsEqual(b.notSizes, by: ==)
+            && a.dateFrom == b.dateFrom && a.dateTo == b.dateTo
+            && a.notDateRanges.elementsEqual(b.notDateRanges, by: ==)
+            && a.onlyDirs == b.onlyDirs && a.onlyFiles == b.onlyFiles
+            && a.wholeWord == b.wholeWord && a.dupesOnly == b.dupesOnly
+            && a.emptyDirsOnly == b.emptyDirsOnly
+            && a.lenFilters.elementsEqual(b.lenFilters, by: ==)
+            && a.prefixes == b.prefixes && a.suffixes == b.suffixes
+            && a.notPrefixes == b.notPrefixes && a.notSuffixes == b.notSuffixes
+    }
+
     // MARK: - general evaluator (modes, filters, multi-term, NOT, path, relevance)
 
-    private func general(parsed: ParsedQuery, mode: MatchMode, sortKey: SortKey, ascending: Bool,
-                         limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
+    private func general(parsed: ParsedQuery, mode: MatchMode, scope: SearchScope, sortKey: SortKey,
+                         ascending: Bool, limit: Int, start: ContinuousClock.Instant, clock: ContinuousClock,
                          scopeRoot: Int32?, frecency: [Int32: Double] = [:],
                          now: TimeInterval = 0) -> SearchResults {
         let relevance = (sortKey == .relevance)
+        // [23] narrow eligibility: never for relevance (OI-1 — pruned per-chunk sets are never the
+        // FULL match set). Attr-dependent filters/sorts (MUST-FIX 2, §2) additionally require the
+        // cached attrSeq to still match — computed once, used by both consume and store below.
+        let attrDependentFilters =
+               !parsed.sizes.isEmpty || !parsed.notSizes.isEmpty
+            || parsed.dateFrom != nil || parsed.dateTo != nil
+            || !parsed.notDateRanges.isEmpty
+        let attrDependentSort = (sortKey == .size || sortKey == .dateModified || sortKey == .dateCreated)
+        let attrDependent = attrDependentFilters || attrDependentSort
+        // Codex B2 TOCTOU: sample the option flags ONCE — the gate compare, the term
+        // compilation, and the cache store below must all see the SAME values, or a toggle
+        // landing mid-search labels a cache computed under different semantics.
+        let wnwOpt = wholeNameWildcards, ufsOpt = useFolderSizes
+        // liveBuildGen: type:/empty: filters read typeClass/CSR, whose sentinel→authoritative
+        // fill (buildLiveIndexes) moves NO other gen — gate those queries on it (Codex B2).
+        let sentinelDependent = !parsed.typeMasks.isEmpty || !parsed.notTypeMasks.isEmpty
+                             || parsed.emptyDirsOnly
+        var narrowBase: [Int32]? = nil
+        if !relevance {
+            let epoch = index.epochLocked, structSeq = index.structSeqLocked, attrSeq = index.attrSeqLocked
+            let liveGen = index.liveBuildGenLocked
+            genNarrowLock.lock()
+            if gnValid, gnEpoch == epoch, gnStructSeen == structSeq,
+               (!attrDependent || gnAttrSeen == attrSeq),
+               (!sentinelDependent || gnLiveBuildSeen == liveGen),           // Codex B2
+               gnMode == mode, gnScope == scope, gnScopeRoot == scopeRoot,
+               gnSortKey == sortKey, gnAscending == ascending,
+               gnWholeNameWildcards == wnwOpt,                                // SHOULD-FIX 3
+               (sortKey != .size || gnUseFolderSizes == ufsOpt),             // SHOULD-FIX 3
+               isGeneralRefinement(old: gnParsed, new: parsed, mode: mode) {
+                narrowBase = gnIDs                       // COW O(1) grab; predicate ran under the lock
+            }
+            genNarrowLock.unlock()
+            narrowBase != nil ? bumpGnHit() : bumpGnFull()
+        }
         // Recency boost for relevance (ProFind's trick, via the FAF author): what you search
         // for is disproportionately something you JUST worked with, so recently-modified
         // files get a bounded bump. Precomputed step thresholds (ns) so the per-candidate
@@ -1189,7 +1416,10 @@ public final class SearchEngine: @unchecked Sendable {
         // match score BEFORE the top-K prune (Codex review: boosting after prune is too
         // late). log2 keeps it from swamping match quality; only touches matched ids.
         let boostOn = relevance && !frecency.isEmpty
-        let order = orderArray(for: scanOrderKey(sortKey))
+        // [23] scan source: the narrow base when eligible (already in returned order — no cold
+        // orderArray call), else the ordinary cached order array.
+        let narrowing = narrowBase != nil
+        let order = narrowBase ?? orderArray(for: scanOrderKey(sortKey))
         let n = order.count
         let caseSensitive = parsed.caseSensitive
         // Flatten term bytes into one contiguous buffer + trivial refs so the hot loop
@@ -1205,7 +1435,7 @@ public final class SearchEngine: @unchecked Sendable {
             for t in g {
                 var bytes = t.bytes
                 let willGlob = (t.isGlob && mode == .exact) || mode == .wildcard
-                if !wholeNameWildcards, willGlob, !bytes.isEmpty {
+                if !wnwOpt, willGlob, !bytes.isEmpty {   // entry-sampled (TOCTOU)
                     if bytes.first != star { bytes.insert(star, at: 0) }
                     if bytes.last != star { bytes.append(star) }
                 }
@@ -1339,7 +1569,10 @@ public final class SearchEngine: @unchecked Sendable {
                     let dp = DPScratchPtrs(prev: dpv, curr: dcv, prevStart: dpvs, currStart: dcvs,
                                            prevRun: dpvr, currRun: dcvr)
                     for k in lo..<hi {
-                        let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
+                        // narrowBase is ALREADY in returned order (ascending baked in when it was
+                        // produced), so no flip; the cold order array is ascending and flips for
+                        // descending (unchanged behavior).
+                        let id = narrowing ? Int(ordB[k]) : Int(ascending ? ordB[k] : ordB[n - 1 - k])
                         if delB[id] { continue }   // defensive: skip tombstones even if order is stale
                         // character bloom prefilter: reject before any byte scan when the
                         // name can't possibly contain the needle's characters (cheapest,
@@ -1639,6 +1872,26 @@ public final class SearchEngine: @unchecked Sendable {
         } else {
             out = []; out.reserveCapacity(min(total, limit))
             outer: for c in 0..<nChunks { for id in chunkIDs[c] { if out.count >= limit { break outer }; out.append(id) } }
+        }
+        // [23] store: only a NON-relevance, UNTRUNCATED (`out` IS the full set) result seeds the
+        // next keystroke's narrow. Read the gens again here (still under the same inherited read
+        // lock general() ran under — Codex/skeleton note: the whole call is one lock acquisition,
+        // so this is the SAME snapshot the consume gate above compared against).
+        if !relevance {
+            genNarrowLock.lock()
+            if total == out.count, total <= Self.incMaxCacheIDs {
+                gnValid = true
+                gnIDs = out                       // returned order
+                gnParsed = parsed; gnMode = mode; gnScope = scope; gnScopeRoot = scopeRoot
+                gnSortKey = sortKey; gnAscending = ascending
+                gnWholeNameWildcards = wnwOpt; gnUseFolderSizes = ufsOpt   // entry-sampled (TOCTOU)
+                gnEpoch = index.epochLocked; gnStructSeen = index.structSeqLocked
+                gnAttrSeen = index.attrSeqLocked; gnAttrDependent = attrDependent
+                gnLiveBuildSeen = index.liveBuildGenLocked
+            } else {
+                gnValid = false                    // truncated or over-bound → do not seed a partial set
+            }
+            genNarrowLock.unlock()
         }
         return SearchResults(ids: out, total: total, truncated: total > out.count,
                              queryMillis: secondsBetween(start, clock.now) * 1000)

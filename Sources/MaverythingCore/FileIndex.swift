@@ -412,8 +412,16 @@ public final class FileIndex: @unchecked Sendable {
     /// no path string is ever materialized (FNV-1a streams left-to-right, and a
     /// child's display path is parentPath + "/" + name), so the only transient is
     /// one UInt64 per entry instead of an array of every directory path string.
+    // Bumped by every buildLiveIndexes: the sentinel→authoritative transition for
+    // typeClass/nameMask/camelBits (and the CSR rebuild) changes type:/empty: filter RESULTS
+    // without any epoch/structSeq/attrSeq movement — caches keyed on those gens alone would
+    // go stale across it (Codex B2 review: a -type: query cached against sentinel typeClass).
+    private var liveBuildGenValue = 0
+    var liveBuildGenLocked: Int { liveBuildGenValue }   // caller holds a lock
+
     public func buildLiveIndexes() {
         wrlock(); defer { unlock() }
+        liveBuildGenValue &+= 1
         let n = nameOff.count
         dirIndexByHash.removeAll(keepingCapacity: true)
         computeNameMasksLocked(n)

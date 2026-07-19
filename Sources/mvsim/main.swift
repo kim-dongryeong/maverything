@@ -1062,6 +1062,534 @@ check("regex: invalid pattern → no crash, empty", engine.search("[", mode: .re
 // empty query returns everything
 check("empty query returns all \(index.count)", engine.search("", limit: 1_000_000, now: now).total == index.count)
 
+// ---- SPEC-B2-FINAL: [23] general-path incremental narrowing + [34] regex off-lock chunked scan ----
+// Fully isolated corpus/index/engine (mirrors inc13Block's isolation) so these tests don't disturb
+// the shared `index`/`engine` fixture used above and below.
+narrowB2Block: do {
+    let nRoot = root + "/narrowB2"; mkdir(nRoot)
+
+    // O1 corpus: a filtered extension chain (`ext:txt` forces the general() path — a bare term
+    // would take the fastExact/incLock fast path instead, which is NOT what [23] narrows).
+    writeAbs(nRoot + "/report1.txt", bytes: 10)
+    writeAbs(nRoot + "/report12.txt", bytes: 10)
+    writeAbs(nRoot + "/report123.txt", bytes: 10)
+    writeAbs(nRoot + "/report1_other.md", bytes: 10)      // wrong ext — excluded by ext:txt
+    // MUST-FIX 1 (ww:) family: trailing-word-byte chain + a real whole-word occurrence.
+    writeAbs(nRoot + "/foo", bytes: 3)
+    writeAbs(nRoot + "/foob", bytes: 3)
+    writeAbs(nRoot + "/foobar", bytes: 3)
+    writeAbs(nRoot + "/foo.txt", bytes: 3)
+    // O2c wildcard-anchoring fixture (`mic?o` anchored vs. star-wrapped).
+    writeAbs(nRoot + "/microsoft.txt", bytes: 3)
+    // O2c useFolderSizes fixture (a real directory to sort by folder-vs-raw size).
+    writeAbs(nRoot + "/sizefx/inner_sizefx.dat", bytes: 50)
+    // O2 attr-dependent FILTER fixture.
+    writeAbs(nRoot + "/attrq/target.bin", bytes: 100)
+    writeAbs(nRoot + "/attrq/other.bin", bytes: 100)
+    // O2b attr-dependent SORT fixture: both contain "report" AND "zzq" (so extending "zz" to
+    // "zzq" keeps BOTH matching — needed to observe an ORDER change, not just a set change).
+    // "zz"/"zzq" (not "x"/"xy"): every ".txt" name in this corpus already contains the letter
+    // "x" (from the extension itself), which would make an "x" term match everything.
+    writeAbs(nRoot + "/sortattr/report_zzq_a.txt", bytes: 5, mtime: now - 100)
+    writeAbs(nRoot + "/sortattr/report_zzq_b.txt", bytes: 5, mtime: now - 50)
+
+    let nIdx = FileIndex()
+    _ = FileEnumerator(index: nIdx).crawl(roots: [nRoot], exclude: [], mountPoints: [])
+    nIdx.buildLiveIndexes()
+    let nEng = SearchEngine(index: nIdx)
+    nEng.useFolderSizes = false
+    let nRec = Reconciler(index: nIdx, exclude: [])
+
+    func coldNames(_ q: String, mode: MatchMode = .exact, sortKey: SortKey = .name,
+                   ascending: Bool = true, scopeRoot: Int32? = nil) -> [Int32] {
+        let e = SearchEngine(index: nIdx); e.useFolderSizes = false
+        return e.search(q, mode: mode, sortKey: sortKey, ascending: ascending,
+                        limit: 100_000, now: now, scopeRoot: scopeRoot).ids
+    }
+    func coldNamesOpt(_ q: String, mode: MatchMode = .exact, wnw: Bool? = nil, fs: Bool? = nil,
+                      sortKey: SortKey = .name) -> [Int32] {
+        let e = SearchEngine(index: nIdx)
+        e.useFolderSizes = fs ?? false
+        if let wnw { e.wholeNameWildcards = wnw }
+        return e.search(q, mode: mode, sortKey: sortKey, limit: 100_000, now: now).ids
+    }
+    @discardableResult
+    func warm(_ q: String, mode: MatchMode = .exact, sortKey: SortKey = .name,
+             ascending: Bool = true, scopeRoot: Int32? = nil) -> SearchResults {
+        nEng.search(q, mode: mode, sortKey: sortKey, ascending: ascending,
+                    limit: 100_000, now: now, scopeRoot: scopeRoot)
+    }
+
+    // ---- O1: sequential query-extension equivalence (load-bearing) ----
+    nEng._debugResetNarrowStats()
+    let s1 = warm("report1 ext:txt")
+    check("[23] O1 base 'report1 ext:txt' warm == cold", s1.ids == coldNames("report1 ext:txt"))
+    let s2 = warm("report12 ext:txt")
+    check("[23] O1 extend 'report12 ext:txt' warm == cold", s2.ids == coldNames("report12 ext:txt"))
+    let s3 = warm("report123 ext:txt")
+    check("[23] O1 extend 'report123 ext:txt' warm == cold", s3.ids == coldNames("report123 ext:txt"))
+    let statsExt = nEng._debugNarrowStats()
+    // s1 is a COLD start (nothing cached yet) — always counted as a full scan; only s2/s3 (the
+    // actual extensions) must be narrow hits.
+    check("[23] O1 pure-extension run produced narrow hits, exactly one cold-start full scan",
+          statsExt.hits >= 2 && statsExt.full == 1, "hits=\(statsExt.hits) full=\(statsExt.full)")
+
+    // WIDENING (shorten) must fall back to a full scan and still equal cold.
+    nEng._debugResetNarrowStats()
+    let s4 = warm("report1 ext:txt")   // shorten back from "report123" — NOT a refinement
+    check("[23] O1 shorten forces a full scan", nEng._debugNarrowStats().full >= 1)
+    check("[23] O1 shorten result warm == cold", s4.ids == coldNames("report1 ext:txt"))
+
+    // addFilter (OI-3): byte-identical terms + a newly-added filter must ALSO fall back. Uses a
+    // 2-group query so the "no filter" baseline ALSO routes through general() (a single bare term
+    // would take the fastExact/incLock fast path instead, which never touches the [23] gn-cache).
+    nEng._debugResetNarrowStats()
+    _ = warm("report1 report")
+    let s5 = warm("report1 report ext:txt")
+    check("[23] O1 addFilter forces a full scan (OI-3: no filter-superset narrowing)",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O1 addFilter result warm == cold", s5.ids == coldNames("report1 report ext:txt"))
+
+    // toggleNegation: a structural sign flip must fall back (never a refinement of itself).
+    nEng._debugResetNarrowStats()
+    _ = warm("report1 ext:txt")
+    let s6 = warm("-report1 ext:txt")
+    check("[23] O1 toggleNegation forces a full scan", nEng._debugNarrowStats().full >= 1)
+    check("[23] O1 toggleNegation result warm == cold", s6.ids == coldNames("-report1 ext:txt"))
+
+    // MUST-FIX 1 (ww:): prefix extension under whole-word matching is NON-MONOTONE — must NOT
+    // narrow, or a newly-whole-word name (`foob`) would be silently dropped.
+    nEng._debugResetNarrowStats()
+    let wwA = warm("foo ww:")
+    check("[23] MUST-FIX1 base 'foo ww:' warm == cold", wwA.ids == coldNames("foo ww:"))
+    let wwB = warm("foob ww:")
+    check("[23] MUST-FIX1 'foob ww:' finds foob (not dropped by an unsafe prefix-narrow)",
+          wwB.ids.map { nIdx.name(Int($0)) }.contains("foob"))
+    check("[23] MUST-FIX1 'foob ww:' warm == cold", wwB.ids == coldNames("foob ww:"))
+    check("[23] MUST-FIX1 extend under ww: was a FULL scan (no unsafe narrow hit)",
+          nEng._debugNarrowStats().full >= 1)
+    // Same property for a path-scope ww: term (exercises the `tr.isPath` branch too).
+    nEng._debugResetNarrowStats()
+    let wwPathA = warm("path:foo ww:")
+    check("[23] MUST-FIX1 base 'path:foo ww:' warm == cold", wwPathA.ids == coldNames("path:foo ww:"))
+    let wwPathB = warm("path:foob ww:")
+    check("[23] MUST-FIX1 'path:foob ww:' finds foob",
+          wwPathB.ids.map { nIdx.name(Int($0)) }.contains("foob"))
+    check("[23] MUST-FIX1 'path:foob ww:' warm == cold", wwPathB.ids == coldNames("path:foob ww:"))
+    check("[23] MUST-FIX1 path ww: extend was a FULL scan",
+          nEng._debugNarrowStats().full >= 1)
+
+    // ---- O2: attr-dependent FILTER staleness (red-team #3) ----
+    let sizeQ = "target size:>500"
+    nEng._debugResetNarrowStats()
+    let o2a = warm(sizeQ)
+    check("[23] O2 base 'target size:>500' (no match yet) warm == cold",
+          o2a.ids == coldNames(sizeQ) && o2a.ids.isEmpty)
+    // reconcile's `eventPaths` only re-lists the GIVEN directory (plus recursing into brand-new
+    // subdirs) — an attr change to a file nested under `nRoot` is invisible unless we hand it the
+    // file's ACTUAL parent directory (`attrq/`), not the outer `nRoot`.
+    var tvGrow1 = [timeval(tv_sec: Int(now) + 1, tv_usec: 0), timeval(tv_sec: Int(now) + 1, tv_usec: 0)]
+    FileManager.default.createFile(atPath: nRoot + "/attrq/target.bin", contents: Data(count: 1000))
+    _ = utimes(nRoot + "/attrq/target.bin", &tvGrow1)
+    _ = nRec.reconcile(eventPaths: [nRoot + "/attrq"])      // attr-only: attrSeq bumps, structSeq doesn't
+    nEng._debugResetNarrowStats()
+    let o2b = warm(sizeQ)                                   // byte-identical query across the attr churn
+    check("[23] O2 attr-only growth invalidates the size: narrow (MUST-FIX2 attrSeq gate)",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O2 attr-only growth: newly-matching target.bin now appears",
+          o2b.ids.map { nIdx.name(Int($0)) }.contains("target.bin"))
+    check("[23] O2 attr-only growth result warm == cold", o2b.ids == coldNames(sizeQ))
+    // Contrast: a NON-attr-dependent filter query across the SAME churn must still narrow.
+    _ = warm("target ext:bin")
+    var tvGrow2 = [timeval(tv_sec: Int(now) + 2, tv_usec: 0), timeval(tv_sec: Int(now) + 2, tv_usec: 0)]
+    FileManager.default.createFile(atPath: nRoot + "/attrq/target.bin", contents: Data(count: 2000))
+    _ = utimes(nRoot + "/attrq/target.bin", &tvGrow2)
+    _ = nRec.reconcile(eventPaths: [nRoot + "/attrq"])
+    nEng._debugResetNarrowStats()
+    let o2c = warm("target ext:bin")
+    check("[23] O2 contrast: non-attr filter narrows across attr churn (no over-invalidation)",
+          nEng._debugNarrowStats().hits >= 1 && nEng._debugNarrowStats().full == 0)
+    check("[23] O2 contrast result warm == cold", o2c.ids == coldNames("target ext:bin"))
+
+    // ---- O2b: attr-dependent SORT staleness across an attr-only mutation (MUST-FIX 2) ----
+    // "zz"/"zzq" (not "x"/"xy") — the fixture is full of ".txt" names, and ".txt" itself contains
+    // the letter "x", so an "x" term would spuriously match every .txt file in the corpus.
+    nEng._debugResetNarrowStats()
+    let o2bBase = warm("report zz", sortKey: .dateModified)
+    check("[23] O2b base 'report zz' dateModified asc warm == cold",
+          o2bBase.ids == coldNames("report zz", sortKey: .dateModified))
+    let namesBase = o2bBase.ids.map { nIdx.name(Int($0)) }
+    check("[23] O2b base order is [report_zzq_a.txt, report_zzq_b.txt]",
+          namesBase == ["report_zzq_a.txt", "report_zzq_b.txt"], namesBase.joined(separator: ","))
+    // reconcile needs the mutated file's ACTUAL parent dir (`sortattr/`), not the outer `nRoot`.
+    var tvA = [timeval(tv_sec: Int(now) + 10_000, tv_usec: 0), timeval(tv_sec: Int(now) + 10_000, tv_usec: 0)]
+    _ = utimes(nRoot + "/sortattr/report_zzq_a.txt", &tvA)   // attr-only: pushes a's mtime past b's
+    _ = nRec.reconcile(eventPaths: [nRoot + "/sortattr"])
+    nEng._debugResetNarrowStats()
+    let o2bExt = warm("report zzq", sortKey: .dateModified)  // extend "zz" -> "zzq" — both still match
+    check("[23] O2b MUST-FIX2: attr-sort staleness forces a full scan on extend",
+          nEng._debugNarrowStats().full >= 1)
+    let namesExt = o2bExt.ids.map { nIdx.name(Int($0)) }
+    check("[23] O2b MUST-FIX2: re-sorted order reflects the new mtime (b, then a)",
+          namesExt == ["report_zzq_b.txt", "report_zzq_a.txt"], namesExt.joined(separator: ","))
+    check("[23] O2b MUST-FIX2 result warm == cold",
+          o2bExt.ids == coldNames("report zzq", sortKey: .dateModified))
+    // Contrast: the SAME attr churn under a `.name` sort must still narrow ([13] decoupling).
+    _ = warm("report zz", sortKey: .name)
+    var tvA2 = [timeval(tv_sec: Int(now) + 20_000, tv_usec: 0), timeval(tv_sec: Int(now) + 20_000, tv_usec: 0)]
+    _ = utimes(nRoot + "/sortattr/report_zzq_a.txt", &tvA2)
+    _ = nRec.reconcile(eventPaths: [nRoot + "/sortattr"])
+    nEng._debugResetNarrowStats()
+    _ = warm("report zzq", sortKey: .name)
+    check("[23] O2b contrast: .name sort not invalidated by attr churn (decoupling preserved)",
+          nEng._debugNarrowStats().hits >= 1 && nEng._debugNarrowStats().full == 0)
+
+    // ---- O2c: engine-option cache-key isolation (SHOULD-FIX 3) ----
+    nEng.wholeNameWildcards = true
+    nEng._debugResetNarrowStats()
+    let wcOnA = warm("mic?o", mode: .wildcard)
+    check("[23] O2c wholeNameWildcards ON: anchored glob doesn't match microsoft.txt",
+          !wcOnA.ids.map { nIdx.name(Int($0)) }.contains("microsoft.txt"))
+    nEng.wholeNameWildcards = false
+    nEng._debugResetNarrowStats()
+    let wcOffA = warm("mic?o", mode: .wildcard)              // byte-identical query, option flipped
+    check("[23] O2c wholeNameWildcards flip forced a full scan (no stale anchored hit)",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O2c wholeNameWildcards OFF: unanchored glob now matches microsoft.txt",
+          wcOffA.ids.map { nIdx.name(Int($0)) }.contains("microsoft.txt"))
+    check("[23] O2c wholeNameWildcards OFF result warm == cold",
+          wcOffA.ids == coldNamesOpt("mic?o", mode: .wildcard, wnw: false))
+    nEng.wholeNameWildcards = true
+
+    nEng.useFolderSizes = false
+    nEng._debugResetNarrowStats()
+    _ = warm("folder:sizefx", sortKey: .size)
+    nEng.useFolderSizes = true
+    nEng._debugResetNarrowStats()
+    let fsFlipped = warm("folder:sizefx", sortKey: .size)    // byte-identical query, option flipped
+    check("[23] O2c useFolderSizes flip forced a full scan for .size sort",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O2c useFolderSizes flip result warm == cold",
+          fsFlipped.ids == coldNamesOpt("folder:sizefx", fs: true, sortKey: .size))
+    nEng.useFolderSizes = false
+    // Contrast: the SAME flip must NOT invalidate a `.name`-sorted narrow (key only gates `.size`).
+    _ = warm("folder:sizefx", sortKey: .name)
+    nEng.useFolderSizes = true
+    nEng._debugResetNarrowStats()
+    _ = warm("folder:sizefx", sortKey: .name)
+    check("[23] O2c useFolderSizes flip does NOT invalidate a .name-sorted narrow",
+          nEng._debugNarrowStats().hits >= 1 && nEng._debugNarrowStats().full == 0)
+    nEng.useFolderSizes = false
+
+    // ---- O3: mode/relevance cache-key isolation (red-team #6) ----
+    nEng._debugResetNarrowStats()
+    _ = warm("report1 ext:txt", mode: .exact)
+    let o3Wild = warm("report1 ext:txt", mode: .wildcard)    // same text, different mode
+    check("[23] O3 mode switch (exact→wildcard) forces a full scan (key includes mode)",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O3 wildcard result warm == cold", o3Wild.ids == coldNames("report1 ext:txt", mode: .wildcard))
+    nEng._debugResetNarrowStats()
+    let o3Fuzzy = warm("report1 ext:txt", mode: .fuzzy)
+    check("[23] O3 mode switch (wildcard→fuzzy) forces a full scan",
+          nEng._debugNarrowStats().full >= 1)
+    check("[23] O3 fuzzy result warm == cold", o3Fuzzy.ids == coldNames("report1 ext:txt", mode: .fuzzy))
+    // relevance: never populates/consumes the narrow cache (OI-1).
+    nEng._debugResetNarrowStats()
+    _ = warm("report1 ext:txt", sortKey: .relevance)
+    let o3Rel = warm("report12 ext:txt", sortKey: .relevance)
+    let relStats = nEng._debugNarrowStats()
+    check("[23] O3 relevance queries never hit the narrow cache", relStats.hits == 0, "hits=\(relStats.hits)")
+    check("[23] O3 relevance result warm == cold (ids, order, total)",
+          o3Rel.ids == coldNames("report12 ext:txt", sortKey: .relevance))
+
+    // ---- O4: [34] regex A/B vs. a reference scan built independently of regexSearch ----
+    // Reuses the already-verified "" (empty query) name order as the candidate SOURCE, then
+    // applies the regex filter with a plain per-candidate loop — independent of the chunked,
+    // off-lock implementation under test.
+    func referenceRegex(_ pattern: String, scope: SearchScope = .nameOnly, scopeRoot: Int32? = nil) -> [Int32] {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let base = SearchEngine(index: nIdx).search("", sortKey: .name, limit: 1_000_000, now: now,
+                                                     scopeRoot: scopeRoot).ids
+        var out: [Int32] = []
+        for id in base {
+            let i = Int(id)
+            let s = scope == .fullPath ? nIdx.path(i) : nIdx.name(i)
+            let r = NSRange(s.startIndex..., in: s)
+            if re.firstMatch(in: s, options: [], range: r) != nil { out.append(id) }
+        }
+        return out
+    }
+    let regexBattery: [(String, SearchScope)] = [
+        ("^report1\\.txt$", .nameOnly),
+        ("report1|foobar", .nameOnly),
+        ("FOO$", .nameOnly),              // case-insensitivity
+        ("\\.bin$", .fullPath),
+    ]
+    for (pat, sc) in regexBattery {
+        let got = nEng.search(pat, mode: .regex, scope: sc, sortKey: .name, limit: 100_000, now: now).ids
+        let want = referenceRegex(pat, scope: sc)
+        check("[34] O4 regex '\(pat)' scope=\(sc) matches reference",
+              got == want, "got=\(got.count) want=\(want.count)")
+    }
+    // Tombstone parity: a deleted match must not survive the final-emit delB re-filter.
+    // reconcile needs the file's ACTUAL parent dir (`attrq/`), not the outer `nRoot`.
+    try? fm.removeItem(atPath: nRoot + "/attrq/target.bin")
+    _ = nRec.reconcile(eventPaths: [nRoot + "/attrq"])
+    let afterDel = nEng.search("target", mode: .regex, sortKey: .name, limit: 100_000, now: now).ids
+    check("[34] O4 tombstone parity: deleted file excluded from regex result",
+          !afterDel.map { nIdx.name(Int($0)) }.contains("target.bin"))
+    check("[34] O4 tombstone parity matches reference after delete",
+          afterDel == referenceRegex("target"))
+    // scopeRoot parity: a subtree-scoped regex equals the reference restricted to isUnder(root).
+    if let attrqDir = nIdx.dirIndex(forPath: nRoot + "/attrq") {
+        let scoped = nEng.search("bin", mode: .regex, sortKey: .name,
+                                 limit: 10_000, now: now, scopeRoot: attrqDir).ids
+        let wantScoped = referenceRegex("bin", scopeRoot: attrqDir)
+        check("[34] O4 scopeRoot parity: subtree-scoped regex == reference restricted to isUnder(root)",
+              scoped == wantScoped, "got=\(scoped.count) want=\(wantScoped.count)")
+    }
+
+    try? fm.removeItem(atPath: nRoot)
+
+    // ---- O5: [34] writer-starvation proxy (lock-hold time) ----
+    // A larger corpus + a deterministic, terminating but moderately-backtracking pattern with NO
+    // matches (so total wall time is dominated by the OFF-LOCK match phase, not result assembly).
+    final class NarrowB2Flag {
+        private let lock = NSLock(); private var v = false
+        func set() { lock.lock(); v = true; lock.unlock() }
+        func get() -> Bool { lock.lock(); defer { lock.unlock() }; return v }
+    }
+    func ms(_ a: ContinuousClock.Instant, _ b: ContinuousClock.Instant) -> Double {
+        let d = a.duration(to: b)
+        return Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) * 1e-15
+    }
+    func fastWriteB2(_ p: String, bytes: Int) {
+        let fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        guard fd >= 0 else { return }
+        if bytes > 0 { let buf = [UInt8](repeating: 1, count: bytes); _ = buf.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, bytes) } }
+        close(fd)
+    }
+    let bigRoot = root + "/narrowB2big"; mkdir(bigRoot)
+    for i in 0..<70_000 { fastWriteB2(bigRoot + "/f\(i)_nomatchtrailb.dat", bytes: 4) }
+    fastWriteB2(bigRoot + "/aab_target.dat", bytes: 4)      // the ONE name (a|a)+b actually matches
+    let bigIdx = FileIndex()
+    _ = FileEnumerator(index: bigIdx).crawl(roots: [bigRoot], exclude: [], mountPoints: [])
+    bigIdx.buildLiveIndexes()
+    let bigEng = SearchEngine(index: bigIdx); bigEng.useFolderSizes = false
+    let slowPattern = "(a|a)+b"
+
+    let scanDone = NarrowB2Flag()
+    DispatchQueue.global().async {
+        _ = bigEng.search(slowPattern, mode: .regex, sortKey: .name, limit: 100_000, now: now)
+        scanDone.set()
+    }
+    Thread.sleep(forTimeInterval: 0.02)          // let the scan grab its first chunk
+    // Probe pure LOCK-acquisition wait with `bumpMutation()` (wrlock; O(1) body) rather than a
+    // full reconcile — reconcile's own O(n) directory-listing cost (70k entries) would dominate
+    // the measurement and swamp the lock-contention signal this oracle is actually after.
+    let wt0 = ContinuousClock().now
+    bigIdx.bumpMutation()                         // needs the WRITE lock — times how long it's blocked
+    let wt1 = ContinuousClock().now
+    let writerWaitMs = ms(wt0, wt1)
+    while !scanDone.get() { Thread.sleep(forTimeInterval: 0.005) }
+
+    let fscan0 = ContinuousClock().now
+    _ = bigEng.search(slowPattern, mode: .regex, sortKey: .name, limit: 100_000, now: now)
+    let fscan1 = ContinuousClock().now
+    let fullScanMs = ms(fscan0, fscan1)
+    check("[34] O5 writer not blocked until scan end (writerWait << fullScan)",
+          writerWaitMs < max(fullScanMs / 4, 20), "writerWait=\(writerWaitMs)ms fullScan=\(fullScanMs)ms")
+
+    // isStale abort: telling the scan it's already superseded must return promptly with a
+    // coherent partial result (a subset of the true match set, in order).
+    let staleFlag = NarrowB2Flag(); staleFlag.set()
+    let abortStart = ContinuousClock().now
+    let aborted = bigEng.search(slowPattern, mode: .regex, sortKey: .name, limit: 100_000, now: now,
+                                isStale: { staleFlag.get() })
+    let abortMs = ms(abortStart, ContinuousClock().now)
+    check("[34] O5 isStale abort returns promptly", abortMs < fullScanMs / 2 + 20,
+          "abortMs=\(abortMs)ms fullScan=\(fullScanMs)ms")
+    let trueMatches = Set(bigEng.search(slowPattern, mode: .regex, sortKey: .name, limit: 100_000, now: now).ids)
+    check("[34] O5 isStale abort result is a coherent subset of the true match set",
+          Set(aborted.ids).isSubset(of: trueMatches))
+
+    try? fm.removeItem(atPath: bigRoot)
+}
+
+// ---- O1-random: [23] seeded-LCG random query-EXTENSION sequences vs a COLD engine ----
+// Mirrors inc13Block's LCG harness (main.swift ~:443). Unlike the hand-picked O1 keystrokes
+// above, this drives ~30 random edits per seed across 5 seeds, on a PERSISTENT engine (so the
+// [23] narrow cache accumulates across steps, exactly like real typing), asserting after EVERY
+// step that warm (narrowed-or-full, whichever the engine picked) == cold (fresh SearchEngine,
+// no cache) on ids, order, AND total. This includes edit classes the spec DISABLES narrowing
+// for (addFilter/toggleNegation/insertSpace/shortenTerm/wildcard-ify/ww:) — they must still be
+// correct via the full-scan fallback, not just the narrow-hit path.
+narrowB2RandomBlock: do {
+    let rRoot = root + "/narrowB2rand"; mkdir(rRoot)
+    let rExts = ["txt", "md", "dat", "bin", "log"]
+    for i in 0..<60 {
+        let e = rExts[i % rExts.count]
+        writeAbs(rRoot + "/item\(i)_alpha\(i % 7)beta.\(e)", bytes: 4 + (i * 37) % 5000,
+                mtime: now - Double((i * 131) % 100_000))
+    }
+    for d in 0..<4 {
+        mkdir(rRoot + "/sub\(d)")
+        for i in 0..<8 {
+            let e = rExts[(i + d) % rExts.count]
+            writeAbs(rRoot + "/sub\(d)/nested\(d)_\(i)_gamma.\(e)", bytes: 4 + i * 17,
+                    mtime: now - Double(i * 500))
+        }
+    }
+    writeAbs(rRoot + "/pic_report.jpg", bytes: 10)
+    writeAbs(rRoot + "/pic_report.png", bytes: 10)
+    writeAbs(rRoot + "/notes_final.md", bytes: 10)
+    writeAbs(rRoot + "/notes_draft.md", bytes: 10)
+    // MUST-FIX 1 (ww:) family + OR-alternation-friendly names, so the random sequence can land
+    // on the narrowing-DISABLED classes (whole-word, glob, OR-group) too.
+    writeAbs(rRoot + "/word.txt", bytes: 3)
+    writeAbs(rRoot + "/words.txt", bytes: 3)
+    writeAbs(rRoot + "/wordsmith.txt", bytes: 3)
+
+    let rIdx = FileIndex()
+    _ = FileEnumerator(index: rIdx).crawl(roots: [rRoot], exclude: [], mountPoints: [])
+    rIdx.buildLiveIndexes()
+    let rEng = SearchEngine(index: rIdx); rEng.useFolderSizes = false
+
+    func rCold(_ q: String, mode: MatchMode, sortKey: SortKey, ascending: Bool) -> SearchResults {
+        let e = SearchEngine(index: rIdx); e.useFolderSizes = false
+        return e.search(q, mode: mode, sortKey: sortKey, ascending: ascending, limit: 100_000, now: now)
+    }
+
+    let alnum = Array("abcdefghijklmnopqrstuvwxyz0123456789")
+    let sortKeys: [(SortKey, Bool)] = [(.name, true), (.name, false), (.size, true), (.dateModified, true)]
+    let modes: [MatchMode] = [.exact, .fuzzy, .wildcard]
+    let baseTemplates = ["item ext:txt", "alpha ext:dat", "gamma", "report", "notes", "pic",
+                         "word ww:", "wordsmith|pic"]
+
+    var totalRandomSteps = 0
+    for seed: UInt64 in [11, 22, 33, 44, 55] {
+        var lcg: UInt64 = seed &* 0x2545F4914F6CDD1D &+ 0x9E3779B97F4A7C15
+        func rnd() -> UInt64 { lcg = lcg &* 6364136223846793005 &+ 1442695040888963407; return lcg >> 16 }
+        func rndInt(_ m: Int) -> Int { Int(rnd() % UInt64(max(1, m))) }
+
+        var terms: [String] = [baseTemplates[rndInt(baseTemplates.count)]]
+        let mode = modes[rndInt(modes.count)]
+        let (sortKey, ascending) = sortKeys[rndInt(sortKeys.count)]
+        func currentQuery() -> String { terms.joined(separator: " ") }
+
+        // Seed the cache with the base query (this first call is necessarily a cold start).
+        _ = rEng.search(currentQuery(), mode: mode, sortKey: sortKey, ascending: ascending,
+                        limit: 100_000, now: now)
+
+        for step in 0..<30 {
+            let op = rndInt(7)
+            switch op {
+            case 0:                                   // extendLastTerm
+                if var last = terms.popLast() {
+                    if !last.contains(":") && !last.contains("|") && !last.hasPrefix("-") {
+                        last.append(alnum[rndInt(alnum.count)])
+                    }
+                    terms.append(last)
+                }
+            case 1:                                   // addTerm — new positive plain term
+                terms.append(String(alnum[rndInt(alnum.count)]))
+            case 2:                                   // addFilter — toggle ext:; EXPECT full scan
+                if terms.contains(where: { $0.hasPrefix("ext:") }) {
+                    terms.removeAll { $0.hasPrefix("ext:") }
+                } else {
+                    terms.append("ext:\(rExts[rndInt(rExts.count)])")
+                }
+            case 3:                                   // toggleNegation — WIDENS; EXPECT full scan
+                if var last = terms.popLast() {
+                    if last.hasPrefix("-") { last.removeFirst() }
+                    else if !last.contains(":") && !last.contains("|") { last = "-" + last }
+                    terms.append(last)
+                }
+            case 4:                                   // insertSpace — split last term in two
+                if let last = terms.popLast() {
+                    if last.count > 2 && !last.contains(":") && !last.contains("|") && !last.hasPrefix("-") {
+                        let mid = last.index(last.startIndex, offsetBy: last.count / 2)
+                        terms.append(String(last[last.startIndex..<mid]))
+                        terms.append(String(last[mid...]))
+                    } else { terms.append(last) }
+                }
+            case 5:                                   // shortenTerm — WIDENS; EXPECT full scan
+                if var last = terms.popLast() {
+                    if last.count > 1 && !last.contains(":") && !last.contains("|") && !last.hasPrefix("-") {
+                        last.removeLast()
+                    }
+                    terms.append(last)
+                }
+            default:                                   // wildcard-ify — glob-disable path (op 6)
+                if var last = terms.popLast() {
+                    if !last.contains(":") && !last.contains("|") && !last.contains("?")
+                        && !last.contains("*") && last.count > 1 {
+                        last = String(last.prefix(1)) + "?" + String(last.dropFirst(2))
+                    }
+                    terms.append(last)
+                }
+            }
+            if terms.isEmpty { terms = [String(alnum[rndInt(alnum.count)])] }
+            let q = currentQuery()
+            let warm = rEng.search(q, mode: mode, sortKey: sortKey, ascending: ascending,
+                                   limit: 100_000, now: now)
+            let cold = rCold(q, mode: mode, sortKey: sortKey, ascending: ascending)
+            totalRandomSteps += 1
+            check("[23] O1-random seed\(seed) step\(step) op\(op) mode=\(mode) sort=\(sortKey) asc=\(ascending) "
+                  + "q='\(q)': warm.ids == cold.ids (order+membership)",
+                  warm.ids == cold.ids, "warm=\(warm.ids.count) cold=\(cold.ids.count)")
+            check("[23] O1-random seed\(seed) step\(step) op\(op) q='\(q)': warm.total == cold.total",
+                  warm.total == cold.total, "warm=\(warm.total) cold=\(cold.total)")
+        }
+    }
+    check("[23] O1-random: ran the expected number of random extension steps",
+          totalRandomSteps == 5 * 30, "totalRandomSteps=\(totalRandomSteps)")
+
+    try? fm.removeItem(atPath: rRoot)
+}
+
+// ---- O7 (verifier-added): [23] structSeq gate — a NEW matching file APPENDED mid-narrow-chain
+// must force a full scan and appear. O2/O2b only exercise attr-only mutations (attrSeq); none
+// append a live row between keystrokes, so the structSeq half of the invalidation gate was
+// untested. A structSeq-gate regression would let the narrow scan a stale gnIDs that predates the
+// append and silently DROP the new file (warm ⊊ cold). ----
+narrowB2StructBlock: do {
+    let sRoot = root + "/narrowB2struct"; mkdir(sRoot)
+    writeAbs(sRoot + "/report.dat", bytes: 10)       // matches both "rep" and the extended "repo"
+    let sIdx = FileIndex()
+    _ = FileEnumerator(index: sIdx).crawl(roots: [sRoot], exclude: [], mountPoints: [])
+    sIdx.buildLiveIndexes()
+    let sEng = SearchEngine(index: sIdx); sEng.useFolderSizes = false
+    let sRec = Reconciler(index: sIdx, exclude: [])
+    func sCold(_ q: String) -> [Int32] {
+        let e = SearchEngine(index: sIdx); e.useFolderSizes = false
+        return e.search(q, mode: .exact, sortKey: .name, limit: 100_000, now: now).ids
+    }
+    // Warm the narrow cache on the filtered (general-path) base query.
+    sEng._debugResetNarrowStats()
+    _ = sEng.search("rep ext:dat", mode: .exact, sortKey: .name, limit: 100_000, now: now)
+    // Append a BRAND-NEW file that matches the about-to-be-typed extension "repo ext:dat".
+    writeAbs(sRoot + "/repository.dat", bytes: 10)
+    _ = sRec.reconcile(eventPaths: [sRoot])          // append → structSeq bumps
+    sEng._debugResetNarrowStats()
+    let sWarm = sEng.search("repo ext:dat", mode: .exact, sortKey: .name, limit: 100_000, now: now)
+    check("[23] O7 structSeq gate: append mid-chain forces a full scan (not a stale narrow)",
+          sEng._debugNarrowStats().full >= 1, "stats=\(sEng._debugNarrowStats())")
+    check("[23] O7 structSeq gate: newly-appended matching file appears in the result",
+          sWarm.ids.map { sIdx.name(Int($0)) }.contains("repository.dat"))
+    check("[23] O7 structSeq gate: warm == cold (ids + order) after the append",
+          sWarm.ids == sCold("repo ext:dat"),
+          "warm=\(sWarm.ids.count) cold=\(sCold("repo ext:dat").count)")
+    // Follow-up keystroke with NO further mutation must now narrow cleanly from the re-stored base.
+    sEng._debugResetNarrowStats()
+    let sWarm2 = sEng.search("repos ext:dat", mode: .exact, sortKey: .name, limit: 100_000, now: now)
+    check("[23] O7 structSeq gate: quiescent follow-up extension narrows (re-store worked)",
+          sEng._debugNarrowStats().hits >= 1 && sEng._debugNarrowStats().full == 0,
+          "stats=\(sEng._debugNarrowStats())")
+    check("[23] O7 structSeq gate: follow-up warm == cold", sWarm2.ids == sCold("repos ext:dat"))
+    try? fm.removeItem(atPath: sRoot)
+}
+
 // ---- live updates (reconciler) ----
 let rec = Reconciler(index: index, exclude: [])
 write("live_new.txt", bytes: 42, mtime: now)

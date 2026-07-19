@@ -1,7 +1,9 @@
 import Foundation
 
-public enum TermScope: Sendable { case name, path }
-public enum SizeOp: Sendable { case gt, lt, ge, le, eq }
+public enum TermScope: Sendable, Equatable { case name, path }
+// OI-5: Equatable so `(SizeOp, Int64)`/`(SizeOp, Int)` tuples compare with `elementsEqual(by: ==)`
+// in SearchEngine's [23] narrow-refinement filter check. Additive, no payload — zero risk.
+public enum SizeOp: Sendable, Equatable { case gt, lt, ge, le, eq }
 
 public struct QueryTerm: Sendable {
     public var bytes: [UInt8]     // folded unless the query is case-sensitive

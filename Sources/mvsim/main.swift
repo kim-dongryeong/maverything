@@ -346,6 +346,31 @@ inc13Block: do {
         let f = SearchEngine(index: idx); f.useFolderSizes = false
         return f.search("", sortKey: k, ascending: asc, limit: 100_000, now: now).ids
     }
+    // [B1] brute-force children oracle over the parallel arrays, LIVE children only (excludes
+    // tombstones). applyDirDiff (stable since the CSR/overlay design landed — see FileIndex.swift)
+    // builds each touched dir's childOverlay newList strictly from the current on-disk listing,
+    // so a name that disappears is dropped from its parent's overlay in the SAME reconcile that
+    // tombstones it — never left dangling for a live, already-diffed parent. Both real consumers
+    // of childrenLocked (resolveIdsLocked, subtreeSize) already defensively re-filter
+    // `!deleted[...]`, confirming "live children" (not "every id ever parented here") is the
+    // actual contract; matching that here instead of asserting tombstones linger. [S2] compared
+    // as a SET: CSR is ascending-id order, childOverlay is directory-listing order — exact array
+    // equality would go red after any reconcile even though the product (set/map/sum readers) is
+    // correct.
+    func bruteChildren(_ idx: FileIndex, _ d: Int32) -> Set<Int32> {
+        var s = Set<Int32>()
+        for i in 0..<idx.count where idx.parentOf(i) == d && !idx.isDeleted(i) { s.insert(Int32(i)) }
+        return s
+    }
+    // childrenLocked() itself is allowed to surface tombstones (a directly-diffed dir's
+    // childOverlay never does, but the CSR fallback rebuilt by buildLiveIndexes() doesn't purge
+    // rows already flagged deleted=true out of the raw parent[] array either) — both real
+    // consumers (resolveIdsLocked, subtreeSize) already re-filter `!deleted[...]` themselves, so
+    // that's the actual contract, not "every id ever parented here." Filter here too so the
+    // live-only oracle above compares apples to apples regardless of which path answered.
+    func liveDebugChildren(_ idx: FileIndex, _ d: Int32) -> Set<Int32> {
+        Set(idx._debugChildren(of: d).filter { !idx.isDeleted(Int($0)) })
+    }
 
     // (a) Equivalence property test — THE load-bearing test: across 5 seeds, 200 random
     // mutation batches each, every incremental-sort key must equal a from-scratch order.
@@ -411,6 +436,28 @@ inc13Block: do {
                 check("inc13 seed\(seed) op\(opCounter) \(k) asc=\(asc): warm == scratch",
                       warm == truth, "warm=\(warm.count) truth=\(truth.count)")
             }
+            // [B1(A)] folder-size delta equivalence — after EVERY reconcile, the maintained
+            // (incremental-or-full, whichever _folderSizes() picks) array must equal a from-scratch
+            // bottom-up pass exactly. _debugFolderSizes() advances fsizeAppliedSeq to `total`, so
+            // this collapses each pending window to one record — the multi-record-window paths are
+            // covered separately below (S4) without an intervening peek.
+            let fMaint = idxA._debugFolderSizes()
+            let fTruth = idxA._debugFolderSizesScratch()
+            check("fsize seed\(seed) op\(opCounter): delta == scratch", fMaint == fTruth, "n=\(fMaint.count)")
+            // [B1(C)] CSR+overlay children == brute (as sets) — sampled every 10 ops over a handful
+            // of live dirs to keep the 5×200-op loop cheap while still exercising the overlay path
+            // after every kind of mutation the switch above produces.
+            if opCounter % 10 == 0 {
+                var checked = 0
+                for i in 0..<idxA.count where checked < 6 {
+                    if idxA.isDir(i) && !idxA.isDeleted(i) {
+                        let d = Int32(i)
+                        check("csr children seed\(seed) op\(opCounter) d=\(d) == brute",
+                              liveDebugChildren(idxA, d) == bruteChildren(idxA, d))
+                        checked += 1
+                    }
+                }
+            }
         }
         if seed == 5 {
             // keep the last seed's live index/engine/dir around for tests (b)-(f); avoid
@@ -458,6 +505,30 @@ inc13Block: do {
           "full=\(sC.full) incr=\(sC.incr)")
     check("inc13(c) incremental result == scratch", warmC == freshTruth(idxA, .name, true))
 
+    // (c2) [B1(A)/S4] multi-record window: TWO reconciles with NO _debugFolderSizes() peek
+    // between them, so a single incremental refresh must replay a window spanning several kinds
+    // of record for the SAME window: append (a new dir + files + a nested subtree), an attr
+    // (size-changing) touch, a plain tombstone, AND an append∩tombstone (a file created in the
+    // first reconcile, deleted in the second, both still inside the unpeeked window) — plus a
+    // subtree delete producing many tombstones in one go.
+    let mwDir = seedDir + "/mw_window"; mkdir(mwDir)
+    for i in 0..<8 { writeAbs(mwDir + "/mw\(i).dat", bytes: 10 + i) }
+    let mwSubDir = mwDir + "/sub"; mkdir(mwSubDir)
+    for i in 0..<4 { writeAbs(mwSubDir + "/s\(i).dat", bytes: 5 + i) }
+    _ = rec.reconcile(eventPaths: [seedDir])            // reconcile #1: append dir+files+subtree — NO peek yet
+    var tvMW = [timeval(tv_sec: Int(now) + 5000, tv_usec: 0), timeval(tv_sec: Int(now) + 5000, tv_usec: 0)]
+    FileManager.default.createFile(atPath: mwDir + "/mw0.dat", contents: Data(count: 999))  // attr(size) on mw0
+    _ = utimes(mwDir + "/mw0.dat", &tvMW)
+    try? fm.removeItem(atPath: mwDir + "/mw1.dat")      // plain tombstone of a mw0-window sibling
+    try? fm.removeItem(atPath: mwSubDir)                // subtree delete: sub/ + its 4 files ⇒ 5 tombstones
+    _ = rec.reconcile(eventPaths: [seedDir])            // reconcile #2 — STILL no _debugFolderSizes() peek
+    // mw1.dat was appended in reconcile #1 and tombstoned in reconcile #2, both inside this ONE
+    // pending window: exercises the append∩tombstone (+current −current == 0) composition case.
+    check("fsize multi-window (append+attr+tombstone+subtree-delete, no peek) == scratch",
+          idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
+    check("csr children after multi-window subtree-delete == brute",
+          idxA.dirIndex(forPath: mwDir).map { liveDebugChildren(idxA, $0) == bruteChildren(idxA, $0) } ?? false)
+
     // (d) log overflow ⇒ full-rebuild fallback, still equal.
     idxA._debugSetChangeLogCap(4)                      // force tiny cap
     eWarm._debugResetOrderStats()
@@ -467,6 +538,27 @@ inc13Block: do {
     let sD = eWarm._debugOrderStats()
     check("inc13(d) overflow ⇒ full rebuild fallback", sD.full >= 1, "full=\(sD.full)")
     check("inc13(d) fallback result still == scratch", warmD == freshTruth(idxA, .name, true))
+    check("fsize overflow ⇒ full-rebuild == scratch", idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
+    // [S4] one MORE reconcile after the overflow full-rebuild — runs an INCREMENTAL replay window
+    // post-reset (fsizeAppliedSeq now sits at the post-overflow chgBase), catching any drift a
+    // full-rebuild-only assertion would miss (chgPayload must still be in lockstep after the halving).
+    writeAbs(seedDir + "/post_ovf_marker.dat", bytes: 3)
+    _ = rec.reconcile(eventPaths: [seedDir])
+    check("fsize incremental-after-overflow == scratch", idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
+
+    // bumpMutation forces a full rebuild (chgBase jumps past the emptied log, including chgPayload,
+    // in lockstep) — a check right after it would PASS even if bumpMutation forgot to clear
+    // chgPayload (the full-rebuild branch never reads it). ONE more reconcile forces the very next
+    // refresh to be an INCREMENTAL window, which DOES read chgPayload — the only case that would
+    // actually catch a missing `chgPayload.removeAll` in bumpMutation.
+    check("fsize before bumpMutation == scratch (baseline)",
+          idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
+    idxA.bumpMutation()
+    check("fsize after bumpMutation == scratch", idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
+    writeAbs(seedDir + "/post_bump_marker.dat", bytes: 3)
+    _ = rec.reconcile(eventPaths: [seedDir])
+    check("fsize incremental-after-bumpMutation == scratch",
+          idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
 
     // (e) snapshot-load resets the log; scratch equality holds.
     let blob13 = idxA.snapshotData(lastEventId: 0, savedAt: Double(now))
@@ -475,6 +567,53 @@ inc13Block: do {
     let aE = eL.search("", sortKey: .name, limit: 100_000, now: now).ids
     let bE = freshTruth(idxL, .name, true)
     check("inc13(e) after snapshot-load order == scratch (log reset)", aE == bE)
+    check("fsize after snapshot-load == scratch", idxL._debugFolderSizes() == idxL._debugFolderSizesScratch())
+    check("csr overlay empty right after snapshot-load buildLiveIndexes", idxL._debugOverlayCount == 0)
+    for d in 0..<min(idxL.count, 200) where idxL.isDir(d) && !idxL.isDeleted(d) {
+        check("csr children after snapshot-load d=\(d) == brute",
+              liveDebugChildren(idxL, Int32(d)) == bruteChildren(idxL, Int32(d)))
+    }
+
+    // [B1(C)] subtreeSize walk-result oracle: compare against a brute recursive sum over
+    // non-deleted, VDIR-excluded size[] for a handful of dirs (covers the childrenLocked
+    // migration in subtreeSize independent of the fsize delta machinery).
+    func bruteSubtreeSize(_ idx: FileIndex, _ d: Int32) -> Int64 {
+        var total: Int64 = 0
+        var stack: [Int32] = [d]
+        while let cur = stack.popLast() {
+            if idx.isDeleted(Int(cur)) { continue }         // mirrors subtreeSize's own deleted-guard on pop
+            if !idx.isDir(Int(cur)) { total += idx.row(Int(cur)).size }
+            stack.append(contentsOf: bruteChildren(idx, cur))
+        }
+        return total
+    }
+    var subtreeChecked = 0
+    for d in 0..<idxA.count where subtreeChecked < 10 {
+        if idxA.isDir(d) && !idxA.isDeleted(d) {
+            let did = Int32(d)
+            check("subtreeSize d=\(did) == brute recursive sum",
+                  idxA.subtreeSize(of: did) == bruteSubtreeSize(idxA, did))
+            subtreeChecked += 1
+        }
+    }
+
+    // [B1(C)] re-run buildLiveIndexes while the overlay is non-empty (applyDirDiff has been
+    // writing childOverlay entries throughout (a)-(d) above without an intervening rebuild):
+    // children must still equal brute, AND the overlay must be fully absorbed (empty) afterward.
+    check("csr overlay non-empty before a forced rebuild (precondition for this case)",
+          idxA._debugOverlayCount > 0, "overlay=\(idxA._debugOverlayCount)")
+    idxA.buildLiveIndexes()
+    check("csr overlay empty after buildLiveIndexes rebuild", idxA._debugOverlayCount == 0)
+    var rebuildChecked = 0
+    for d in 0..<idxA.count where rebuildChecked < 20 {
+        if idxA.isDir(d) && !idxA.isDeleted(d) {
+            check("csr children after forced rebuild d=\(d) == brute",
+                  liveDebugChildren(idxA, Int32(d)) == bruteChildren(idxA, Int32(d)))
+            rebuildChecked += 1
+        }
+    }
+    check("fsize after forced buildLiveIndexes rebuild == scratch",
+          idxA._debugFolderSizes() == idxA._debugFolderSizesScratch())
 
     // (f) Bench (informational, NOT asserted).
     let cold = SearchEngine(index: idxA); cold.useFolderSizes = false
@@ -511,17 +650,41 @@ do {
     }
     let idxB = FileIndex()
     _ = FileEnumerator(index: idxB).crawl(roots: [benchRoot], exclude: [], mountPoints: [])
-    idxB.buildLiveIndexes()
+    let csr0 = ContinuousClock().now
+    idxB.buildLiveIndexes()                                             // CSR (csrChildIds/csrChildOff) build
+    let csr1 = ContinuousClock().now
     let eB = SearchEngine(index: idxB); eB.useFolderSizes = false
     let tb0 = ContinuousClock().now
     _ = eB.search("", sortKey: .name, limit: 1_000_000, now: now)      // cold full computeOrder over ~1M
     let tb1 = ContinuousClock().now
+
+    // [B1(E)] folder-size bench: cold full pass, then a +1-file incremental refresh — both must
+    // still equal the from-scratch oracle at this scale (cheap correctness net, not just a print).
+    let fz0 = ContinuousClock().now
+    let fsFull = idxB._debugFolderSizes()
+    let fz1 = ContinuousClock().now
+    check("fsize (1M) cold full == scratch", fsFull == idxB._debugFolderSizesScratch())
+
     let recB = Reconciler(index: idxB, exclude: [])
     fastWrite(benchRoot + "/b0/bench_incr_one.dat", bytes: 1)
     let tb2 = ContinuousClock().now
     _ = recB.reconcile(eventPaths: [benchRoot])
     _ = eB.search("", sortKey: .name, limit: 1_000_000, now: now)      // warm incremental (+1 id)
     let tb3 = ContinuousClock().now
+    let fz2 = ContinuousClock().now
+    let fsIncr = idxB._debugFolderSizes()                               // +1-record incremental window
+    let fz3 = ContinuousClock().now
+    check("fsize (1M) incremental(+1) == scratch", fsIncr == idxB._debugFolderSizesScratch())
+
+    // [B1(E)] radix vs comparator name-order bench at 1M — the [OI-8] `< 2×` keep/revert gate.
+    let radixB = eB._debugBenchNameOrders()
+    let ratio = radixB.radixSeconds > 0 ? radixB.comparatorSeconds / radixB.radixSeconds : 0
+    print("B1(bench) n=\(idxB.count) csrBuild=\(csr0.duration(to: csr1)) " +
+          "fsizeFull=\(fz0.duration(to: fz1)) fsizeIncr(+1)=\(fz2.duration(to: fz3)) " +
+          "nameFull=\(tb0.duration(to: tb1)) nameIncr(+1)=\(tb2.duration(to: tb3)) " +
+          "radix=\(String(format: "%.4f", radixB.radixSeconds))s " +
+          "comparator=\(String(format: "%.4f", radixB.comparatorSeconds))s " +
+          "ratio=\(String(format: "%.2f", ratio))x (n=\(radixB.n))")
     print("inc13(bench) n=\(idxB.count) full=\(tb0.duration(to: tb1)) incr(+1)=\(tb2.duration(to: tb3))")
     try? fm.removeItem(atPath: benchRoot)
 }
@@ -588,7 +751,44 @@ inc13gBlock: do {
     // otherwise the coalescing code was never actually exercised and the test is vacuous.
     check("inc13g coalescing exercised the incremental path (not all full-rebuild)",
           sG.incr >= 1, "full=\(sG.full) incr=\(sG.incr) noop=\(sG.noop)")
+
+    // [B1(A)] fsize coalesce: the SAME accumulated window above (append-then-tombstone,
+    // attr-then-tombstone, multi-attr-on-one-id, append-then-attr, all with no intervening
+    // fsize peek) must still equal the from-scratch fold — the composition proof in SPEC-B1
+    // §2 depends on exactly these coalesced cases.
+    check("fsize coalesce == scratch", idxG._debugFolderSizes() == idxG._debugFolderSizesScratch())
     try? fm.removeItem(atPath: gDir)
+}
+
+// ---- [B1(D)] radix == comparator name-order oracle (SPEC-B1-FINAL §4/§6D; radix kept — gate
+// measured >2x, see SearchEngine.useNameRadix) ----
+radixOrderBlock: do {
+    // (1) corpus — the main fixture tree already has a realistic name mix (unicode, case, dupes).
+    let (rMain, cMain) = engine._debugNameOrders()
+    check("radix == comparator (main fixture corpus)", rMain == cMain, "n=\(rMain.count)")
+
+    // (2) adversarial index — names designed to stress every branch of the radix tie-break:
+    // shared 8-byte prefixes forcing the per-key64-group tie-sort (digit varies past byte 8),
+    // a length tie inside a shared 8-byte prefix, a unicode-folded pair that differs in key64
+    // (accent present vs absent — genuinely different strings, no filesystem collision), and
+    // duplicate folded names in different dirs to hit the id tie-break.
+    let advDir = root + "/radixadv"; mkdir(advDir)
+    for i in 1...9 { writeAbs(advDir + "/AAAAAAAA_\(i).dat", bytes: 1) }   // shared 8B prefix, digit past it
+    writeAbs(advDir + "/AAAAAAAAA.dat", bytes: 1)                          // 9 A's — length tie-break vs below
+    writeAbs(advDir + "/AAAAAAAA.dat", bytes: 1)                           // exactly 8 A's — shares full key64
+    writeAbs(advDir + "/CAFÉ.txt", bytes: 1)                               // accented, uppercase
+    writeAbs(advDir + "/cafe.txt", bytes: 1)                               // unaccented, lowercase — distinct string
+    writeAbs(advDir + "/dupA/same_name.dat", bytes: 1)                     // same folded name, different ids —
+    writeAbs(advDir + "/dupB/same_name.dat", bytes: 1)                     // (different dirs so no fs collision)
+
+    let idxAdv = FileIndex()
+    _ = FileEnumerator(index: idxAdv).crawl(roots: [advDir], exclude: [], mountPoints: [])
+    idxAdv.buildLiveIndexes()
+    let eAdv = SearchEngine(index: idxAdv)
+    let (rAdv, cAdv) = eAdv._debugNameOrders()
+    check("radix == comparator (adversarial: 8B-prefix ties, unicode fold, id ties)",
+          rAdv == cAdv, "n=\(rAdv.count)")
+    try? fm.removeItem(atPath: advDir)
 }
 
 // Everything's "Include only files" whitelist + live hide-hidden toggle

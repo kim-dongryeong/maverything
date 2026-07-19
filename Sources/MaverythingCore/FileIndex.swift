@@ -55,16 +55,43 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var deleted: [Bool] = []     // tombstones (live removals)
 
     // Live-update indexes (built during crawl, maintained by the reconciler).
-    // childrenOf maps a directory entry to its child entry indices; dirIndexByHash
-    // maps the FNV-1a 64 hash of a directory's DISPLAY path (NFC bytes) to its entry
+    // CSR (csrChildIds/csrChildOff) + childOverlay map a directory entry to its child entry
+    // indices (see childrenLocked); dirIndexByHash maps the FNV-1a 64 hash of a directory's
+    // DISPLAY path (NFC bytes) to its entry
     // index so FSEvents paths resolve WITHOUT storing every directory's path string
     // (~400k dirs × 60-100+ B each). Lookups verify the hit by reconstructing the
     // entry's real path, so a hash collision can never resolve to a wrong directory —
     // it just misses (nil) and the caller treats the dir as unknown. Two different
     // dirs colliding on insert is last-write-wins (same as the old String map for
     // equal paths); the loser merely falls back to parent-rescan reconciles.
-    var childrenOf: [Int32: [Int32]] = [:]
+    // CSR adjacency, rebuilt each buildLiveIndexes (crawl end / snapshot load / rescan). children of dir d
+    // (0 ≤ d < n) are csrChildIds[csrChildOff[d] ..< csrChildOff[d+1]]; csrChildOff has length n+1.
+    var csrChildIds: [Int32] = []
+    var csrChildOff: [Int32] = []
+    // Overlay: dirs whose child set changed AFTER the CSR build (live reconcile). Absorbed at next
+    // buildLiveIndexes. Live-churn growth is acceptable.
+    var childOverlay: [Int32: [Int32]] = [:]
     var dirIndexByHash: [UInt64: Int32] = [:]
+
+    /// The children of a directory entry. CALLER HOLDS THE LOCK (rd for readers, wr for the reconciler).
+    /// Overlay wins over CSR. Returns a slice — no per-dir heap array, no copy on the CSR path. The slice is
+    /// valid for the duration of the lock hold; the CSR path aliases csrChildIds, the overlay path retains the
+    /// overlay array's buffer.
+    @inline(__always) func childrenLocked(of dir: Int32) -> ArraySlice<Int32> {
+        if let ov = childOverlay[dir] { return ov[...] }
+        let d = Int(dir)
+        guard d >= 0, d + 1 < csrChildOff.count else { return ArraySlice<Int32>() }
+        return csrChildIds[Int(csrChildOff[d]) ..< Int(csrChildOff[d + 1])]
+    }
+
+    /// TEST-ONLY: children of `dir` via the maintained CSR+overlay path (copies the slice).
+    public func _debugChildren(of dir: Int32) -> [Int32] {
+        rdlock(); defer { unlock() }
+        return Array(childrenLocked(of: dir))
+    }
+    /// TEST-ONLY: number of dirs currently holding a live overlay entry (should be 0 right
+    /// after a buildLiveIndexes rebuild, since the CSR build absorbs/drops the overlay).
+    public var _debugOverlayCount: Int { rdlock(); defer { unlock() }; return childOverlay.count }
 
     /// A READ-WRITE lock: many concurrent readers (searches + row/path accessors +
     /// main-thread cell rendering) run in parallel; only mutations (crawl append,
@@ -102,6 +129,7 @@ public final class FileIndex: @unchecked Sendable {
         chgBase = chgBase &+ chgIds.count &+ 1
         chgIds.removeAll(keepingCapacity: true)
         chgKinds.removeAll(keepingCapacity: true)
+        chgPayload.removeAll(keepingCapacity: true)
     }
     /// Locked snapshot of the mutation generation — bumped on every content change. Caches
     /// keyed only by path (e.g. BundleSizeCache) compare against this to self-invalidate.
@@ -117,6 +145,13 @@ public final class FileIndex: @unchecked Sendable {
     public init() {}
 
     public var count: Int { nameOff.count }
+
+    /// TEST-ONLY: parent id of entry `i` (-1 for a root or out-of-range index) — a tiny
+    /// accessor so mvsim's brute-force children oracle can walk `parent[]` without a lock dance.
+    public func parentOf(_ i: Int) -> Int32 {
+        rdlock(); defer { unlock() }
+        return i >= 0 && i < parent.count ? parent[i] : -1
+    }
 
     // MARK: - Character bloom mask
 
@@ -161,26 +196,29 @@ public final class FileIndex: @unchecked Sendable {
     // instead of re-argsorting ~2M ids per reconcile batch. kinds: 0=append 1=tombstone 2=attr.
     private var chgIds:   [Int32] = []
     private var chgKinds: [UInt8] = []
+    private var chgPayload: [Int64] = []     // parallel; attr → sizeDelta, append/tombstone → 0
     private var chgBase:  Int = 0            // global seq of chgIds[0]; totalSeq = chgBase + chgIds.count
     private var structSeqValue: Int = 0      // monotonic: ++ per append OR tombstone record
     private var attrSeqValue:   Int = 0      // monotonic: ++ per attr record
     private var logCap: Int = 1 << 18        // 262144; var so a test hook can shrink it
 
-    @inline(__always) private func logAppend(_ id: Int32)    { logRecord(id, 0); structSeqValue &+= 1 }
-    @inline(__always) private func logTombstone(_ id: Int32) { logRecord(id, 1); structSeqValue &+= 1 }
-    @inline(__always) private func logAttr(_ id: Int32)      { logRecord(id, 2); attrSeqValue &+= 1 }
+    @inline(__always) private func logAppend(_ id: Int32)    { logRecord(id, 0, 0); structSeqValue &+= 1 }
+    @inline(__always) private func logTombstone(_ id: Int32) { logRecord(id, 1, 0); structSeqValue &+= 1 }
+    @inline(__always) private func logAttr(_ id: Int32, _ sizeDelta: Int64) { logRecord(id, 2, sizeDelta); attrSeqValue &+= 1 }
 
-    @inline(__always) private func logRecord(_ id: Int32, _ kind: UInt8) {
-        chgIds.append(id); chgKinds.append(kind)
+    @inline(__always) private func logRecord(_ id: Int32, _ kind: UInt8, _ payload: Int64) {
+        chgIds.append(id); chgKinds.append(kind); chgPayload.append(payload)
+        assert(chgIds.count == chgKinds.count && chgIds.count == chgPayload.count)   // [S4] lockstep guard
         if chgIds.count > logCap {                 // overflow: drop oldest half, advance base
             let drop = chgIds.count / 2
-            chgIds.removeFirst(drop); chgKinds.removeFirst(drop)
+            chgIds.removeFirst(drop); chgKinds.removeFirst(drop); chgPayload.removeFirst(drop)  // LOCKSTEP
             chgBase &+= drop                        // consumers with appliedSeq < chgBase → full rebuild
         }
     }
 
     func resetChangeLog() {                 // clear() / snapshot load (internal: Snapshot.swift calls this)
         chgIds.removeAll(keepingCapacity: false); chgKinds.removeAll(keepingCapacity: false)
+        chgPayload.removeAll(keepingCapacity: false)
         chgBase = 0; structSeqValue = 0; attrSeqValue = 0
     }
 
@@ -196,6 +234,18 @@ public final class FileIndex: @unchecked Sendable {
         guard fromSeq >= chgBase, fromSeq <= total else { return nil }
         let lo = fromSeq - chgBase
         return (Array(chgIds[lo...]), Array(chgKinds[lo...]))   // lo..<count
+    }
+
+    /// Like changeRecordsLocked but also returns the parallel Int64 payload (attr → sizeDelta). Only the
+    /// folder-size consumer uses this; the order replay keeps the 2-tuple API and never sees payloads.
+    /// (`_folderSizes()` replays the log arrays DIRECTLY under the held lock rather than calling this
+    /// sibling, to avoid three transient Array copies on the hot path. Provided for symmetry/future
+    /// callers; not on the fsize hot path — kept, costs nothing unless called.)
+    func changeRecordsWithPayloadLocked(from fromSeq: Int) -> (ids: [Int32], kinds: [UInt8], payload: [Int64])? {
+        let total = chgBase &+ chgIds.count
+        guard fromSeq >= chgBase, fromSeq <= total else { return nil }
+        let lo = fromSeq - chgBase
+        return (Array(chgIds[lo...]), Array(chgKinds[lo...]), Array(chgPayload[lo...]))
     }
 
     // TEST-ONLY: force a small cap so mvsim can exercise the overflow→full-rebuild fallback.
@@ -236,9 +286,10 @@ public final class FileIndex: @unchecked Sendable {
         flags.removeAll(keepingCapacity: false); hidden.removeAll(keepingCapacity: false)
         deleted.removeAll(keepingCapacity: false)
         _deletedCount = 0
-        childrenOf.removeAll(keepingCapacity: false)
+        csrChildIds.removeAll(); csrChildOff.removeAll(); childOverlay.removeAll()
         dirIndexByHash.removeAll(keepingCapacity: false)
         resetChangeLog()
+        resetFsizeLocked()   // [N2] defense-in-depth
     }
 
     public func reserveCapacity(_ n: Int) {
@@ -324,7 +375,7 @@ public final class FileIndex: @unchecked Sendable {
         return base
     }
 
-    /// Builds the live-update maps (childrenOf, dirIndexByHash) in one O(n) pass
+    /// Builds the live-update maps (CSR children, dirIndexByHash) in one O(n) pass
     /// after the crawl. Entries are appended parent-before-child, so a forward
     /// pass can extend each directory's display-path FNV state from its parent's —
     /// no path string is ever materialized (FNV-1a streams left-to-right, and a
@@ -333,7 +384,6 @@ public final class FileIndex: @unchecked Sendable {
     public func buildLiveIndexes() {
         wrlock(); defer { unlock() }
         let n = nameOff.count
-        childrenOf.removeAll(keepingCapacity: true)
         dirIndexByHash.removeAll(keepingCapacity: true)
         computeNameMasksLocked(n)
         var dirHash = [UInt64](repeating: 0, count: n)   // FNV state of each dir's display path
@@ -348,7 +398,6 @@ public final class FileIndex: @unchecked Sendable {
             }
             for i in 0..<n {
                 let p = parent[i]
-                if p >= 0 { childrenOf[p, default: []].append(Int32(i)) }
                 if objType[i] == VNODE_VDIR {
                     let pi = Int(p)
                     let h: UInt64
@@ -369,9 +418,24 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         }
+        // CSR children (counting sort — two flat O(n) passes, zero hashing/COW). Order within a parent is
+        // ASCENDING id, identical to the old forward-append dict-of-arrays. Empty-index safe: at n==0,
+        // csrChildOff = [0] (length 1), the prefix-sum loop is skipped, totalChildren = 0, and the
+        // count/scatter loops are empty (reachable: a fully-excluded / permission-denied root crawls 0 rows).
+        childOverlay.removeAll(keepingCapacity: false)          // CSR now authoritative — absorb/drop overlay
+        csrChildOff = [Int32](repeating: 0, count: n + 1)
+        for i in 0..<n { let p = parent[i]; if p >= 0 { csrChildOff[Int(p) + 1] &+= 1 } }   // counts (shifted by 1)
+        if n > 0 { for i in 1...n { csrChildOff[i] &+= csrChildOff[i - 1] } }               // prefix sum
+        let totalChildren = Int(csrChildOff[n])                                            // 0 when n==0
+        csrChildIds = [Int32](repeating: 0, count: totalChildren)
+        var cursor = csrChildOff                                                            // per-parent write head
+        for i in 0..<n {
+            let p = parent[i]
+            if p >= 0 { let pos = Int(cursor[Int(p)]); csrChildIds[pos] = Int32(i); cursor[Int(p)] &+= 1 }
+        }
         // Bump the generation so every gen-keyed cache (order, incremental narrowing,
         // the engine's frecency-id map) rebuilds AGAINST the freshly-built live maps.
-        // Without this a frecency map resolved while childrenOf was still empty (during
+        // Without this a frecency map resolved while children were still empty (during
         // crawl / right after snapshot load) would be cached under an unchanged gen and
         // never re-resolve (Codex review).
         bumpMut()
@@ -507,7 +571,8 @@ public final class FileIndex: @unchecked Sendable {
             byParent[parent, default: []].append((p, base))
         }
         for (parent, kids) in byParent {
-            guard let pid = _dirIndexVerified(parent), let childIdxs = childrenOf[pid] else { continue }
+            guard let pid = _dirIndexVerified(parent) else { continue }
+            let childIdxs = childrenLocked(of: pid)
             var nameToId = [String: Int32](minimumCapacity: childIdxs.count)
             for ci in childIdxs where !deleted[Int(ci)] { nameToId[_name(Int(ci))] = ci }
             for (full, base) in kids where nameToId[String(base)] != nil { out[full] = nameToId[String(base)]! }
@@ -525,17 +590,116 @@ public final class FileIndex: @unchecked Sendable {
     // MARK: - folder-size index (Everything 1.5's "Index folder sizes")
 
     private var fsize: [Int64] = []
-    private var fsizeGen = -1
+    private var fsizeEpoch: Int = -1        // epochValue at last (re)build
+    private var fsizeAppliedSeq: Int = -1   // log totalSeq consumed into fsize
     private let fsizeLock = NSLock()
 
-    /// Bottom-up folder totals for ALL entries, cached per mutationGen. Entries are
-    /// appended parent-before-child (crawl and reconcile both), so ONE reverse pass
-    /// accumulates each entry into its parent — O(n), ~15 ms per rebuild at 2M.
-    /// Caller must hold the read lock. Lock order: rwlock → fsizeLock (everywhere).
+    /// Folder totals for ALL entries. Refreshes INCREMENTALLY by replaying the change log
+    /// since the last build when possible (append/tombstone/attr contributions walked up the
+    /// parent chain), falling back to a full bottom-up pass on epoch mismatch, a dropped log
+    /// window, or an oversized window. Every incremental result equals the from-scratch
+    /// computation exactly (see spec SPEC-B1-FINAL §2). Caller must hold the read lock.
+    /// Lock order: rwlock → fsizeLock (everywhere).
     func _folderSizes() -> [Int64] {
-        fsizeLock.lock()
-        if fsizeGen == mutationGenLocked { let c = fsize; fsizeLock.unlock(); return c }
-        fsizeLock.unlock()
+        let epoch = epochLocked                     // == epochValue, caller holds rdlock
+        let total = chgBase &+ chgIds.count         // == totalSeqLocked
+        let n = nameOff.count
+        fsizeLock.lock(); defer { fsizeLock.unlock() }
+
+        // (a) fresh?
+        if fsizeEpoch == epoch, fsizeAppliedSeq == total, fsize.count == n { return fsize }
+
+        // (b) can we advance incrementally? same epoch AND the log still reaches back to appliedSeq.
+        if fsizeEpoch == epoch, fsizeAppliedSeq >= chgBase, fsizeAppliedSeq <= total, fsize.count <= n {
+            let lo = fsizeAppliedSeq - chgBase
+            // grow fsize for ids appended since the last build (new slots start at 0 — a leaf's own slot is 0,
+            // matching the full pass; dirs only ever RECEIVE from descendants).
+            if fsize.count < n { fsize.append(contentsOf: repeatElement(0, count: n - fsize.count)) }
+
+            // window-size guard: bound distinct work like applyIncremental (SearchEngine.swift).
+            let hi = total - chgBase                 // == chgIds.count
+            let windowLen = hi - lo
+            if windowLen <= max(8192, n / 16) {
+                // PASS 1: appended-set for the attr-exclusion rule.
+                var appendedSet = Set<Int32>()
+                for k in lo..<hi where chgKinds[k] == 0 { appendedSet.insert(chgIds[k]) }
+                // PASS 2: apply each record's contribution up the parent chain. A truncated
+                // walk (hop guard) means a partial contribution was committed — the replay is
+                // no longer exact, so bail to the full rebuild below (Codex P2: silently
+                // committing a truncated sequence left ancestors permanently drifted).
+                var walksExact = true
+                for k in lo..<hi {
+                    let id = chgIds[k]
+                    let isDir = objType[Int(id)] == VNODE_VDIR                    // [S3] gate
+                    switch chgKinds[k] {
+                    case 0:  if !isDir { walksExact = walkAddAncestors(of: id, delta: size[Int(id)]) && walksExact }        // append: +size @replay
+                    case 1:  if !isDir { walksExact = walkAddAncestors(of: id, delta: 0 &- size[Int(id)]) && walksExact }   // tombstone: −size @replay (&- : Int64.min-safe, Codex P2)
+                    default:                                                                // attr
+                        if !isDir, !appendedSet.contains(id) {                              // gated + append-excluded
+                            walksExact = walkAddAncestors(of: id, delta: chgPayload[k]) && walksExact  // +delta (pre-overwrite)
+                        }
+                    }
+                }
+                if walksExact {
+                    fsizeAppliedSeq = total
+                    return fsize
+                }
+                // truncated walk ⇒ fall through to full rebuild (overwrites the partial state)
+            }
+            // window too large ⇒ fall through to full rebuild
+        }
+
+        // (c) full rebuild — mirrors the ORIGINAL bottom-up pass EXACTLY.
+        var out = [Int64](repeating: 0, count: n)
+        var i = n - 1
+        while i >= 0 {
+            if !deleted[i] {
+                let own = objType[i] == VNODE_VDIR ? out[i] : size[i]   // dir own-size ignored; VLNK counts as file
+                let p = parent[i]
+                if p >= 0, Int(p) < n { out[Int(p)] &+= own }
+            }
+            i -= 1
+        }
+        fsize = out; fsizeEpoch = epoch; fsizeAppliedSeq = total
+        return fsize
+    }
+
+    /// Add `delta` to every ANCESTOR dir of `id` (its own slot untouched). Caller holds
+    /// rdlock+fsizeLock. Returns false when the cycle guard truncated the walk — the caller
+    /// MUST discard the incremental state and full-rebuild (partial contributions were applied).
+    @inline(__always) private func walkAddAncestors(of id: Int32, delta: Int64) -> Bool {
+        if delta == 0 { return true }
+        var cur = parent[Int(id)]
+        var hops = 0
+        while cur >= 0 {
+            fsize[Int(cur)] &+= delta
+            cur = parent[Int(cur)]
+            hops += 1; if hops > 4096 { return false } // cycle guard, mirrors _path (unreachable on real FS)
+        }
+        return true
+    }
+
+    /// [N2] defense-in-depth: explicitly resets the fsize triple. Caller holds the write lock
+    /// (clear() and Snapshot.swift's load call this alongside their existing epoch bump — both
+    /// paths already bumpEpochLocked(), so this is belt-and-suspenders, not a correctness
+    /// dependency today; it guards against a future edit that drops the epoch bump).
+    func resetFsizeLocked() {
+        fsizeLock.lock(); fsizeEpoch = -1; fsizeAppliedSeq = -1; fsize.removeAll(keepingCapacity: false); fsizeLock.unlock()
+    }
+
+    /// Build (or refresh) the folder-size cache — call from a background queue.
+    public func buildFolderSizes() { rdlock(); defer { unlock() }; _ = _folderSizes() }
+
+    /// TEST-ONLY: the MAINTAINED folder-size array (incremental refresh or full rebuild, whichever
+    /// `_folderSizes()` picks). NOTE: this ADVANCES `fsizeAppliedSeq` to the current log total just
+    /// like any other caller — do not call it between reconciles you want to stay unpeeked-at when
+    /// testing a multi-record replay window (see SPEC-B1-FINAL §6 [S4]).
+    public func _debugFolderSizes() -> [Int64] { rdlock(); defer { unlock() }; return _folderSizes() }
+
+    /// TEST-ONLY oracle: a from-scratch bottom-up pass over the CURRENT state, ignoring (and NOT
+    /// touching) the fsize cache entirely. Mirrors `_folderSizes()`'s full-rebuild branch exactly.
+    public func _debugFolderSizesScratch() -> [Int64] {
+        rdlock(); defer { unlock() }
         let n = nameOff.count
         var out = [Int64](repeating: 0, count: n)
         var i = n - 1
@@ -547,26 +711,21 @@ public final class FileIndex: @unchecked Sendable {
             }
             i -= 1
         }
-        fsizeLock.lock()
-        fsizeGen = mutationGenLocked; fsize = out
-        fsizeLock.unlock()
         return out
     }
-
-    /// Build (or refresh) the folder-size cache — call from a background queue.
-    public func buildFolderSizes() { rdlock(); defer { unlock() }; _ = _folderSizes() }
 
     /// Non-blocking read for display: nil while the cache is stale (kick
     /// buildFolderSizes() off-main and re-render when it lands).
     public func folderSizeIfReady(_ i: Int) -> Int64? {
         rdlock(); defer { unlock() }
+        let epoch = epochLocked, total = chgBase &+ chgIds.count
         fsizeLock.lock(); defer { fsizeLock.unlock() }
-        guard fsizeGen == mutationGenLocked, i >= 0, i < fsize.count else { return nil }
+        guard fsizeEpoch == epoch, fsizeAppliedSeq == total, i >= 0, i < fsize.count else { return nil }
         return fsize[i]
     }
 
     /// Total size of everything inside a directory subtree — the "size" Finder shows
-    /// for a package/bundle. Iterative DFS over childrenOf; hop-bounded for safety.
+    /// for a package/bundle. Iterative DFS over children; hop-bounded for safety.
     public func subtreeSize(of dirIdx: Int32) -> Int64 {
         rdlock(); defer { unlock() }
         var total: Int64 = 0
@@ -577,7 +736,7 @@ public final class FileIndex: @unchecked Sendable {
             let i = Int(cur)
             if i < 0 || i >= objType.count || deleted[i] { continue }
             if objType[i] != VNODE_VDIR { total += size[i] }
-            if let kids = childrenOf[cur] { stack.append(contentsOf: kids) }
+            stack.append(contentsOf: childrenLocked(of: cur))
         }
         return total
     }
@@ -655,8 +814,8 @@ public final class FileIndex: @unchecked Sendable {
         let lastName = (p as NSString).lastPathComponent
         var removed = 0
         // The stub lives under the parent dir's children; the root copy has parent == -1.
-        if let pi = _dirIndexVerified(parentPath), let kids = childrenOf[pi] {
-            for k in kids where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
+        if let pi = _dirIndexVerified(parentPath) {
+            for k in childrenLocked(of: pi) where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
                 removed += _markDeletedSubtree(k)
             }
         }
@@ -688,7 +847,7 @@ public final class FileIndex: @unchecked Sendable {
         let di = Int(dirIdx)
         guard di < deleted.count, !deleted[di] else { return res }
 
-        let oldIdxs = childrenOf[dirIdx] ?? []
+        let oldIdxs = childrenLocked(of: dirIdx)   // slice; consumed into oldByName below before any mutation (R5)
         var oldByName = [String: Int32](minimumCapacity: oldIdxs.count)
         for ci in oldIdxs where !deleted[Int(ci)] { oldByName[_name(Int(ci))] = ci }
 
@@ -721,10 +880,11 @@ public final class FileIndex: @unchecked Sendable {
                     // actually changed, so a flags-only churn doesn't force an order rebuild.
                     let sortKeyChanged = size[o] != c.size || mtime[o] != c.mtime || crtime[o] != c.crtime
                     if sortKeyChanged || flags[o] != c.flags {
+                        let sizeDelta = c.size &- size[o]                 // BEFORE the in-place write (OI-1)
                         size[o] = c.size; mtime[o] = c.mtime; crtime[o] = c.crtime; flags[o] = c.flags
                         hidden[o] = (c.name.first == UInt8(ascii: ".")) || (c.flags & UInt32(UF_HIDDEN)) != 0
                         res.changed += 1
-                        if sortKeyChanged { logAttr(oi) }
+                        if sortKeyChanged { logAttr(oi, sizeDelta) }      // delta may be 0 (mtime/crtime-only) — harmless
                     }
                     newList.append(oi)
                 }
@@ -733,7 +893,7 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
         for (_, oi) in oldByName { _markDeletedSubtree(oi); res.removed += 1 }
-        childrenOf[dirIdx] = newList
+        childOverlay[dirIdx] = newList
         if res.added + res.removed + res.changed > 0 { bumpMut() }   // auto-invalidate search caches
         return res
     }
@@ -788,7 +948,9 @@ public final class FileIndex: @unchecked Sendable {
                 let h = pathHash(_path(c))
                 if dirIndexByHash[h] == cur { dirIndexByHash.removeValue(forKey: h) }
             }
-            if let kids = childrenOf[cur] { stack.append(contentsOf: kids); childrenOf[cur] = nil }
+            let kids = childrenLocked(of: cur)
+            if !kids.isEmpty { stack.append(contentsOf: kids) }
+            childOverlay.removeValue(forKey: cur)   // read BEFORE removeValue; CSR slice inert for a deleted dir
         }
         _deletedCount += removed   // keep liveStats() O(1) (caller holds the write lock)
         return removed

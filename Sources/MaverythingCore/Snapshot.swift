@@ -230,7 +230,9 @@ extension FileIndex {
             // buildLiveIndexes() fills the authoritative values.
             nameMask = [UInt64](repeating: .max, count: count)
             typeClass = [UInt8](repeating: 0xFF, count: count)
-            childrenOf.removeAll(); dirIndexByHash.removeAll()
+            csrChildIds.removeAll(); csrChildOff.removeAll(); childOverlay.removeAll()
+            dirIndexByHash.removeAll()
+            resetFsizeLocked()   // [N2] defense-in-depth
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }
     }

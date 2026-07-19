@@ -1828,17 +1828,118 @@ public final class SearchEngine: @unchecked Sendable {
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
                 let base = fb.baseAddress!
-                // Pack the first 8 folded bytes into a UInt64 so most comparisons are a single
-                // integer compare; nameLessTie's memcmp only runs on an 8-byte key tie. Shared
-                // with the incremental path (§5) so the two orders cannot drift.
+                if useNameRadix {
+                    radixNameOrder(&ids, base, offB, lenB)
+                } else {
+                    // Pack the first 8 folded bytes into a UInt64 so most comparisons are a single
+                    // integer compare; nameLessTie's memcmp only runs on an 8-byte key tie. Shared
+                    // with the incremental path (§5) so the two orders cannot drift.
+                    var pairs = ids.map { (nameKey64(Int($0), base, offB, lenB), $0) }
+                    pairs.sort { a, b in
+                        a.0 != b.0 ? a.0 < b.0 : nameLessTie(Int(a.1), Int(b.1), base, offB, lenB)
+                    }
+                    for k in 0..<pairs.count { ids[k] = pairs[k].1 }
+                }
+            }}}
+        }
+        return ids
+    }
+
+    /// Gate (OI-8): measured on the 1M synthetic bench (mvsim inc13 bench fixture) — radix ~2.2-2.4×
+    /// faster than the comparator sort (clean, single-run timings; e.g. radix=0.041s comparator=0.097s).
+    /// KEPT (>2× gate). The comparator path (pairs.sort below) survives unconditionally for the oracle
+    /// and as a one-flag revert if a future regression drops radix below the gate.
+    private let useNameRadix = true
+
+    /// Produces the EXACT same total order as `pairs.sort { (key64, nameLessTie) }` — key64 asc, then folded-name
+    /// memcmp beyond 8 bytes, then length, then id. Runs under the inherited index rdlock.
+    private func radixNameOrder(_ ids: inout [Int32], _ base: UnsafePointer<UInt8>,
+            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) {
+        let n = ids.count; if n < 2 { return }
+        var srcK = [UInt64](repeating: 0, count: n)
+        for k in 0..<n { srcK[k] = nameKey64(Int(ids[k]), base, offB, lenB) }
+        var src = ids
+        var dst = [Int32](repeating: 0, count: n)
+        var dstK = [UInt64](repeating: 0, count: n)
+        var count = [Int](repeating: 0, count: 65537)
+        for pass in 0..<4 {
+            let shift = UInt64(pass * 16)
+            for k in 0...65536 { count[k] = 0 }
+            for k in 0..<n { count[Int((srcK[k] >> shift) & 0xFFFF) + 1] &+= 1 }
+            for k in 1...65536 { count[k] &+= count[k - 1] }
+            for k in 0..<n {
+                let b = Int((srcK[k] >> shift) & 0xFFFF)
+                let pos = count[b]; count[b] &+= 1
+                dst[pos] = src[k]; dstK[pos] = srcK[k]
+            }
+            swap(&src, &dst); swap(&srcK, &dstK)
+        }
+        // src is now sorted by key64 asc (stable, even pass count). Sort each equal-key64 run by the full tie-break.
+        var i = 0
+        while i < n {
+            var j = i + 1
+            while j < n && srcK[j] == srcK[i] { j += 1 }
+            if j - i > 1 {
+                src[i..<j].sort { nameLessTie(Int($0), Int($1), base, offB, lenB) }
+            }
+            i = j
+        }
+        ids = src
+    }
+
+    /// TEST-ONLY: computes the name-family order both ways (radix, comparator) over all live ids.
+    public func _debugNameOrders() -> (radix: [Int32], comparator: [Int32]) {
+        index.withReadLock {
+            let n = index.count
+            let del = index.deleted
+            var ids = [Int32](); ids.reserveCapacity(n)
+            for i in 0..<n where !del[i] { ids.append(Int32(i)) }
+            return index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+                let base = fb.baseAddress!
+                var radixIds = ids
+                radixNameOrder(&radixIds, base, offB, lenB)
                 var pairs = ids.map { (nameKey64(Int($0), base, offB, lenB), $0) }
                 pairs.sort { a, b in
                     a.0 != b.0 ? a.0 < b.0 : nameLessTie(Int(a.1), Int(b.1), base, offB, lenB)
                 }
-                for k in 0..<pairs.count { ids[k] = pairs[k].1 }
+                let cmpIds = pairs.map { $0.1 }
+                return (radixIds, cmpIds)
             }}}
         }
-        return ids
+    }
+
+    /// TEST-ONLY (bench): same computation as `_debugNameOrders()` but times the radix pass and
+    /// the comparator pass separately (each over an identical `ids` snapshot) so mvsim can print
+    /// the ratio the [OI-8] `< 2×` keep/revert gate is read off. Print-only — never asserted on.
+    public func _debugBenchNameOrders() -> (radixSeconds: Double, comparatorSeconds: Double, n: Int) {
+        index.withReadLock {
+            let n = index.count
+            let del = index.deleted
+            var ids = [Int32](); ids.reserveCapacity(n)
+            for i in 0..<n where !del[i] { ids.append(Int32(i)) }
+            return index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+                let base = fb.baseAddress!
+                let clock = ContinuousClock()
+                var radixIds = ids
+                let r0 = clock.now
+                radixNameOrder(&radixIds, base, offB, lenB)
+                let r1 = clock.now
+                let c0 = clock.now
+                var pairs = ids.map { (nameKey64(Int($0), base, offB, lenB), $0) }
+                pairs.sort { a, b in
+                    a.0 != b.0 ? a.0 < b.0 : nameLessTie(Int(a.1), Int(b.1), base, offB, lenB)
+                }
+                let c1 = clock.now
+                let rd = r0.duration(to: r1), cd = c0.duration(to: c1)
+                let rSec = Double(rd.components.seconds) + Double(rd.components.attoseconds) * 1e-18
+                let cSec = Double(cd.components.seconds) + Double(cd.components.attoseconds) * 1e-18
+                return (rSec, cSec, ids.count)
+            }}}
+        }
     }
 
     /// True full-path sort order (OQ1A): reconstruct each LIVE entry's folded

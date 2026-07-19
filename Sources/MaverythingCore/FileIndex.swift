@@ -90,7 +90,19 @@ public final class FileIndex: @unchecked Sendable {
     var mutationGenLocked: Int { _mutationGen }                       // caller already holds the lock
     @inline(__always) private func bumpMut() { _mutationGen &+= 1 }   // caller holds wrlock
     func bumpMutationLocked() { _mutationGen &+= 1 }                  // internal: Snapshot.swift, caller holds wrlock
-    public func bumpMutation() { wrlock(); _mutationGen &+= 1; unlock() }   // external "refresh now"
+    // External "refresh now" (SearchEngine.invalidate()). Must force a full rebuild in ALL THREE
+    // order families, not just fs=true .size: advance _mutationGen (fsSize), structSeqValue (name),
+    // and strictly advance totalSeq via chgBase (attr family, keyed on (epoch, totalSeq) — a mere
+    // ++ of chgBase with the log emptied would leave totalSeq numerically unchanged, see spec CF-1).
+    public func bumpMutation() {
+        wrlock(); defer { unlock() }
+        _mutationGen &+= 1                                 // fs=true .size family
+        structSeqValue &+= 1                               // name family
+        attrSeqValue   &+= 1                               // kept monotone; not strictly required
+        chgBase = chgBase &+ chgIds.count &+ 1
+        chgIds.removeAll(keepingCapacity: true)
+        chgKinds.removeAll(keepingCapacity: true)
+    }
     /// Locked snapshot of the mutation generation — bumped on every content change. Caches
     /// keyed only by path (e.g. BundleSizeCache) compare against this to self-invalidate.
     public func mutationGeneration() -> Int { rdlock(); defer { unlock() }; return _mutationGen }
@@ -144,6 +156,51 @@ public final class FileIndex: @unchecked Sendable {
         return (nameOff.count, _deletedCount)
     }
 
+    // MARK: - Order-maintenance change log (all writes under wrlock; reads under rdlock)
+    // A flat record stream the SearchEngine replays to update cached sort orders incrementally
+    // instead of re-argsorting ~2M ids per reconcile batch. kinds: 0=append 1=tombstone 2=attr.
+    private var chgIds:   [Int32] = []
+    private var chgKinds: [UInt8] = []
+    private var chgBase:  Int = 0            // global seq of chgIds[0]; totalSeq = chgBase + chgIds.count
+    private var structSeqValue: Int = 0      // monotonic: ++ per append OR tombstone record
+    private var attrSeqValue:   Int = 0      // monotonic: ++ per attr record
+    private var logCap: Int = 1 << 18        // 262144; var so a test hook can shrink it
+
+    @inline(__always) private func logAppend(_ id: Int32)    { logRecord(id, 0); structSeqValue &+= 1 }
+    @inline(__always) private func logTombstone(_ id: Int32) { logRecord(id, 1); structSeqValue &+= 1 }
+    @inline(__always) private func logAttr(_ id: Int32)      { logRecord(id, 2); attrSeqValue &+= 1 }
+
+    @inline(__always) private func logRecord(_ id: Int32, _ kind: UInt8) {
+        chgIds.append(id); chgKinds.append(kind)
+        if chgIds.count > logCap {                 // overflow: drop oldest half, advance base
+            let drop = chgIds.count / 2
+            chgIds.removeFirst(drop); chgKinds.removeFirst(drop)
+            chgBase &+= drop                        // consumers with appliedSeq < chgBase → full rebuild
+        }
+    }
+
+    func resetChangeLog() {                 // clear() / snapshot load (internal: Snapshot.swift calls this)
+        chgIds.removeAll(keepingCapacity: false); chgKinds.removeAll(keepingCapacity: false)
+        chgBase = 0; structSeqValue = 0; attrSeqValue = 0
+    }
+
+    // Locked accessors — CALLER HOLDS THE READ LOCK (SearchEngine order path runs under rdlock).
+    var structSeqLocked: Int { structSeqValue }
+    var attrSeqLocked:   Int { attrSeqValue }
+    var totalSeqLocked:  Int { chgBase &+ chgIds.count }
+    var chgBaseLocked:   Int { chgBase }
+    /// Slice-copy the records in [fromSeq, totalSeq). Returns nil if fromSeq < chgBase (log dropped
+    /// that far back → caller must full-rebuild). COW array slices are safe under the shared rdlock.
+    func changeRecordsLocked(from fromSeq: Int) -> (ids: [Int32], kinds: [UInt8])? {
+        let total = chgBase &+ chgIds.count
+        guard fromSeq >= chgBase, fromSeq <= total else { return nil }
+        let lo = fromSeq - chgBase
+        return (Array(chgIds[lo...]), Array(chgKinds[lo...]))   // lo..<count
+    }
+
+    // TEST-ONLY: force a small cap so mvsim can exercise the overflow→full-rebuild fallback.
+    public func _debugSetChangeLogCap(_ cap: Int) { wrlock(); defer { unlock() }; logCap = max(2, cap) }
+
     // Locked (safe to call from the main thread while the reconciler mutates).
     // Bounds-guarded like `row(_:)`: SwiftUI (GridResults et al.) can render one frame
     // with result ids from the PREVIOUS index generation while a reindex has already
@@ -181,6 +238,7 @@ public final class FileIndex: @unchecked Sendable {
         _deletedCount = 0
         childrenOf.removeAll(keepingCapacity: false)
         dirIndexByHash.removeAll(keepingCapacity: false)
+        resetChangeLog()
     }
 
     public func reserveCapacity(_ n: Int) {
@@ -224,6 +282,7 @@ public final class FileIndex: @unchecked Sendable {
         objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
         nameMask.append(.max)   // authoritative value filled by buildLiveIndexes (safe passthrough meanwhile)
         typeClass.append(fold.withUnsafeBufferPointer { FileTypeClass.mask(foldedName: $0.baseAddress!, 0, $0.count) })
+        logAppend(idx)   // real append site: crawl-start root + live volume mount (spec OI-1)
         return idx   // live-update maps are built in bulk post-crawl (buildLiveIndexes)
     }
 
@@ -260,6 +319,8 @@ public final class FileIndex: @unchecked Sendable {
         // the crawl must not miss these). Now computed in ChildBatch.appendName off the write
         // lock (parallel scan phase) — here we just splice the precomputed masks in.
         typeClass.append(contentsOf: batch.typeClass)
+        for j in 0..<n { logAppend(base &+ Int32(j)) }   // crawl floods overflow the cap ⇒ chgBase
+                                                          // jumps ⇒ consumers full-rebuild (today's behavior)
         return base
     }
 
@@ -655,10 +716,15 @@ public final class FileIndex: @unchecked Sendable {
                     _markDeletedSubtree(oi); res.removed += 1
                     newList.append(appendChild(c, nameStr)); res.added += 1
                 } else {
-                    if size[o] != c.size || mtime[o] != c.mtime || crtime[o] != c.crtime || flags[o] != c.flags {
+                    // flags/hidden affect FILTERING (hidden, UF_HIDDEN) but never a sort key
+                    // (name/path/size/mtime/crtime) — log an attr record only when a sort key
+                    // actually changed, so a flags-only churn doesn't force an order rebuild.
+                    let sortKeyChanged = size[o] != c.size || mtime[o] != c.mtime || crtime[o] != c.crtime
+                    if sortKeyChanged || flags[o] != c.flags {
                         size[o] = c.size; mtime[o] = c.mtime; crtime[o] = c.crtime; flags[o] = c.flags
                         hidden[o] = (c.name.first == UInt8(ascii: ".")) || (c.flags & UInt32(UF_HIDDEN)) != 0
                         res.changed += 1
+                        if sortKeyChanged { logAttr(oi) }
                     }
                     newList.append(oi)
                 }
@@ -701,6 +767,7 @@ public final class FileIndex: @unchecked Sendable {
         typeClass.append(foldBlob.withUnsafeBufferPointer {
             $0.baseAddress.map { FileTypeClass.mask(foldedName: $0, fo, fl) } ?? 0
         })
+        logAppend(idx)   // every reconcile insert + the file↔dir-flip re-add (via appendChild)
         return idx
     }
 
@@ -712,6 +779,7 @@ public final class FileIndex: @unchecked Sendable {
             let c = Int(cur)
             if deleted[c] { continue }
             deleted[c] = true
+            logTombstone(cur)   // sole deleted=true site: covers every deletion path (spec §1)
             removed += 1
             // Drop the hash→id mapping so it can't leak for the whole session on high churn
             // (e.g. repeatedly deleted node_modules/build dirs). Guard on identity so we never

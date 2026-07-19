@@ -32,16 +32,48 @@ public final class SearchEngine: @unchecked Sendable {
     // mutation reuses a stale size order (Codex + red-team review: a real bug even
     // single-threaded, e.g. two socket requests with different useFolderSizes).
     private struct OrderKey: Hashable { let sort: SortKey; let folderSizes: Bool }
-    // Each cached order stores the gen it was built at, keyed PER ORDER (no global dump). The
-    // relevant gen differs by sort: name/path/relevance/runCount orders are attribute-
-    // INDEPENDENT (a name is immutable per id; a rename is tombstone+append; a deletion leaves
-    // a tombstone the scan skips), so they change ONLY on an append or a wholesale replace —
-    // keyed on (epoch, count). The overwhelmingly common FS event (an mtime/size touch on an
-    // existing file) leaves (epoch, count) unchanged → the ~2M name/path re-sort is SKIPPED
-    // entirely, which is the bulk of the idle-CPU "live-refresh storm". size/date orders DO
-    // depend on attributes (and folder-subtree totals), so they stay on the full mutationGen.
-    private var orderCache: [OrderKey: (gen: Int, ids: [Int32])] = [:]
+    // Each cached order remembers the state it was built at, keyed PER ORDER (no global dump).
+    // [13] incremental order maintenance: name/path orders are attribute-INDEPENDENT (a name is
+    // immutable per id; a rename is tombstone+append; a deletion leaves a tombstone the scan
+    // skips) so they only need to grow on structural change (append/tombstone) — `structSeen`
+    // tracks that via FileIndex's change log, letting an attr-only touch (the overwhelmingly
+    // common FS event: an mtime/size change on an existing file) hit an O(1) no-op with NO log
+    // scan at all (the bulk of the idle-CPU "live-refresh storm"). size(fs=false)/date orders DO
+    // depend on attributes, so they track `appliedSeq` against the log's total seq and grow
+    // incrementally from it. fs=true folder-size order stays on the full mutationGen (unchanged;
+    // subtree-total cascade is a separate design — non-goal here).
+    private struct OrderState {
+        var epoch: Int
+        var mutGen: Int          // used ONLY by the fs=true .size variant (unchanged keying)
+        var appliedSeq: Int      // totalSeq consumed into `ids`
+        var structSeen: Int      // structSeqValue at build time (name-family O(1) staleness)
+        var ids: [Int32]
+    }
+    private var orderCache: [OrderKey: OrderState] = [:]
     private let cacheLock = NSLock()
+
+    private enum OrderFamily { case name, attr, fsSize }
+    @inline(__always) private func family(_ key: SortKey, folderSizes: Bool) -> OrderFamily {
+        if key == .size { return folderSizes ? .fsSize : .attr }
+        if key == .dateModified || key == .dateCreated { return .attr }
+        return .name    // .name/.path (relevance/runCount already mapped to .name upstream)
+    }
+
+    // [13] observability: mvsim asserts on the delta of these across a reconcile.
+    private let statsLock = NSLock()
+    private var _orderFullRebuilds = 0, _orderIncrementalApplies = 0, _orderNoopHits = 0
+    @inline(__always) private func bumpFullRebuild() { statsLock.lock(); _orderFullRebuilds += 1;      statsLock.unlock() }
+    @inline(__always) private func bumpIncremental() { statsLock.lock(); _orderIncrementalApplies += 1; statsLock.unlock() }
+    @inline(__always) private func bumpNoop()        { statsLock.lock(); _orderNoopHits += 1;           statsLock.unlock() }
+    /// TEST/observability: read-only snapshot (mvsim asserts on deltas).
+    public func _debugOrderStats() -> (full: Int, incr: Int, noop: Int) {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return (_orderFullRebuilds, _orderIncrementalApplies, _orderNoopHits)
+    }
+    public func _debugResetOrderStats() {
+        statsLock.lock(); _orderFullRebuilds = 0; _orderIncrementalApplies = 0; _orderNoopHits = 0
+        statsLock.unlock()
+    }
 
     // Incremental "narrow as you type": remember the FULL match set of the last simple
     // exact query so the next keystroke (which appends to it) can rescan only that set
@@ -1522,24 +1554,248 @@ public final class SearchEngine: @unchecked Sendable {
 
     // MARK: - sort order (argsort) with caching
 
+    // Lock discipline: the index rdlock is ALREADY held by every caller (via withReadLock/the
+    // search scan). `cacheLock` guards `orderCache` only and is NEVER held across
+    // computeOrder/applyIncremental (both scan index arrays and can be slow) — mirrors the
+    // pre-[13] lock/unlock/compute/relock dance. The freshness check AND the name-family
+    // `appliedSeq` refresh happen in a SINGLE `cacheLock` section (no second acquisition on the
+    // hot attr-storm no-op path — that path is exactly what this feature exists to make O(1)).
+    // Stats bumps (which take `statsLock`) happen only AFTER `cacheLock` is released: `cacheLock`
+    // and `statsLock` are never held together.
     private func orderArray(for key: SortKey) -> [Int32] {
-        // safe: called inside the index read lock. Attribute-dependent orders (size/date) use
-        // the full mutationGen; name/path (attribute-independent) use (epoch, count) so an
-        // attr touch or deletion — which don't change name/path order — don't invalidate them.
-        let attrDependent = (key == .size || key == .dateModified || key == .dateCreated)
-        let gen = attrDependent
-            ? index.mutationGenLocked
-            : index.epochLocked &* 0x1_0000_0000 &+ index.count   // count grows only on append
-        // only .size varies with useFolderSizes; other keys ignore it (folderSizes:false).
-        let ck = OrderKey(sort: key, folderSizes: key == .size && useFolderSizes)
+        let fs  = (key == .size && useFolderSizes)
+        let ck  = OrderKey(sort: key, folderSizes: fs)
+        let fam = family(key, folderSizes: fs)
+        let epoch     = index.epochLocked
+        let structSeq = index.structSeqLocked
+        let totalSeq  = index.totalSeqLocked
+        let mutGen    = index.mutationGenLocked
+
         cacheLock.lock()
-        if let cached = orderCache[ck], cached.gen == gen { let ids = cached.ids; cacheLock.unlock(); return ids }
+        let base: OrderState? = orderCache[ck]
+        if var s = base {
+            switch fam {
+            case .name:
+                if s.epoch == epoch && s.structSeen == structSeq {
+                    if s.appliedSeq != totalSeq { s.appliedSeq = totalSeq; orderCache[ck] = s }   // CF-2: in-lock
+                    let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
+                }
+            case .attr:
+                if s.epoch == epoch && s.appliedSeq == totalSeq {
+                    let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
+                }
+            case .fsSize:
+                if s.mutGen == mutGen {
+                    let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
+                }
+            }
+        }
         cacheLock.unlock()
-        let order = computeOrder(key)
-        cacheLock.lock()
-        orderCache[ck] = (gen, order)   // per-key gen: no global removeAll, so unrelated orders stay warm
-        cacheLock.unlock()
+
+        // Try incremental (name/attr only, and only if we have a same-epoch base to grow from).
+        var result: [Int32]? = nil
+        if fam != .fsSize, let s = base, s.epoch == epoch,
+           let recs = index.changeRecordsLocked(from: s.appliedSeq) {
+            result = applyIncremental(key: key, fam: fam, base: s.ids, ids: recs.ids, kinds: recs.kinds)
+        }
+        let order: [Int32]
+        if let r = result { order = r; bumpIncremental() }
+        else              { order = computeOrder(key); bumpFullRebuild() }
+
+        let newState = OrderState(epoch: epoch, mutGen: mutGen, appliedSeq: totalSeq,
+                                  structSeen: structSeq, ids: order)
+        cacheLock.lock(); orderCache[ck] = newState; cacheLock.unlock()
         return order
+    }
+
+    /// Applies a suffix of the index's change log to `base` to produce the current order without
+    /// a full re-argsort. Runs under the index rdlock (inherited). Returns nil to signal "fall
+    /// back to full rebuild" (caller does `computeOrder`).
+    private func applyIncremental(key: SortKey, fam: OrderFamily, base: [Int32],
+                                  ids: [Int32], kinds: [UInt8]) -> [Int32]? {
+        let n = index.count
+        // 1. Coalesce (sets ⇒ idempotent; ids never resurrect ⇒ order within the window is
+        //    irrelevant). append-then-tombstone / attr-then-tombstone both net to "absent"; a
+        //    multi-attr id's final in-place value is read once at sort time (idempotent).
+        var tomb = Set<Int32>(); var appended = Set<Int32>(); var attrTouched = Set<Int32>()
+        for k in 0..<ids.count {
+            switch kinds[k] {
+            case 0: appended.insert(ids[k])
+            case 1: tomb.insert(ids[k])
+            default: attrTouched.insert(ids[k])          // kind 2
+            }
+        }
+        // name family ignores attr records entirely.
+        let inserts = appended.subtracting(tomb)
+        let moved: Set<Int32> = (fam == .attr) ? attrTouched.subtracting(tomb).subtracting(appended)
+                                               : []
+        // 2. Size guard: distinct affected ids. Cheap upper bound.
+        let k = inserts.count + moved.count + tomb.count
+        if k > max(8192, n / 16) { return nil }          // too big ⇒ full rebuild cheaper/simpler
+        // membership bitset over old ids for O(1) drop test (drop = tomb ∪ moved).
+        var drop = [Bool](repeating: false, count: n)     // sized n; every affected id < n
+        for id in tomb  where Int(id) < n { drop[Int(id)] = true }
+        for id in moved where Int(id) < n { drop[Int(id)] = true }
+        // 3. Pass 1 — filter old order (REQUIRED before any comparison: removes every stale-valued
+        //    id so a probe never compares a moved id's NEW value against its OLD neighbourhood).
+        var filtered = [Int32](); filtered.reserveCapacity(base.count)
+        for id in base { let i = Int(id); if i < n && !drop[i] { filtered.append(id) } }
+        // 4. Sort the k new/moved ids with the SHARED comparator (§5). For attr `moved` ids the
+        //    comparator reads index.size/mtime/crtime which already hold the NEW value
+        //    (applyDirDiff wrote it in-place BEFORE logging), so they sort into their new position.
+        var news = Array(inserts); news.append(contentsOf: moved)
+        if news.isEmpty { return filtered }   // pure deletion batch: nothing to merge in
+        if key == .path { return mergePathIncremental(filtered: filtered, news: news) }
+        sortIds(&news, key: key)                          // shared comparator
+        // 5. Two-pointer merge (both `news` and `filtered` are sorted by the SAME total order):
+        var out = [Int32](); out.reserveCapacity(filtered.count + news.count)
+        var a = 0, b = 0
+        while a < filtered.count && b < news.count {
+            if lessId(news[b], filtered[a], key: key) { out.append(news[b]); b += 1 }
+            else                                       { out.append(filtered[a]); a += 1 }
+        }
+        while a < filtered.count { out.append(filtered[a]); a += 1 }
+        while b < news.count     { out.append(news[b]);     b += 1 }
+        return out
+    }
+
+    /// `.path`-family incremental merge: `news`' folded paths are materialized ONCE into a
+    /// small packed side-blob (k entries, tiny) and sorted with the shared `pathBytesLess`;
+    /// `filtered` is already in path order from the cached base, so each `filtered[a]` probe
+    /// reconstructs its path on demand into REUSED scratch (no full O(n) path blob, unlike
+    /// `computePathOrder`). Uses the exact `foldedPathBytes` signature/args computePathOrder
+    /// uses, so the two can never drift.
+    private func mergePathIncremental(filtered: [Int32], news: [Int32]) -> [Int32] {
+        index.foldBlob.withUnsafeBufferPointer { fb in
+        index.nameOff.withUnsafeBufferPointer { offB in
+        index.nameLen.withUnsafeBufferPointer { lenB in
+        index.parent.withUnsafeBufferPointer { parB -> [Int32] in
+            let base = fb.baseAddress!
+            var newsBlob = [UInt8](); newsBlob.reserveCapacity(news.count * 24)
+            var newsOff = [Int](); newsOff.reserveCapacity(news.count)
+            var newsLen = [Int32](); newsLen.reserveCapacity(news.count)
+            var scratch = [UInt8](repeating: 0, count: 8192)
+            var stack   = [Int32](repeating: 0, count: 4096)
+            scratch.withUnsafeMutableBufferPointer { sb in
+            stack.withUnsafeMutableBufferPointer { stk in
+                for id in news {
+                    let w = foldedPathBytes(Int(id), blob: base, offB: offB, lenB: lenB,
+                                            parB: parB, stack: stk, out: sb)
+                    newsOff.append(newsBlob.count); newsLen.append(Int32(w))
+                    newsBlob.append(contentsOf: UnsafeBufferPointer(start: sb.baseAddress!, count: w))
+                }
+            }}
+            return newsBlob.withUnsafeBufferPointer { nb -> [Int32] in
+                let nbase = nb.baseAddress!
+                var order = Array(0..<news.count)
+                order.sort { i, j in
+                    pathBytesLess(nbase + newsOff[i], Int(newsLen[i]), news[i],
+                                 nbase + newsOff[j], Int(newsLen[j]), news[j])
+                }
+                let sNews = order.map { news[$0] }
+                let sOff  = order.map { newsOff[$0] }
+                let sLen  = order.map { newsLen[$0] }
+
+                var out = [Int32](); out.reserveCapacity(filtered.count + news.count)
+                var a = 0, b = 0
+                var probeScratch = [UInt8](repeating: 0, count: 8192)
+                var probeStack   = [Int32](repeating: 0, count: 4096)
+                probeScratch.withUnsafeMutableBufferPointer { psb in
+                probeStack.withUnsafeMutableBufferPointer { pstk in
+                    while a < filtered.count && b < sNews.count {
+                        let fid = filtered[a]
+                        let fw = foldedPathBytes(Int(fid), blob: base, offB: offB, lenB: lenB,
+                                                 parB: parB, stack: pstk, out: psb)
+                        if pathBytesLess(nbase + sOff[b], Int(sLen[b]), sNews[b],
+                                        psb.baseAddress!, fw, fid) {
+                            out.append(sNews[b]); b += 1
+                        } else {
+                            out.append(fid); a += 1
+                        }
+                    }
+                }}
+                while a < filtered.count { out.append(filtered[a]); a += 1 }
+                while b < sNews.count    { out.append(sNews[b]);    b += 1 }
+                return out
+            }
+        }}}}
+    }
+
+    // MARK: - shared comparator core (§5) — full computeOrder/computePathOrder AND the
+    // incremental applyIncremental route every tie-break through these SAME free functions,
+    // so the two paths cannot drift apart.
+
+    /// First 8 folded name bytes packed into a UInt64 for a cheap integer-compare fast path.
+    @inline(__always) func nameKey64(_ i: Int, _ base: UnsafePointer<UInt8>,
+            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> UInt64 {
+        let o = Int(offB[i]); let l = min(Int(lenB[i]), 8); var k: UInt64 = 0; var j = 0
+        while j < l { k |= UInt64(base[o + j]) << (56 - 8 * j); j += 1 }; return k
+    }
+    @inline(__always) func nameLessTie(_ ia: Int, _ ib: Int, _ base: UnsafePointer<UInt8>,
+            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
+        let oa = Int(offB[ia]), la = Int(lenB[ia]), ob = Int(offB[ib]), lb = Int(lenB[ib])
+        let m = min(la, lb); let r = m > 0 ? memcmp(base + oa, base + ob, m) : 0
+        if r != 0 { return r < 0 }; if la != lb { return la < lb }; return ia < ib   // id tie-break
+    }
+    @inline(__always) func nameLess(_ a: Int32, _ b: Int32, _ base: UnsafePointer<UInt8>,
+            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
+        let ka = nameKey64(Int(a), base, offB, lenB), kb = nameKey64(Int(b), base, offB, lenB)
+        return ka != kb ? ka < kb : nameLessTie(Int(a), Int(b), base, offB, lenB)
+    }
+
+    /// Raw folded-path-byte compare (first 8 bytes are packed by callers for the fast path;
+    /// this is the full memcmp tie-break both the full path sort and the incremental merge use).
+    @inline(__always) func pathBytesLess(_ aPtr: UnsafePointer<UInt8>, _ aLen: Int, _ aId: Int32,
+                                         _ bPtr: UnsafePointer<UInt8>, _ bLen: Int, _ bId: Int32) -> Bool {
+        let m = min(aLen, bLen); let r = m > 0 ? memcmp(aPtr, bPtr, m) : 0
+        if r != 0 { return r < 0 }; if aLen != bLen { return aLen < bLen }; return aId < bId
+    }
+
+    // Attr-family comparators (size fs=false / dateModified / dateCreated), shared by
+    // computeOrder and the incremental sortIds/lessId dispatch.
+    @inline(__always) private func sizeLess(_ a: Int32, _ b: Int32) -> Bool {
+        let s = index.size
+        return s[Int(a)] != s[Int(b)] ? s[Int(a)] < s[Int(b)] : a < b
+    }
+    @inline(__always) private func mtimeLess(_ a: Int32, _ b: Int32) -> Bool {
+        let mt = index.mtime
+        return mt[Int(a)] != mt[Int(b)] ? mt[Int(a)] < mt[Int(b)] : a < b
+    }
+    @inline(__always) private func crtimeLess(_ a: Int32, _ b: Int32) -> Bool {
+        let ct = index.crtime
+        return ct[Int(a)] != ct[Int(b)] ? ct[Int(a)] < ct[Int(b)] : a < b
+    }
+
+    /// Incremental-only comparison entry point for the name/size/date families (`.path` is
+    /// handled specially inside `applyIncremental` — it needs reused path-reconstruction
+    /// scratch threaded through the merge loop, not a per-call buffer open). Never called
+    /// with `.path`/`.relevance`/`.runCount` (scanOrderKey maps the latter two to `.name`
+    /// before `orderArray` is reached — OI-5).
+    private func lessId(_ a: Int32, _ b: Int32, key: SortKey) -> Bool {
+        switch key {
+        case .size: return sizeLess(a, b)
+        case .dateModified: return mtimeLess(a, b)
+        case .dateCreated: return crtimeLess(a, b)
+        default:   // .name (and the unreachable .relevance/.runCount/.path)
+            return index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+                nameLess(a, b, fb.baseAddress!, offB, lenB)
+            }}}
+        }
+    }
+    private func sortIds(_ arr: inout [Int32], key: SortKey) {
+        switch key {
+        case .size: arr.sort { sizeLess($0, $1) }
+        case .dateModified: arr.sort { mtimeLess($0, $1) }
+        case .dateCreated: arr.sort { crtimeLess($0, $1) }
+        default:
+            index.foldBlob.withUnsafeBufferPointer { fb in
+            index.nameOff.withUnsafeBufferPointer { offB in
+            index.nameLen.withUnsafeBufferPointer { lenB in
+                arr.sort { nameLess($0, $1, fb.baseAddress!, offB, lenB) }
+            }}}
+        }
     }
 
     private func computeOrder(_ key: SortKey) -> [Int32] {
@@ -1559,14 +1815,12 @@ public final class SearchEngine: @unchecked Sendable {
                 }
                 ids.sort { eff($0) != eff($1) ? eff($0) < eff($1) : $0 < $1 }
             } else {
-                ids.sort { size[Int($0)] != size[Int($1)] ? size[Int($0)] < size[Int($1)] : $0 < $1 }
+                ids.sort { sizeLess($0, $1) }
             }
         case .dateModified:
-            let mt = index.mtime
-            ids.sort { mt[Int($0)] != mt[Int($1)] ? mt[Int($0)] < mt[Int($1)] : $0 < $1 }
+            ids.sort { mtimeLess($0, $1) }
         case .dateCreated:
-            let ct = index.crtime
-            ids.sort { ct[Int($0)] != ct[Int($1)] ? ct[Int($0)] < ct[Int($1)] : $0 < $1 }
+            ids.sort { crtimeLess($0, $1) }
         case .path:
             break   // handled above by computePathOrder (unreachable; kept exhaustive)
         case .name, .relevance, .runCount:   // relevance/runCount use name order as the scan base
@@ -1574,26 +1828,12 @@ public final class SearchEngine: @unchecked Sendable {
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
                 let base = fb.baseAddress!
-                // Pack the first 8 folded bytes into a UInt64 so most comparisons are
-                // a single integer compare; fall back to memcmp only on an 8-byte tie.
-                @inline(__always) func key64(_ i: Int) -> UInt64 {
-                    let o = Int(offB[i]); let l = min(Int(lenB[i]), 8)
-                    var k: UInt64 = 0
-                    var j = 0
-                    while j < l { k |= UInt64(base[o + j]) << (56 - 8 * j); j += 1 }
-                    return k
-                }
-                var pairs = ids.map { (key64(Int($0)), $0) }
+                // Pack the first 8 folded bytes into a UInt64 so most comparisons are a single
+                // integer compare; nameLessTie's memcmp only runs on an 8-byte key tie. Shared
+                // with the incremental path (§5) so the two orders cannot drift.
+                var pairs = ids.map { (nameKey64(Int($0), base, offB, lenB), $0) }
                 pairs.sort { a, b in
-                    if a.0 != b.0 { return a.0 < b.0 }
-                    let ia = Int(a.1), ib = Int(b.1)
-                    let oa = Int(offB[ia]), la = Int(lenB[ia])
-                    let ob = Int(offB[ib]), lb = Int(lenB[ib])
-                    let m = min(la, lb)
-                    let r = m > 0 ? memcmp(base + oa, base + ob, m) : 0
-                    if r != 0 { return r < 0 }
-                    if la != lb { return la < lb }
-                    return a.1 < b.1
+                    a.0 != b.0 ? a.0 < b.0 : nameLessTie(Int(a.1), Int(b.1), base, offB, lenB)
                 }
                 for k in 0..<pairs.count { ids[k] = pairs[k].1 }
             }}}
@@ -1649,16 +1889,13 @@ public final class SearchEngine: @unchecked Sendable {
                     return k
                 }
                 var pairs = (0..<m).map { (key64($0), Int32($0)) }   // (key, position-in-ids)
+                // Tie-break through the SAME pathBytesLess (§5) the incremental merge uses, so
+                // the two orders cannot drift.
                 pairs.sort { a, b in
                     if a.0 != b.0 { return a.0 < b.0 }
                     let pa = Int(a.1), pbp = Int(b.1)
-                    let oa = offs[pa], la = Int(lens[pa])
-                    let ob = offs[pbp], lb = Int(lens[pbp])
-                    let mm = min(la, lb)
-                    let r = mm > 0 ? memcmp(pbase + oa, pbase + ob, mm) : 0
-                    if r != 0 { return r < 0 }
-                    if la != lb { return la < lb }
-                    return ids[pa] < ids[pbp]   // stable tiebreak by entry id
+                    return pathBytesLess(pbase + offs[pa], Int(lens[pa]), ids[pa],
+                                         pbase + offs[pbp], Int(lens[pbp]), ids[pbp])
                 }
                 var result = [Int32](); result.reserveCapacity(m)
                 for pr in pairs { result.append(ids[Int(pr.1)]) }

@@ -332,6 +332,265 @@ do {
           "total=\(emptyAfter.total) liveBefore=\(liveBefore) shown=\(emptyAfter.ids.count)")
 }
 
+// ---- [13] incremental order maintenance ----
+// Ground-truth oracle: a fresh SearchEngine over the SAME mutated index computes each order
+// cold (computeOrder) — compared element-wise to the warm engine's order via the empty-query
+// path (strips tombstones on both sides). Deterministic seeded LCG only, no system RNG.
+inc13Block: do {
+    var lcg: UInt64 = 0x9E3779B97F4A7C15
+    func rnd() -> UInt64 { lcg = lcg &* 6364136223846793005 &+ 1442695040888963407; return lcg >> 16 }
+    func rndInt(_ m: Int) -> Int { Int(rnd() % UInt64(max(1, m))) }
+    let incKeys: [(SortKey, Bool)] = [(.name, true), (.name, false), (.path, true),
+                                      (.size, true), (.dateModified, true), (.dateCreated, true)]
+    func freshTruth(_ idx: FileIndex, _ k: SortKey, _ asc: Bool) -> [Int32] {
+        let f = SearchEngine(index: idx); f.useFolderSizes = false
+        return f.search("", sortKey: k, ascending: asc, limit: 100_000, now: now).ids
+    }
+
+    // (a) Equivalence property test — THE load-bearing test: across 5 seeds, 200 random
+    // mutation batches each, every incremental-sort key must equal a from-scratch order.
+    var lastSeedDir = ""
+    var lastIdxA: FileIndex? = nil
+    var lastEWarm: SearchEngine? = nil
+    var lastRec: Reconciler? = nil
+    for seed: UInt64 in [1, 2, 3, 4, 5] {
+        let seedDir = root + "/inc13/seed\(seed)"; mkdir(seedDir)
+        // small seed corpus
+        for i in 0..<40 { writeAbs(seedDir + "/f\(i).dat", bytes: 4 + i) }
+        for d in 0..<5 { mkdir(seedDir + "/d\(d)"); for i in 0..<10 { writeAbs(seedDir + "/d\(d)/g\(i).dat", bytes: 4 + i) } }
+
+        let idxA = FileIndex()
+        _ = FileEnumerator(index: idxA).crawl(roots: [seedDir], exclude: [], mountPoints: [])
+        idxA.buildLiveIndexes()
+        let eWarm = SearchEngine(index: idxA); eWarm.useFolderSizes = false
+        let rec = Reconciler(index: idxA, exclude: [])
+        var seedMismatches = 0
+        lcg = seed &* 0xD1B54A32D192ED03 &+ 1
+        var liveFiles: [String] = (0..<40).map { seedDir + "/f\($0).dat" }
+        for d in 0..<5 { for i in 0..<10 { liveFiles.append(seedDir + "/d\(d)/g\(i).dat") } }
+        var opCounter = 0
+        for _ in 0..<200 {
+            let op = rndInt(5)
+            opCounter += 1
+            switch op {
+            case 0:                                             // create file
+                let p = seedDir + "/new_\(seed)_\(opCounter).dat"
+                writeAbs(p, bytes: 4 + rndInt(200)); liveFiles.append(p)
+            case 1:                                             // create dir subtree
+                let dp = seedDir + "/nd_\(seed)_\(opCounter)"
+                mkdir(dp)
+                let cp = dp + "/child.dat"; writeAbs(cp, bytes: 3); liveFiles.append(cp)
+            case 2:                                             // delete
+                if !liveFiles.isEmpty {
+                    let idx2 = rndInt(liveFiles.count)
+                    let p = liveFiles.remove(at: idx2)
+                    try? fm.removeItem(atPath: p)
+                }
+            case 3:                                             // attr-touch (utimes + truncate)
+                if !liveFiles.isEmpty {
+                    let p = liveFiles[rndInt(liveFiles.count)]
+                    var tv = [timeval(tv_sec: Int(now) + opCounter, tv_usec: 0),
+                              timeval(tv_sec: Int(now) + opCounter, tv_usec: 0)]
+                    _ = utimes(p, &tv)
+                    FileManager.default.createFile(atPath: p, contents: Data(count: 1 + rndInt(500)))
+                }
+            default:                                            // rename (tombstone + new append)
+                if !liveFiles.isEmpty {
+                    let idx2 = rndInt(liveFiles.count)
+                    let p = liveFiles.remove(at: idx2)
+                    let np = p + "_r\(opCounter)"
+                    try? fm.moveItem(atPath: p, toPath: np)
+                    liveFiles.append(np)
+                }
+            }
+            _ = rec.reconcile(eventPaths: [seedDir])            // NO manual invalidate
+            for (k, asc) in incKeys {
+                let warm  = eWarm.search("", sortKey: k, ascending: asc, limit: 100_000, now: now).ids
+                let truth = freshTruth(idxA, k, asc)
+                if warm != truth { seedMismatches += 1 }
+                check("inc13 seed\(seed) op\(opCounter) \(k) asc=\(asc): warm == scratch",
+                      warm == truth, "warm=\(warm.count) truth=\(truth.count)")
+            }
+        }
+        if seed == 5 {
+            // keep the last seed's live index/engine/dir around for tests (b)-(f); avoid
+            // rebuilding a fresh corpus for each.
+            lastSeedDir = seedDir; lastIdxA = idxA; lastEWarm = eWarm; lastRec = rec
+        } else {
+            try? fm.removeItem(atPath: seedDir)
+        }
+        _ = seedMismatches   // already asserted per-op above; kept for potential debug use
+    }
+
+    guard let idxA = lastIdxA, let eWarm = lastEWarm, let rec = lastRec else {
+        check("inc13 setup: last-seed index available for (b)-(f)", false)
+        break inc13Block
+    }
+    let seedDir = lastSeedDir
+
+    // (b) attr-only ⇒ name-family O(1) no-op (the storm-kill contract).
+    _ = eWarm.search("", sortKey: .name, limit: 100_000, now: now)   // warm .name
+    eWarm._debugResetOrderStats()
+    let existingPath = seedDir + "/f0.dat"
+    var tv = [timeval(tv_sec: Int(now) + 9, tv_usec: 0), timeval(tv_sec: Int(now) + 9, tv_usec: 0)]
+    if fm.fileExists(atPath: existingPath) {
+        _ = utimes(existingPath, &tv)
+    } else {
+        // f0.dat may have been renamed/deleted during (a)'s random walk; touch whatever
+        // survives so the attr-only invariant still exercises a real mtime change.
+        if let any = try? fm.contentsOfDirectory(atPath: seedDir).first(where: { !$0.hasPrefix("inc13") }) {
+            _ = utimes(seedDir + "/" + any, &tv)
+        }
+    }
+    _ = rec.reconcile(eventPaths: [seedDir])
+    _ = eWarm.search("", sortKey: .name, limit: 100_000, now: now)
+    let sB = eWarm._debugOrderStats()
+    check("inc13(b) attr-only ⇒ name noop, no rebuild", sB.noop == 1 && sB.full == 0 && sB.incr == 0,
+          "full=\(sB.full) incr=\(sB.incr) noop=\(sB.noop)")
+
+    // (c) small structural batch ⇒ incremental, not full.
+    eWarm._debugResetOrderStats()
+    writeAbs(seedDir + "/inc_c_marker.dat", bytes: 4)
+    _ = rec.reconcile(eventPaths: [seedDir])
+    let warmC = eWarm.search("", sortKey: .name, limit: 100_000, now: now).ids
+    let sC = eWarm._debugOrderStats()
+    check("inc13(c) small append ⇒ incremental apply", sC.incr == 1 && sC.full == 0,
+          "full=\(sC.full) incr=\(sC.incr)")
+    check("inc13(c) incremental result == scratch", warmC == freshTruth(idxA, .name, true))
+
+    // (d) log overflow ⇒ full-rebuild fallback, still equal.
+    idxA._debugSetChangeLogCap(4)                      // force tiny cap
+    eWarm._debugResetOrderStats()
+    for i in 0..<50 { writeAbs(seedDir + "/ovf_\(i).dat", bytes: 3) }
+    _ = rec.reconcile(eventPaths: [seedDir])            // >cap records ⇒ chgBase jumps past appliedSeq
+    let warmD = eWarm.search("", sortKey: .name, limit: 100_000, now: now).ids
+    let sD = eWarm._debugOrderStats()
+    check("inc13(d) overflow ⇒ full rebuild fallback", sD.full >= 1, "full=\(sD.full)")
+    check("inc13(d) fallback result still == scratch", warmD == freshTruth(idxA, .name, true))
+
+    // (e) snapshot-load resets the log; scratch equality holds.
+    let blob13 = idxA.snapshotData(lastEventId: 0, savedAt: Double(now))
+    let idxL = FileIndex(); _ = idxL.loadSnapshot(blob13); idxL.buildLiveIndexes()
+    let eL = SearchEngine(index: idxL); eL.useFolderSizes = false
+    let aE = eL.search("", sortKey: .name, limit: 100_000, now: now).ids
+    let bE = freshTruth(idxL, .name, true)
+    check("inc13(e) after snapshot-load order == scratch (log reset)", aE == bE)
+
+    // (f) Bench (informational, NOT asserted).
+    let cold = SearchEngine(index: idxA); cold.useFolderSizes = false
+    let t0 = ContinuousClock().now
+    _ = cold.search("", sortKey: .name, limit: 100_000, now: now)      // full computeOrder
+    let t1 = ContinuousClock().now
+    writeAbs(seedDir + "/bench_one.dat", bytes: 3); _ = rec.reconcile(eventPaths: [seedDir])
+    let t2 = ContinuousClock().now
+    _ = eWarm.search("", sortKey: .name, limit: 100_000, now: now)     // incremental (+1 id)
+    let t3 = ContinuousClock().now
+    print("inc13(f) full=\(t0.duration(to: t1)) incr(+1)=\(t2.duration(to: t3)) n=\(idxA.count)")
+
+    try? fm.removeItem(atPath: seedDir)
+}
+
+// ---- [13] informational large-scale (~1M target, raw-syscall fixture for speed) incremental
+// bench (print only, not asserted). FileManager.createFile is far too slow per-call at this
+// scale, so this fixture writes each file via raw open/write/close.
+func fastWrite(_ p: String, bytes: Int) {
+    let fd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+    guard fd >= 0 else { return }
+    if bytes > 0 { let buf = [UInt8](repeating: 1, count: bytes); _ = buf.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, bytes) } }
+    close(fd)
+}
+do {
+    let benchRoot = NSTemporaryDirectory() + "mvsim-inc13-bench-\(getpid())"
+    try? fm.removeItem(atPath: benchRoot)
+    mkdir(benchRoot)
+    let dirs = 1000, perDir = 1000                      // target ~1,000,000 files
+    for d in 0..<dirs {
+        let dp = benchRoot + "/b\(d)"
+        mkdir(dp)
+        for i in 0..<perDir { fastWrite(dp + "/f\(i).dat", bytes: 1) }
+    }
+    let idxB = FileIndex()
+    _ = FileEnumerator(index: idxB).crawl(roots: [benchRoot], exclude: [], mountPoints: [])
+    idxB.buildLiveIndexes()
+    let eB = SearchEngine(index: idxB); eB.useFolderSizes = false
+    let tb0 = ContinuousClock().now
+    _ = eB.search("", sortKey: .name, limit: 1_000_000, now: now)      // cold full computeOrder over ~1M
+    let tb1 = ContinuousClock().now
+    let recB = Reconciler(index: idxB, exclude: [])
+    fastWrite(benchRoot + "/b0/bench_incr_one.dat", bytes: 1)
+    let tb2 = ContinuousClock().now
+    _ = recB.reconcile(eventPaths: [benchRoot])
+    _ = eB.search("", sortKey: .name, limit: 1_000_000, now: now)      // warm incremental (+1 id)
+    let tb3 = ContinuousClock().now
+    print("inc13(bench) n=\(idxB.count) full=\(tb0.duration(to: tb1)) incr(+1)=\(tb2.duration(to: tb3))")
+    try? fm.removeItem(atPath: benchRoot)
+}
+
+// ---- [13g] VERIFIER-ADDED: coalescing / multi-record-per-window incremental apply ----
+// The (a) property test queries after EVERY op, so each incremental apply only ever replays a
+// SINGLE op's records — it NEVER exercises the coalescing paths the spec §4 leans on
+// (append-then-tombstone, attr-then-tombstone, multi-attr-on-one-id, append-then-attr all in
+// ONE replay window). Here we accumulate several reconciles WITHOUT an intervening query so a
+// single query's incremental apply must replay a window containing multiple records for the
+// same id, then compare to a cold from-scratch oracle for every key.
+inc13gBlock: do {
+    func truth(_ idx: FileIndex, _ k: SortKey, _ asc: Bool) -> [Int32] {
+        let f = SearchEngine(index: idx); f.useFolderSizes = false
+        return f.search("", sortKey: k, ascending: asc, limit: 100_000, now: now).ids
+    }
+    let gKeys: [(SortKey, Bool)] = [(.name, true), (.path, true),
+                                    (.size, true), (.dateModified, true), (.dateCreated, true)]
+    let gDir = root + "/inc13g"; mkdir(gDir)
+    for i in 0..<60 { writeAbs(gDir + "/base\(i).dat", bytes: 10 + i) }
+    let idxG = FileIndex()
+    _ = FileEnumerator(index: idxG).crawl(roots: [gDir], exclude: [], mountPoints: [])
+    idxG.buildLiveIndexes()
+    let eG = SearchEngine(index: idxG); eG.useFolderSizes = false
+    let recG = Reconciler(index: idxG, exclude: [])
+    // Warm every key so the next query grows incrementally from a base.
+    for (k, asc) in gKeys { _ = eG.search("", sortKey: k, ascending: asc, limit: 100_000, now: now) }
+
+    // Accumulate a batch of reconciles with NO query in between:
+    //  - append-then-tombstone: create X, reconcile; delete X, reconcile.
+    var tv1 = [timeval(tv_sec: Int(now) + 1000, tv_usec: 0), timeval(tv_sec: Int(now) + 1000, tv_usec: 0)]
+    writeAbs(gDir + "/coalesce_X.dat", bytes: 7); _ = recG.reconcile(eventPaths: [gDir])
+    try? fm.removeItem(atPath: gDir + "/coalesce_X.dat"); _ = recG.reconcile(eventPaths: [gDir])
+    //  - attr-then-tombstone: touch base1, reconcile; delete base1, reconcile.
+    _ = utimes(gDir + "/base1.dat", &tv1); _ = recG.reconcile(eventPaths: [gDir])
+    try? fm.removeItem(atPath: gDir + "/base1.dat"); _ = recG.reconcile(eventPaths: [gDir])
+    //  - multi-attr on one id: touch base2 twice with different mtime AND size, reconcile each.
+    var tv2 = [timeval(tv_sec: Int(now) + 2000, tv_usec: 0), timeval(tv_sec: Int(now) + 2000, tv_usec: 0)]
+    FileManager.default.createFile(atPath: gDir + "/base2.dat", contents: Data(count: 999))
+    _ = utimes(gDir + "/base2.dat", &tv2); _ = recG.reconcile(eventPaths: [gDir])
+    var tv3 = [timeval(tv_sec: Int(now) + 3000, tv_usec: 0), timeval(tv_sec: Int(now) + 3000, tv_usec: 0)]
+    FileManager.default.createFile(atPath: gDir + "/base2.dat", contents: Data(count: 3))
+    _ = utimes(gDir + "/base2.dat", &tv3); _ = recG.reconcile(eventPaths: [gDir])
+    //  - append-then-attr: create W, reconcile; change W's size+mtime, reconcile.
+    writeAbs(gDir + "/coalesce_W.dat", bytes: 5); _ = recG.reconcile(eventPaths: [gDir])
+    var tv4 = [timeval(tv_sec: Int(now) + 4000, tv_usec: 0), timeval(tv_sec: Int(now) + 4000, tv_usec: 0)]
+    FileManager.default.createFile(atPath: gDir + "/coalesce_W.dat", contents: Data(count: 777))
+    _ = utimes(gDir + "/coalesce_W.dat", &tv4); _ = recG.reconcile(eventPaths: [gDir])
+    //  - plain moves/creates to widen the window: create a couple more.
+    for i in 0..<5 { writeAbs(gDir + "/extra\(i).dat", bytes: 20 + i * 7) }
+    _ = recG.reconcile(eventPaths: [gDir])
+
+    // ONE query per key now — each must replay the whole accumulated window (multiple records
+    // per id) and still equal a cold from-scratch order.
+    eG._debugResetOrderStats()
+    for (k, asc) in gKeys {
+        let warm  = eG.search("", sortKey: k, ascending: asc, limit: 100_000, now: now).ids
+        let cold  = truth(idxG, k, asc)
+        check("inc13g coalesce \(k) asc=\(asc): warm == scratch", warm == cold,
+              "warm=\(warm.count) cold=\(cold.count)")
+    }
+    let sG = eG._debugOrderStats()
+    // At least one key must have taken the incremental path (window well under the size guard),
+    // otherwise the coalescing code was never actually exercised and the test is vacuous.
+    check("inc13g coalescing exercised the incremental path (not all full-rebuild)",
+          sG.incr >= 1, "full=\(sG.full) incr=\(sG.incr) noop=\(sG.noop)")
+    try? fm.removeItem(atPath: gDir)
+}
+
 // Everything's "Include only files" whitelist + live hide-hidden toggle
 write("music_a.mp3", bytes: 2); write("music_b.flac", bytes: 2); write("notes_w.txt", bytes: 2)
 let onlyPats = FileEnumerator.parseFilePatterns("*.mp3;*.flac")

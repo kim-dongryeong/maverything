@@ -251,9 +251,11 @@ public final class SearchEngine: @unchecked Sendable {
         // content:/tag: are post-filters that do FILE I/O (read contents / xattrs), so they
         // must run OUTSIDE the index read lock — a long scan must never block the reconciler.
         // The name/metadata scan first narrows candidates under the lock as usual.
+        var parsedForGate: ParsedQuery? = nil   // [21] see the gate block below — set alongside `post`
         let post: ParsedQuery? = {
             guard mode != .regex else { return nil }
             let p = QueryParser.parse(query, defaultScope: scope == .fullPath ? .path : .name, now: now)
+            parsedForGate = p
             return (p.contentNeedle != nil || !p.tagGroups.isEmpty) ? p : nil
         }()
         // Snapshot the two result-stage toggles ONCE so every stage sees a consistent value —
@@ -279,6 +281,29 @@ public final class SearchEngine: @unchecked Sendable {
         // EMPTY regex query (nothing to compile) is routed through the normal locked path instead
         // — `_search` treats it like any other empty query (unchanged "show all" behavior).
         let isNonEmptyRegex = mode == .regex && !query.trimmingCharacters(in: .whitespaces).isEmpty
+        // [21] Phased buildLiveIndexes (warm snapshot-load path): loadSnapshot leaves the index
+        // Phase-A-complete (arrays live, nameMask/typeClass/camelBits at safe "match everything"
+        // sentinels, CSR/dirIndexByHash empty) and the background queue fills Phase B (masks)
+        // then Phase C (tree) afterwards. Most query shapes are correct straight off the Phase-A
+        // sentinels (bloom prefilter no-ops, emptyDirBitmap/_folderSizes are parent-based, isUnder
+        // walks parent[] — SPEC-B3-FINAL §2.2's full reader table) and must NOT wait. Only the two
+        // shapes that would otherwise return WRONG (not just slower) results wait: type:/notType:
+        // filters and relevance ranking need authoritative typeClass/camelBits (B3/B4 — sentinel
+        // 0xFF over-broadly matches every type:), and a folder-scope root resolve needs an
+        // authoritative dirIndexByHash (C1 — an empty map reads "scope unresolved" and returns
+        // EMPTY, a silent wrong answer for a valid folder). MUST run HERE, BEFORE the
+        // `index.withReadLock { … _search … }` acquisition below — `_search` runs INSIDE that
+        // lock, so waiting there would block holding the rwlock (deadlocks Phase B/C's own brief
+        // wrlock, which is exactly what it's trying to publish). `isNonEmptyRegex` is excluded:
+        // regexSearch's own scope check is parent-based (C2, Phase-A-safe) and it never reads
+        // typeClass/camelBits, so it needs neither wait.
+        if !isNonEmptyRegex {
+            let needMasks = (parsedForGate.map { !$0.typeMasks.isEmpty || !$0.notTypeMasks.isEmpty } ?? false)
+                            || sortKey == .relevance
+            let needTree  = (scopeRoot != nil)   // C1 ONLY — empty:/size-sort are Phase-A-correct (C3/C4)
+            if needMasks { index.waitForMasks() }
+            if needTree  { index.waitForTree() }
+        }
         let res: SearchResults
         if isNonEmptyRegex {
             let clock = ContinuousClock(); let start = clock.now

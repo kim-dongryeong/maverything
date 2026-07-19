@@ -134,7 +134,81 @@ public final class FileIndex: @unchecked Sendable {
     @inline(__always) func rdlock() { pthread_rwlock_rdlock(rwlock) }   // internal: Snapshot.swift extension uses these
     @inline(__always) func wrlock() { pthread_rwlock_wrlock(rwlock) }
     @inline(__always) func unlock() { pthread_rwlock_unlock(rwlock) }
-    deinit { pthread_rwlock_destroy(rwlock); rwlock.deallocate() }
+    deinit {
+        pthread_rwlock_destroy(rwlock); rwlock.deallocate()
+        pthread_cond_destroy(readyCond); readyCond.deallocate()
+        pthread_mutex_destroy(readyMutex); readyMutex.deallocate()
+    }
+
+    // MARK: - [21] Phased buildLiveIndexes readiness (warm-path snapshot load)
+    //
+    // `loadSnapshot` leaves a Phase-A-complete index on return: arrays live, nameMask/
+    // typeClass/camelBits seeded to safe "match everything" sentinels, CSR/dirIndexByHash
+    // empty. `buildNameMasksPhase()` (Phase B) and `buildTreePhase()` (Phase C) fill the
+    // authoritative values afterwards on the warm path; `buildLiveIndexes()` (crawl/cold
+    // path) does both in one shot and sets both flags true at the end, so its callers are
+    // unaffected. See SPEC-B3-FINAL §2.1.
+    private var liveMasksReadyValue = false   // Phase B done: nameMask/typeClass/camelBits authoritative
+    private var liveTreeReadyValue  = false   // Phase C done: dirIndexByHash + CSR authoritative
+    var liveMasksReadyLocked: Bool { liveMasksReadyValue }   // caller holds a lock (rd or wr)
+    var liveTreeReadyLocked:  Bool { liveTreeReadyValue }
+    /// TEST/UI: true once Phase C (the full live indexes) is ready. Takes its own rdlock.
+    public var liveIndexesReady: Bool { rdlock(); defer { unlock() }; return liveTreeReadyValue }
+    /// TEST-ONLY: Phase B done (nameMask/typeClass/camelBits authoritative). `liveIndexesReady`
+    /// only surfaces Phase C; mvsim's phased-warm block needs to observe Phase B independently.
+    public var _debugMasksReady: Bool { rdlock(); defer { unlock() }; return liveMasksReadyValue }
+
+    /// Dedicated cond var (NOT the rwlock) so a search waiting on a phase never blocks — and
+    /// is never blocked by — a concurrent rdlock/wrlock holder. A waiter must NEVER hold the
+    /// index rwlock while parked here (§2.2 scan-time gate calls these before acquiring it).
+    private let readyMutex: UnsafeMutablePointer<pthread_mutex_t> = {
+        let p = UnsafeMutablePointer<pthread_mutex_t>.allocate(capacity: 1)
+        pthread_mutex_init(p, nil)
+        return p
+    }()
+    private let readyCond: UnsafeMutablePointer<pthread_cond_t> = {
+        let p = UnsafeMutablePointer<pthread_cond_t>.allocate(capacity: 1)
+        pthread_cond_init(p, nil)
+        return p
+    }()
+
+    /// Blocks until Phase B (nameMask/typeClass/camelBits) is authoritative. Returns
+    /// immediately if already ready (bounded wait: Phase B/C are scheduled on the warm
+    /// queue right after Phase A, ~30-50ms/~10-20ms — see §2.1).
+    public func waitForMasks() {
+        pthread_mutex_lock(readyMutex)
+        while !liveMasksReadyValue { pthread_cond_wait(readyCond, readyMutex) }
+        pthread_mutex_unlock(readyMutex)
+    }
+    /// Blocks until Phase C (dirIndexByHash + CSR) is authoritative.
+    public func waitForTree() {
+        pthread_mutex_lock(readyMutex)
+        while !liveTreeReadyValue { pthread_cond_wait(readyCond, readyMutex) }
+        pthread_mutex_unlock(readyMutex)
+    }
+    /// Flip a readiness flag TRUE. Caller MUST hold the wrlock (lock order is always
+    /// wrlock → readyMutex; waiters take readyMutex only, so no inversion). Writing the
+    /// value INSIDE the cond mutex while still under the wrlock closes the agy-review race:
+    /// a clear()/loadSnapshot between "phase done under wrlock" and a separate broadcast
+    /// could be overwritten, marking an emptied index "ready" and waking waiters into OOB
+    /// reads. With the single-site write + the phase functions' epoch guard, a stale phase
+    /// can never re-assert readiness over a reset.
+    @inline(__always) private func setReadyLocked(masks: Bool, tree: Bool) {
+        pthread_mutex_lock(readyMutex)
+        if masks { liveMasksReadyValue = true }
+        if tree { liveTreeReadyValue = true }
+        pthread_cond_broadcast(readyCond)
+        pthread_mutex_unlock(readyMutex)
+    }
+    /// clear() / loadSnapshot() / crawl start: both phases are false again until the next
+    /// buildLiveIndexes() (cold) or buildNameMasksPhase()+buildTreePhase() (warm) run.
+    /// Caller holds the wrlock; the cond mutex is taken too so the false-write is
+    /// synchronized with waiters' predicate reads (same wrlock → readyMutex order).
+    func resetReadinessLocked() {
+        pthread_mutex_lock(readyMutex)
+        liveMasksReadyValue = false; liveTreeReadyValue = false
+        pthread_mutex_unlock(readyMutex)
+    }
 
     /// Bumped under the write lock on EVERY content mutation (append/delete/attr/clear/
     /// load). SearchEngine keys its order/narrowing caches off this, so a mutation can
@@ -318,6 +392,7 @@ public final class FileIndex: @unchecked Sendable {
         dirIndexByHash.removeAll(keepingCapacity: false)
         resetChangeLog()
         resetFsizeLocked()   // [N2] defense-in-depth
+        resetReadinessLocked()   // [21] a fresh crawl starts back at "no phase complete"
     }
 
     public func reserveCapacity(_ n: Int) {
@@ -419,8 +494,13 @@ public final class FileIndex: @unchecked Sendable {
     private var liveBuildGenValue = 0
     var liveBuildGenLocked: Int { liveBuildGenValue }   // caller holds a lock
 
+    /// Cold path (crawl end / rescan): builds masks AND the tree in one shot, matching
+    /// pre-[21] behavior exactly. The warm (snapshot-load) path instead runs
+    /// `buildNameMasksPhase()` then `buildTreePhase()` so the UI can serve name search
+    /// after Phase A without waiting for either (§2.1/§2.5 — crawl is intentionally NOT
+    /// phased, to avoid complicating the one code path every launch depends on).
     public func buildLiveIndexes() {
-        wrlock(); defer { unlock() }
+        wrlock()
         liveBuildGenValue &+= 1
         let n = nameOff.count
         dirIndexByHash.removeAll(keepingCapacity: true)
@@ -478,6 +558,132 @@ public final class FileIndex: @unchecked Sendable {
         // crawl / right after snapshot load) would be cached under an unchanged gen and
         // never re-resolve (Codex review).
         bumpMut()
+        setReadyLocked(masks: true, tree: true)   // [21] one-shot cold path: both phases at once
+        unlock()
+    }
+
+    /// [21] Phase B (warm path only): compute nameMask/typeClass/camelBits authoritatively —
+    /// exactly what `computeNameMasksLocked` computes, but OFF-LOCK (§2.4): read the
+    /// immutable-through-A→C source arrays under a brief rdlock, compute three FRESH local
+    /// arrays with NO lock held (safe under OI-4 — no writer runs between Phase A and Phase C
+    /// on the warm path, so nothing mutates nameOff/nameLen/foldBlob/unicodeFold*/nameBlob
+    /// concurrently), then take the wrlock only to swap the three properties in (microseconds)
+    /// and flip the readiness flag. This keeps a concurrent Phase-A search's rdlock hold short
+    /// even while a ~2M-entry mask scan runs in the background.
+    public func buildNameMasksPhase() {
+        rdlock()
+        let epoch0 = epochValue   // agy review: guard the publish against a mid-phase clear/reload
+        let n = nameOff.count
+        let nameOffL = nameOff, nameLenL = nameLen, foldBlobL = foldBlob
+        let unicodeFoldBlobL = unicodeFoldBlob
+        let unicodeFoldOffL = unicodeFoldOff, unicodeFoldLenL = unicodeFoldLen
+        let nameBlobL = nameBlob
+        unlock()
+
+        var newMask = [UInt64](repeating: 0, count: n)
+        var newType = [UInt8](repeating: 0, count: n)
+        var newCamel = [UInt64](repeating: 0, count: n)
+        foldBlobL.withUnsafeBufferPointer { fb in
+        unicodeFoldBlobL.withUnsafeBufferPointer { ub in
+        nameBlobL.withUnsafeBufferPointer { nbb in
+        newMask.withUnsafeMutableBufferPointer { mb in
+        newType.withUnsafeMutableBufferPointer { tc in
+        newCamel.withUnsafeMutableBufferPointer { cb in
+            let fbBase = fb.baseAddress!, nbBase = nbb.baseAddress!
+            for i in 0..<n {
+                var m: UInt64 = 0
+                let o = Int(nameOffL[i]), e = o + Int(nameLenL[i])
+                for k in o..<e { m |= (1 << UInt64(Self.charBit(fb[k]))) }
+                if unicodeFoldOffL[i] != noUnicodeFoldOffset {
+                    let uo = Int(unicodeFoldOffL[i]), ue = uo + Int(unicodeFoldLenL[i])
+                    for k in uo..<ue { m |= (1 << UInt64(Self.charBit(ub[k]))) }
+                }
+                mb[i] = m
+                tc[i] = FileTypeClass.mask(foldedName: fbBase, o, Int(nameLenL[i]))
+                cb[i] = Self.camelBitsOf(nbBase, o, Int(nameLenL[i]))
+            }
+        }}}}}}
+
+        wrlock()
+        // agy review: if a clear()/loadSnapshot replaced the index while we computed, these
+        // buffers describe a DEAD index — publishing them (or re-asserting readiness over the
+        // reset) would hand waiters authoritative-looking garbage. Abandon; the new epoch's
+        // own build owns readiness now.
+        guard epochValue == epoch0 else { unlock(); return }
+        nameMask = newMask
+        typeClass = newType
+        camelBits = newCamel
+        liveBuildGenValue &+= 1
+        bumpMut()
+        setReadyLocked(masks: true, tree: false)
+        unlock()
+    }
+
+    /// [21] Phase C (warm path only): build dirIndexByHash + CSR (csrChildOff/csrChildIds) and
+    /// drop childOverlay — the second half of `buildLiveIndexes`, off-lock (§2.4) the same way
+    /// as Phase B: snapshot the immutable-through-A→C source arrays under a brief rdlock,
+    /// compute fresh locals with no lock held, then take the wrlock only to publish + flip the
+    /// readiness flag.
+    public func buildTreePhase() {
+        rdlock()
+        let epoch0 = epochValue   // agy review: guard the publish against a mid-phase clear/reload
+        let n = nameOff.count
+        let nameOffL = nameOff, nameLenL = nameLen, nameBlobL = nameBlob
+        let parentL = parent, objTypeL = objType
+        unlock()
+
+        var dirHash = [UInt64](repeating: 0, count: n)   // FNV state of each dir's display path
+        var newDirIndexByHash: [UInt64: Int32] = [:]
+        nameBlobL.withUnsafeBufferPointer { blob in
+            func feedName(_ h: UInt64, _ i: Int) -> UInt64 {
+                var h = h
+                let o = Int(nameOffL[i]), e = o + Int(nameLenL[i])
+                for k in o..<e { h = fnvFeed(h, blob[k]) }
+                return h
+            }
+            for i in 0..<n {
+                let p = parentL[i]
+                if objTypeL[i] == VNODE_VDIR {
+                    let pi = Int(p)
+                    let h: UInt64
+                    if p < 0 {
+                        h = feedName(fnvOffsetBasis, i)   // root: name IS the display path
+                    } else if pi < i, objTypeL[pi] == VNODE_VDIR {
+                        let parentIsSlashRoot = parentL[pi] < 0 && nameLenL[pi] == 1
+                            && blob[Int(nameOffL[pi])] == UInt8(ascii: "/")
+                        h = feedName(parentIsSlashRoot ? dirHash[pi]
+                                                       : fnvFeed(dirHash[pi], UInt8(ascii: "/")), i)
+                    } else {
+                        h = feedName(fnvOffsetBasis, i)   // shouldn't happen (parent dir precedes child)
+                    }
+                    dirHash[i] = h
+                    newDirIndexByHash[h] = Int32(i)   // "/" roots collide; harmless
+                }
+            }
+        }
+        // CSR children — identical counting-sort as buildLiveIndexes (see there for the
+        // empty-index-safe reasoning).
+        var newCsrChildOff = [Int32](repeating: 0, count: n + 1)
+        for i in 0..<n { let p = parentL[i]; if p >= 0 { newCsrChildOff[Int(p) + 1] &+= 1 } }
+        if n > 0 { for i in 1...n { newCsrChildOff[i] &+= newCsrChildOff[i - 1] } }
+        let totalChildren = Int(newCsrChildOff[n])
+        var newCsrChildIds = [Int32](repeating: 0, count: totalChildren)
+        var cursor = newCsrChildOff
+        for i in 0..<n {
+            let p = parentL[i]
+            if p >= 0 { let pos = Int(cursor[Int(p)]); newCsrChildIds[pos] = Int32(i); cursor[Int(p)] &+= 1 }
+        }
+
+        wrlock()
+        guard epochValue == epoch0 else { unlock(); return }   // agy review: dead-index buffers
+        dirIndexByHash = newDirIndexByHash
+        childOverlay.removeAll(keepingCapacity: false)   // CSR now authoritative — absorb/drop overlay
+        csrChildOff = newCsrChildOff
+        csrChildIds = newCsrChildIds
+        liveBuildGenValue &+= 1
+        bumpMut()
+        setReadyLocked(masks: false, tree: true)
+        unlock()
     }
 
     /// Authoritative bloom-mask pass. Each entry's mask = the folded characters of

@@ -155,6 +155,14 @@ final class AppModel: ObservableObject {
     @Published var isIndexing = true {
         didSet { let v = isIndexing; AppModel.indexingMirror.withLock { $0 = v } }   // thread-safe mirror for QueryServer
     }
+    /// [21] Phase A done (arrays live, name/ext/size/date/empty:/size-sort queries correct) on
+    /// the warm snapshot-load path — set true right after `loadSnapshot` returns, WITHOUT
+    /// flipping `isIndexing` (which must stay true through Phase C so the writers gated on
+    /// `!isIndexing` — refreshMountedVolumes, volume-mount rescans, stale-resume reindex, custom-
+    /// root rescan — stay deferred; see §2.6's gate matrix). `runSearch` gates on THIS, not
+    /// `isIndexing`, so the UI serves a Phase-A-correct search immediately instead of blocking
+    /// until Phase C. Reset to false at the start of every (re)load/(re)crawl.
+    @Published var nameSearchReady = false
     /// Lock-protected mirror of `isIndexing` so the background socket-server thread can
     /// read it without touching @MainActor state (Codex + red-team: reading the
     /// @Published Bool off-main is a data race / Swift-6 break).
@@ -382,6 +390,10 @@ final class AppModel: ObservableObject {
 
         // Mirror the primary's shared status so this window's overlays/status bar stay live.
         isIndexing = primary.isIndexing
+        // [21] `runSearch` gates on `nameSearchReady`, not `isIndexing` — a secondary window
+        // must mirror it too (both the initial value and the live stream below), or its OWN
+        // `nameSearchReady` sits at its default `false` forever and `runSearch()` never runs.
+        nameSearchReady = primary.nameSearchReady
         indexedCount = primary.indexedCount
         statusText = primary.statusText
         hasFullDiskAccess = primary.hasFullDiskAccess
@@ -401,9 +413,12 @@ final class AppModel: ObservableObject {
             resultsVersion &+= 1
         }
         primary.$isIndexing.dropFirst()
+            .sink { [weak self] v in self?.isIndexing = v }
+            .store(in: &cancellables)
+        primary.$nameSearchReady.dropFirst()
             .sink { [weak self] v in
-                self?.isIndexing = v
-                if !v { self?.runSearch() }   // crawl / snapshot load finished → populate
+                self?.nameSearchReady = v
+                if v { self?.runSearch() }   // Phase A ready (snapshot load) / crawl finished → populate
             }
             .store(in: &cancellables)
         primary.$indexedCount.dropFirst()
@@ -631,10 +646,23 @@ final class AppModel: ObservableObject {
 
     /// Fast path: reload the last snapshot (~100 ms) and resume live updates from
     /// the persisted FSEvents id, instead of a full crawl.
+    ///
+    /// [21] Phased warm path (§2.3): `loadSnapshot` leaves the index Phase-A-complete
+    /// (arrays live, sentinel masks/CSR). We unblock the UI right there — `nameSearchReady =
+    /// true` lets `runSearch` serve name/ext/size/date/empty:/size-sort queries immediately —
+    /// then build Phase B (`buildNameMasksPhase`) and Phase C (`buildTreePhase`) on the SAME
+    /// background queue. `isIndexing` stays true across A→B→C on purpose (§2.6): it gates every
+    /// index WRITER (root sync, tombstoning, `startWatching`, `refreshMountedVolumes`, the
+    /// stale-resume reindex), and OI-4's "no concurrent writer between Phase A and Phase C" only
+    /// holds because those writers stay deferred until Phase C's `isIndexing = false` below. The
+    /// FSEvents stream itself isn't started until after Phase C either, so no event is ever
+    /// delivered to a half-built dirIndexByHash/CSR — macOS buffers from `meta.lastEventId` and
+    /// `startWatching(sinceWhen:)` replays the A→C gap once the tree is authoritative.
     private func loadFromSnapshot() -> Bool {
         let url = Snapshot.defaultURL()
         guard FileManager.default.fileExists(atPath: url.path) else { return false }
         isIndexing = true
+        nameSearchReady = false
         statusText = "Loading saved index…"
         let gen = indexGen
         indexQueue.async { [weak self] in
@@ -643,15 +671,23 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async { if gen == self.indexGen { self.beginIndexing() } }
                 return
             }
-            self.index.buildLiveIndexes()
+            // Phase A is complete (loadSnapshot returned) — unblock the UI now, off the
+            // background queue, before Phase B/C run.
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
-                self.isIndexing = false
+                self.nameSearchReady = true
                 self.indexedCount = self.index.count
                 self.statusText = "Loaded \(self.index.count.formatted()) items · resuming…"
                 self.engine.invalidate()
                 self.prewarmAndSearch()
-                Diag.log("LOADED snapshot \(self.index.count) items, resume@\(meta.lastEventId)")
+                Diag.log("LOADED snapshot (Phase A) \(self.index.count) items, resume@\(meta.lastEventId)")
+            }
+            guard gen == self.indexGen else { return }   // superseded before Phase B even starts
+            self.index.buildNameMasksPhase()   // Phase B: nameMask/typeClass/camelBits authoritative
+            self.index.buildTreePhase()        // Phase C: dirIndexByHash + CSR authoritative
+            DispatchQueue.main.async {
+                guard gen == self.indexGen else { return }
+                self.isIndexing = false
                 let roots = self.desiredCrawlRoots()
                 // Roots that were in the snapshot but are NO LONGER mounted would otherwise
                 // survive forever (the sync only diffs against currently-watched roots) —
@@ -695,6 +731,12 @@ final class AppModel: ObservableObject {
         watcher.stop()                  // pause live updates during (re)index
         currentEnumerator?.cancel()     // abort any in-flight crawl fast
         isIndexing = true
+        // [21] The crawl (cold) path is NOT phased (§2.5) — index.clear() below wipes the
+        // arrays a stale `nameSearchReady = true` would otherwise let `runSearch` scan mid-clear/
+        // mid-crawl. Reset now; buildLiveIndexes() sets both FileIndex-side readiness flags true
+        // at crawl end and the completion handler below flips this back to true alongside
+        // `isIndexing = false`.
+        nameSearchReady = false
         indexedCount = 0
         // A reindex rebuilds the index from scratch, so every row id currently in the
         // result set points at the OLD generation. Invalidate them now so nothing maps
@@ -759,6 +801,7 @@ final class AppModel: ObservableObject {
                 self.currentEnumerator = nil
                 self.progressTimer?.invalidate(); self.progressTimer = nil
                 self.isIndexing = false
+                self.nameSearchReady = true   // [21] cold path: buildLiveIndexes() above did both phases
                 self.indexedCount = self.index.count
                 self.statusText = String(format: "Indexed %@ items in %.1fs",
                                          self.index.count.formatted(), stats.seconds)
@@ -1452,7 +1495,15 @@ final class AppModel: ObservableObject {
     }
 
     func runSearch() {
-        guard !isIndexing else { return }   // M1: index is immutable only after crawl
+        // [21] MUST-FIX-1: gate on `nameSearchReady` (Phase A), NOT `isIndexing` — the latter
+        // stays true through Phase C on purpose (§2.6: it also gates every index WRITER —
+        // refreshMountedVolumes, volume-mount rescans, stale-resume reindex, custom-root rescan —
+        // which must stay deferred so nothing mutates the arrays under Phase B/C's off-lock
+        // reads). Gating here on `!isIndexing` would make [21] a no-op: Phase A would load but
+        // the UI would show nothing until Phase C, exactly like before. Copy-All-Paths/CSV export
+        // intentionally keep `!isIndexing` (§2.6) — their ids belong to a generation still
+        // settling, no early-serve requirement.
+        guard nameSearchReady else { return }
         let seq = nextSearchSeq()
         let sig = searchSignature            // stamp the results with the inputs they're for
         let q = effectiveQuery, sk = sortKey, asc = ascending, sc = scope, mm = matchMode
@@ -1465,6 +1516,12 @@ final class AppModel: ObservableObject {
             // Superseded by a newer keystroke before our turn on the serial queue → skip
             // the whole scan (typing enqueues many searches; only the latest need run).
             guard self.currentSearchSeq() == seq else { return }
+            // [21] C1: a folder-scope root resolve reads dirIndexByHash, which is empty until
+            // Phase C — resolving against the empty map would take the "scope unresolved" branch
+            // below and silently return EMPTY for a perfectly valid folder. Wait for Phase C
+            // BEFORE resolving (never while holding the index lock — waitForTree() doesn't take
+            // one). A plain (unscoped) query never waits here.
+            if root != nil { idx.waitForTree() }
             let rootIdx = root.flatMap { idx.dirIndex(forPath: $0) }
             // A folder scope that can't be resolved (deleted/renamed folder, or the
             // index mid-reindex) must NOT silently degrade into a whole-disk search —

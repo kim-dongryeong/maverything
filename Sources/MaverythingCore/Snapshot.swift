@@ -7,7 +7,7 @@ import Foundation
 /// lets us replay changes that happened while the app was closed.
 public enum Snapshot {
     static let magic: UInt32 = 0x4D56_4931   // "MVI1"
-    static let version: UInt32 = 5           // v5 widens nameOff to UInt64
+    static let version: UInt32 = 6           // v6 drops foldBlob + nameOff (reconstructed on load)
     /// Compressed-container magic ("MVZ1"): header = magic + rawSize(UInt64), then an
     /// LZFSE stream of the ordinary (v5) snapshot. Cardinal ships a 22 MB zstd snapshot
     /// for a whole disk vs our 167 MB raw — this closes most of that gap natively.
@@ -80,7 +80,10 @@ extension FileIndex {
         var live = 0
         for i in 0..<n where !deleted[i] { remap[i] = Int32(live); live += 1 }
 
-        var oNameOff = [UInt64](); oNameOff.reserveCapacity(live)
+        // v6 drops foldBlob (= asciiLower(nameBlob), reconstructed on load) and nameOff
+        // (= prefix-sum of nameLen, reconstructed on load) from the on-disk format — see
+        // §1.2/§1.3. `oBlob` is still packed CONTIGUOUSLY (no gaps) because the load-side
+        // reconstruction's gap-free invariant depends on it.
         var oNameLen = [UInt16](); oNameLen.reserveCapacity(live)
         var oParent = [Int32](); oParent.reserveCapacity(live)
         var oSize = [Int64](); oSize.reserveCapacity(live)
@@ -90,16 +93,14 @@ extension FileIndex {
         var oFlags = [UInt32](); oFlags.reserveCapacity(live)
         var oHidden = [UInt8](); oHidden.reserveCapacity(live)
         var oBlob = [UInt8](); oBlob.reserveCapacity(nameBlob.count)
-        var oFold = [UInt8](); oFold.reserveCapacity(foldBlob.count)
         var oUnicodeFoldBlob = [UInt8](); oUnicodeFoldBlob.reserveCapacity(unicodeFoldBlob.count)
         var oUnicodeFoldOff = [UInt64](); oUnicodeFoldOff.reserveCapacity(live)
         var oUnicodeFoldLen = [UInt32](); oUnicodeFoldLen.reserveCapacity(live)
 
         for i in 0..<n where !deleted[i] {
             let o = Int(nameOff[i]); let l = Int(nameLen[i])
-            oNameOff.append(UInt64(oBlob.count)); oNameLen.append(UInt16(l))
+            oNameLen.append(UInt16(l))
             oBlob.append(contentsOf: nameBlob[o..<o+l])
-            oFold.append(contentsOf: foldBlob[o..<o+l])
             if unicodeFoldOff[i] == noUnicodeFoldOffset {
                 oUnicodeFoldOff.append(noUnicodeFoldOffset)
                 oUnicodeFoldLen.append(0)
@@ -124,9 +125,7 @@ extension FileIndex {
         appendScalar(UInt64(oBlob.count), &d)
         appendScalar(UInt64(oUnicodeFoldBlob.count), &d)
         appendArrayBytes(oBlob, &d)
-        appendArrayBytes(oFold, &d)
         appendArrayBytes(oUnicodeFoldBlob, &d)
-        appendArrayBytes(oNameOff, &d)
         appendArrayBytes(oNameLen, &d)
         appendArrayBytes(oUnicodeFoldOff, &d)
         appendArrayBytes(oUnicodeFoldLen, &d)
@@ -149,7 +148,7 @@ extension FileIndex {
             guard raw.count >= 48 else { return nil }
             let m: UInt32 = readScalar(raw, &off)
             let v: UInt32 = readScalar(raw, &off)
-            guard m == Snapshot.magic, (v == 4 || v == 5) else { return nil }
+            guard m == Snapshot.magic, (v == 4 || v == 5 || v == 6) else { return nil }
             let lastEventId: UInt64 = readScalar(raw, &off)
             let savedBits: UInt64 = readScalar(raw, &off)
             let countU: UInt64 = readScalar(raw, &off)
@@ -160,22 +159,60 @@ extension FileIndex {
                   blobLenU <= 8_000_000_000,
                   unicodeBlobLenU <= 8_000_000_000 else { return nil }
             let count = Int(countU), blobLen = Int(blobLenU), unicodeBlobLen = Int(unicodeBlobLenU)
-            let nameOffSize = (v == 4) ? 4 : 8
-            let perEntry = nameOffSize + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 1   // arrays below, bytes/entry
-            let expected = 48 + blobLen * 2 + unicodeBlobLen + count * perEntry
+            // v4/v5 store BOTH a foldBlob (2nd B-sized blob) and a per-entry nameOff array
+            // (4 or 8 bytes); v6 drops both and reconstructs them on load (§1.2/§1.3), so it
+            // has one fewer B-sized blob on disk and a shorter per-entry stride.
+            let perEntry: Int
+            let blobFactor: Int
+            switch v {
+            case 4: perEntry = 4 + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 1; blobFactor = 2
+            case 5: perEntry = 8 + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 4 + 1; blobFactor = 2
+            default /* 6 */: perEntry = 48; blobFactor = 1
+            }
+            let expected = 48 + blobLen * blobFactor + unicodeBlobLen + count * perEntry
             guard raw.count >= expected else { return nil }   // falls back to a full crawl
 
+            let blobLen64 = UInt64(blobLen)
+            let unicodeBlobLen64 = UInt64(unicodeBlobLen)
             let loadedNameBlob = readArray(raw, &off, blobLen, UInt8.self)
-            let loadedFoldBlob = readArray(raw, &off, blobLen, UInt8.self)
-            let loadedUnicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
+            let loadedFoldBlob: [UInt8]
+            let loadedUnicodeFoldBlob: [UInt8]
             let loadedNameOff: [UInt64]
-            if v == 4 {
-                let tempOff = readArray(raw, &off, count, UInt32.self)
-                loadedNameOff = tempOff.map { UInt64($0) }
+            let loadedNameLen: [UInt16]
+            if v == 6 {
+                loadedUnicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
+                loadedNameLen = readArray(raw, &off, count, UInt16.self)
+                // (a) Reconstruct nameOff as the exclusive prefix-sum of nameLen. Each step IS
+                // a bounds check (never a crash/overread) — §1.3(a): `acc` is inductively ≤ B,
+                // so `blobLen64 - acc` cannot underflow. The final sum must EXACTLY equal B
+                // (gap-free invariant — our save always packs contiguously); short OR
+                // overflowed sums both reject.
+                var recNameOff = [UInt64](repeating: 0, count: count)
+                var acc: UInt64 = 0
+                var ok = true
+                for i in 0..<count {
+                    recNameOff[i] = acc
+                    let l = UInt64(loadedNameLen[i])
+                    if l > blobLen64 - acc { ok = false; break }
+                    acc &+= l
+                }
+                guard ok, acc == blobLen64 else { return nil }
+                loadedNameOff = recNameOff
+                // (b) Reconstruct foldBlob = asciiLower(nameBlob) — byte-length-preserving
+                // (asciiLower maps only A–Z→a–z, leaves non-ASCII untouched), matching how
+                // foldBlob was built at append time (§1.3(b)).
+                loadedFoldBlob = loadedNameBlob.map(asciiLower)
             } else {
-                loadedNameOff = readArray(raw, &off, count, UInt64.self)
+                loadedFoldBlob = readArray(raw, &off, blobLen, UInt8.self)
+                loadedUnicodeFoldBlob = readArray(raw, &off, unicodeBlobLen, UInt8.self)
+                if v == 4 {
+                    let tempOff = readArray(raw, &off, count, UInt32.self)
+                    loadedNameOff = tempOff.map { UInt64($0) }
+                } else {
+                    loadedNameOff = readArray(raw, &off, count, UInt64.self)
+                }
+                loadedNameLen = readArray(raw, &off, count, UInt16.self)
             }
-            let loadedNameLen = readArray(raw, &off, count, UInt16.self)
             let loadedUnicodeFoldOff = readArray(raw, &off, count, UInt64.self)
             let loadedUnicodeFoldLen = readArray(raw, &off, count, UInt32.self)
             let loadedParent = readArray(raw, &off, count, Int32.self)
@@ -187,9 +224,10 @@ extension FileIndex {
             let loadedHiddenBytes = readArray(raw, &off, count, UInt8.self)
             // Intra-file integrity: a valid-LENGTH but corrupt snapshot (bit rot) could hold
             // out-of-range name offsets or parent indices that would trap in _name/_path.
-            // Verify in one pass; on any violation, reject → caller does a full crawl.
-            let blobLen64 = UInt64(blobLen)
-            let unicodeBlobLen64 = UInt64(unicodeBlobLen)
+            // Verify in one pass; on any violation, reject → caller does a full crawl. For v6
+            // this check is provably redundant after (a)'s successful reconstruction (monotone
+            // prefix sums, final == B) but stays: it's O(N) cheap and still essential for the
+            // v4/v5 stored-offset path.
             for i in 0..<count {
                 let nameOffset = loadedNameOff[i]
                 let nameLength = UInt64(loadedNameLen[i])
@@ -236,6 +274,11 @@ extension FileIndex {
             csrChildIds.removeAll(); csrChildOff.removeAll(); childOverlay.removeAll()
             dirIndexByHash.removeAll()
             resetFsizeLocked()   // [N2] defense-in-depth
+            // [21] Phase A complete (arrays live, sentinels seeded above); Phase B/C are NOT
+            // done yet — the warm-path caller runs buildNameMasksPhase()/buildTreePhase()
+            // afterwards. A cold-path caller that instead calls the one-shot buildLiveIndexes()
+            // gets both flags set true at its end, same as before.
+            resetReadinessLocked()
             return Snapshot.Meta(lastEventId: lastEventId, savedAt: Double(bitPattern: savedBits))
         }
     }

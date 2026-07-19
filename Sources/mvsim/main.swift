@@ -1773,9 +1773,9 @@ check("dynamic unmount: tombstones whole mounted root",
       "removed=\(removedDynamic)")
 check("dynamic unmount: root dir lookup removed", index.dirIndex(forPath: dynamicRoot) == nil)
 
-// ---- snapshot round-trip ----
+// ---- snapshot round-trip (v6 — foldBlob + nameOff dropped, reconstructed on load) ----
 let blob = index.snapshotData(lastEventId: 777, savedAt: 1.0)                 // compressed (default)
-let rawBlob = index.snapshotData(lastEventId: 777, savedAt: 1.0, compress: false)  // raw v5 for byte surgery
+let rawBlob = index.snapshotData(lastEventId: 777, savedAt: 1.0, compress: false)  // raw v6 for byte surgery
 let idx2 = FileIndex()
 let meta = idx2.loadSnapshot(blob); idx2.buildLiveIndexes()
 let e2 = SearchEngine(index: idx2)
@@ -1785,12 +1785,150 @@ check("snapshot: 'png' count survives round-trip",
 check("snapshot: Unicode fold survives round-trip",
       e2.search("cafe", limit: 10_000, now: now).ids.map { idx2.name(Int($0)) }.contains("CAFÉ.txt"))
 
-// ---- v4 → v5 backward-compat (nameOff widened UInt32 → UInt64) ----
-// Synthesize a legacy v4 blob (4-byte nameOff) from the current v5 blob by
-// flipping the version byte and narrowing the nameOff array, then confirm the
-// migration read path in loadSnapshot reconstructs identical results.
-let v4blob: Data = {
+// ---- v4/v5 back-compat — genuine legacy-layout fixtures (SHOULD-FIX-2, §3.3) ----
+// `snapshotData` now emits v6 (no foldBlob array, no nameOff array), so byte-surgering the
+// v6 blob on the old v5-layout assumption would produce a MALFORMED v5 blob — reject BEFORE
+// the version-5 read path is ever exercised, leaving the actual v5 upgrade path (every
+// existing user's launch-time migration) untested. Build a REAL v5 blob instead: splice
+// foldBlob = asciiLower(nameBlob) back in as the 2nd blob, and nameOff = prefix-sum(nameLen)
+// back in as the 1st per-entry array — the exact inverse of the v6 load-side reconstruction.
+// Built HERE (before the byte-equality checks below) so idx5 — loaded via the v5 STORED-offset
+// path, no reconstruction — is a same-id-space oracle for idx2 — loaded via the v6
+// RECONSTRUCTED-offset path. (Comparing either against the shared global `index` would be
+// wrong: `index` still holds earlier tests' tombstones/dynamic-mount churn, so its id space and
+// row order differ from the compacted snapshot; `total`-only comparisons against `index` are
+// still valid and used below.)
+@inline(__always) func mvsimAsciiLower(_ b: UInt8) -> UInt8 { (b >= 65 && b <= 90) ? b &+ 32 : b }
+func rdU64v6(_ b: [UInt8], _ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
+func wrU64v6(_ b: inout [UInt8], _ at: Int, _ v: UInt64) { for j in 0..<8 { b[at+j] = UInt8((v >> (8*j)) & 0xff) } }
+func wrU16v6(_ b: inout [UInt8], _ at: Int, _ v: UInt16) { for j in 0..<2 { b[at+j] = UInt8((v >> (8*j)) & 0xff) } }
+func wrU32v6(_ b: inout [UInt8], _ at: Int, _ v: UInt32) { for j in 0..<4 { b[at+j] = UInt8((v >> (8*j)) & 0xff) } }
+let v6Count = rdU64v6([UInt8](rawBlob), 24)
+let v6BlobLen = rdU64v6([UInt8](rawBlob), 32)
+let v6UBlobLen = rdU64v6([UInt8](rawBlob), 40)
+let v6NameLenStart = 48 + v6BlobLen + v6UBlobLen   // nameLen[N] starts right after the two blobs
+let realV5Blob: Data = {
+    let b = [UInt8](rawBlob)
+    let count = v6Count, blobLen = v6BlobLen, uBlobLen = v6UBlobLen
+    let nameBlob = Array(b[48..<(48+blobLen)])
+    let unicodeFoldBlob = Array(b[(48+blobLen)..<(48+blobLen+uBlobLen)])
+    let nameLenBytes = Array(b[v6NameLenStart..<(v6NameLenStart + count*2)])
+    let rest = Array(b[(v6NameLenStart + count*2)...])   // unicodeFoldOff.. through hidden[], unchanged shape
+    var nameLen = [UInt16](repeating: 0, count: count)
+    for i in 0..<count { nameLen[i] = UInt16(nameLenBytes[i*2]) | (UInt16(nameLenBytes[i*2+1]) << 8) }
+    let foldBlob = nameBlob.map(mvsimAsciiLower)
+    var nameOff = [UInt8](); nameOff.reserveCapacity(count*8)   // exclusive prefix-sum of nameLen, LE UInt64
+    var acc: UInt64 = 0
+    for i in 0..<count {
+        var tmp = [UInt8](repeating: 0, count: 8)
+        wrU64v6(&tmp, 0, acc)
+        nameOff.append(contentsOf: tmp)
+        acc &+= UInt64(nameLen[i])
+    }
+    var out = [UInt8](); out.reserveCapacity(b.count + blobLen + count*8)
+    out.append(contentsOf: b[0..<4])                         // magic
+    out.append(contentsOf: [5, 0, 0, 0])                      // version = 5
+    out.append(contentsOf: b[8..<48])                         // lastEventId/savedAt/count/blobLen/uBlobLen
+    out.append(contentsOf: nameBlob)
+    out.append(contentsOf: foldBlob)
+    out.append(contentsOf: unicodeFoldBlob)
+    out.append(contentsOf: nameOff)
+    out.append(contentsOf: nameLenBytes)
+    out.append(contentsOf: rest)
+    return Data(out)
+}()
+let idx5 = FileIndex()
+let meta5 = idx5.loadSnapshot(realV5Blob); idx5.buildLiveIndexes()
+let e5 = SearchEngine(index: idx5)
+check("snapshot (genuine v5 fixture): lastEventId preserved", meta5?.lastEventId == 777)
+check("snapshot (genuine v5 fixture): total entries match the v6 source",
+      meta5 != nil && e5.search("", limit: 100_000, now: now).total == e2.search("", limit: 100_000, now: now).total)
+check("snapshot (genuine v5 fixture): 'png' count + top-K ids match",
+      e5.search("png", limit: 10_000, now: now).total == e2.search("png", limit: 10_000, now: now).total
+      && e5.search("png", limit: 10_000, now: now).ids == e2.search("png", limit: 10_000, now: now).ids)
+
+// Reconstruction byte-equality (§3.1): idx2 (v6, RECONSTRUCTED foldBlob/nameOff) vs idx5 (v5,
+// STORED foldBlob/nameOff) — both loaded from the same compacted dataset in the same row
+// order, so they share an id space and the reconstruction must be byte-IDENTICAL to what was
+// actually stored. unicodeFoldOff is KEPT (not reconstructed) in both — this is also the OI-1
+// guard: if someone later drops it, this assertion fails loudly.
+check("snapshot v6: reconstructed foldBlob byte-equal to the genuine-v5 stored foldBlob",
+      idx2.foldBlob == idx5.foldBlob)
+check("snapshot v6: reconstructed nameOff byte-equal to the genuine-v5 stored nameOff",
+      idx2.nameOff == idx5.nameOff)
+check("snapshot v6: unicodeFoldOff (kept, not reconstructed) byte-equal (OI-1 guard)",
+      idx2.unicodeFoldOff == idx5.unicodeFoldOff)
+check("snapshot v6: nameLen byte-equal", idx2.nameLen == idx5.nameLen)
+
+// Query-result equality (§3.1) — pre-save (`engine`/`index`) vs post-v6-load (`e2`/`idx2`),
+// a representative set including unicode names, filters, sorts, empty:, path-scope, regex.
+// `total` only against the uncompacted `engine` (see id-space note above); name-order against
+// the same-id-space `e5` where an ORDER assertion (not just count) is needed.
+check("snapshot v6: type:images count matches",
+      e2.search("type:images", limit: 10_000, now: now).total
+      == engine.search("type:images", limit: 10_000, now: now).total)
+check("snapshot v6: ext:swift results match",
+      e2.search("ext:swift", limit: 10_000, now: now).total
+      == engine.search("ext:swift", limit: 10_000, now: now).total)
+check("snapshot v6: size-sorted empty query matches (same id space as the genuine-v5 fixture)",
+      e2.search("", sortKey: .size, limit: 10_000, now: now).ids
+      == e5.search("", sortKey: .size, limit: 10_000, now: now).ids)
+check("snapshot v6: date-sorted empty query matches (same id space as the genuine-v5 fixture)",
+      e2.search("", sortKey: .dateModified, limit: 10_000, now: now).ids
+      == e5.search("", sortKey: .dateModified, limit: 10_000, now: now).ids)
+check("snapshot v6: empty: query matches",
+      e2.search("empty:", limit: 10_000, now: now).total
+      == engine.search("empty:", limit: 10_000, now: now).total)
+check("snapshot v6: regex query matches",
+      e2.search("^report", mode: .regex, limit: 10_000, now: now).total
+      == engine.search("^report", mode: .regex, limit: 10_000, now: now).total)
+check("snapshot v6: path-scope query matches",
+      e2.search("", sortKey: .name, limit: 10_000, now: now, scopeRoot: idx2.dirIndex(forPath: root + "/kind")).total
+      == engine.search("", sortKey: .name, limit: 10_000, now: now, scopeRoot: index.dirIndex(forPath: root + "/kind")).total)
+check("snapshot: header version byte == 6", rawBlob[4] == 6)
+
+// ---- v6 corrupt fuzz (reject, never crash; index untouched) — §3.2 ----
+func seedCorruptV6() -> FileIndex {
+    let idx = FileIndex(); _ = idx.appendRoot(path: "/sentinel6"); return idx
+}
+func checkV6Rejects(_ label: String, _ mutate: (inout [UInt8]) -> Void) {
     var b = [UInt8](rawBlob)
+    mutate(&b)
+    let idx = seedCorruptV6()
+    check("snapshot v6 corrupt: \(label)",
+          idx.loadSnapshot(Data(b)) == nil && idx.count == 1 && idx.name(0) == "/sentinel6")
+}
+checkV6Rejects("truncated blob rejects") { b in b = Array(b.dropLast()) }
+if v6Count > 0 {
+    checkV6Rejects("nameLen sum overflow (Σ nameLen > B) rejects") { b in
+        // bump nameLen[0] to the max representable UInt16 → prefix-sum overflows past B.
+        wrU16v6(&b, v6NameLenStart, 0xFFFF)
+    }
+    checkV6Rejects("nameLen sum SHORT (Σ nameLen < B) rejects — gap-free check") { b in
+        // zero out nameLen[0] → the running sum can no longer reach B exactly.
+        wrU16v6(&b, v6NameLenStart, 0)
+    }
+    let unicodeFoldOffStart = v6NameLenStart + v6Count*2
+    checkV6Rejects("unicodeFoldOff huge (< max, > U) rejects") { b in
+        wrU64v6(&b, unicodeFoldOffStart, UInt64(v6UBlobLen) + 1_000_000)
+    }
+    let unicodeFoldLenStart = unicodeFoldOffStart + v6Count*8
+    checkV6Rejects("unicodeFoldLen non-zero for a sentinel-offset entry rejects") { b in
+        wrU64v6(&b, unicodeFoldOffStart, UInt64.max)      // sentinel offset
+        wrU32v6(&b, unicodeFoldLenStart, 1)                // len != 0 → integrity reject
+    }
+    let parentStart = unicodeFoldLenStart + v6Count*4
+    checkV6Rejects("parent out of range rejects") { b in
+        b[parentStart] = 0xFF; b[parentStart+1] = 0xFF; b[parentStart+2] = 0xFF; b[parentStart+3] = 0x7F
+    }
+}
+
+// ---- v4 → v5 backward-compat (nameOff widened UInt32 → UInt64), derived from the REAL v5 blob ----
+// Synthesize a legacy v4 blob (4-byte nameOff) from the genuine v5 blob by flipping the
+// version byte and narrowing the nameOff array; nameOffStart is now correct because the
+// array physically exists in realV5Blob (unlike a byte-surgered v6 blob).
+let v4blob: Data = {
+    var b = [UInt8](realV5Blob)
     func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
     let count = rdU64(24), blobLen = rdU64(32), uBlobLen = rdU64(40)
     b[4] = 4; b[5] = 0; b[6] = 0; b[7] = 0                  // version 5 → 4 (little-endian UInt32)
@@ -1839,15 +1977,16 @@ check("snapshot v4→v5: corrupt offsets reject without replacing index",
       && corruptV4Idx.count == corruptBefore
       && corruptV4Idx.name(0) == "/sentinel")
 
-// v5-NATIVE rejection (regression guards for the Int-conversion trap fixed in f4ab553):
+// v5-NATIVE rejection (regression guards for the Int-conversion trap fixed in f4ab553),
+// now against the GENUINE v5 blob so it actually exercises the v5 branch as the name claims:
 // (a) truncated v5 must reject via the expected-length math, index untouched
-let shortV5 = Data(rawBlob.dropLast())
+let shortV5 = Data(realV5Blob.dropLast())
 let shortV5Idx = FileIndex()
 check("snapshot v5: truncated blob rejects without touching index",
       shortV5Idx.loadSnapshot(shortV5) == nil && shortV5Idx.count == 0)
 // (b) corrupt v5 with a huge 8-byte nameOff (>= 2^63) must reject, NOT trap on Int()
 let corruptV5: Data = {
-    var b = [UInt8](rawBlob)
+    var b = [UInt8](realV5Blob)
     func rdU64(_ at: Int) -> Int { (0..<8).reduce(0) { $0 | (Int(b[at+$1]) << (8*$1)) } }
     let blobLen = rdU64(32), uBlobLen = rdU64(40)
     let nameOffStart = 48 + blobLen*2 + uBlobLen
@@ -1860,6 +1999,148 @@ check("snapshot v5: 2^63+ nameOff rejects without trap or index replacement",
       corruptV5Idx.loadSnapshot(corruptV5) == nil
       && corruptV5Idx.count == 1
       && corruptV5Idx.name(0) == "/sentinel5")
+
+// ---- [21] Phased buildLiveIndexes: Phase A/B/C interplay (§3.4) ----
+// Exercises exactly the sentinel window [21] widens, all via `engine.search` (the `runSearch`
+// guard change is verified by inspection per §2.6, not exercisable from mvsim). `idxP`/`idx2`
+// are BOTH loaded from the identical `blob` bytes (same compaction, same row order) so their
+// ids are directly comparable — a stronger oracle than the uncompacted, tombstone-bearing
+// global `index`.
+do {
+    let idxP = FileIndex()
+    _ = idxP.loadSnapshot(blob)   // Phase A ONLY — do NOT build masks/tree yet
+    check("phased: liveIndexesReady == false right after Phase A", idxP.liveIndexesReady == false)
+    check("phased: masksReady == false right after Phase A", idxP._debugMasksReady == false)
+    let eP = SearchEngine(index: idxP)
+
+    // 3: plain name query serves correct results in Phase A (masks=.max, CSR empty) — B1/B2/C2/B5.
+    check("phased: plain name query Phase-A-correct (B1/B2/C2/B5)",
+          eP.search("png", limit: 10_000, now: now).ids == e2.search("png", limit: 10_000, now: now).ids)
+
+    // 4: Phase-A-correct-without-wait (C3/C4 corrected) — empty: and a folder-size sort must
+    // NOT block and must match a full build (emptyDirBitmap/_folderSizes are parent-based).
+    check("phased: empty: query Phase-A-correct (no wait)",
+          eP.search("empty:", limit: 10_000, now: now).ids == e2.search("empty:", limit: 10_000, now: now).ids)
+    check("phased: folder-size-sorted query Phase-A-correct (no wait)",
+          eP.search("", sortKey: .size, limit: 10_000, now: now).ids
+          == e2.search("", sortKey: .size, limit: 10_000, now: now).ids)
+    // C8: a subtreeSize-backed total reads empty CSR pre-Phase-C — degrades to 0, doesn't crash.
+    let kindDirId = idx2.dirIndex(forPath: root + "/kind")
+    let subtreeBeforeC = kindDirId.map { idxP.subtreeSize(of: $0) }
+    check("phased: subtreeSize degrades to 0 (not a crash) before Phase C (C8 pre-condition)",
+          subtreeBeforeC == 0, "got=\(String(describing: subtreeBeforeC))")
+
+    // 5: WAIT sites (B3/B4/C1) — type:images and a folder-scope query launched during Phase A
+    // must BLOCK (never over-broad-match / silently-empty), driven on background threads.
+    // Proven with a TIMESTAMP ordering, not a fixed-sleep "still nil?" poll (which is racy
+    // under system load — a slow-to-schedule background thread looks indistinguishable from a
+    // correctly-blocked one): each thread records when its search RETURNED; the phases are only
+    // started after capturing `beforePhases`, so if the wait is honored the finish time can only
+    // land at or after `beforePhases` — if the gate were broken (no wait), the search would
+    // return in microseconds, long before `beforePhases`.
+    // Dedicated `Thread`s (not DispatchQueue.global()) — this deep into the suite the shared GCD
+    // global concurrent queue can have residual queued work from earlier tests, and a delayed
+    // *start* must never be confused with "still correctly blocked".
+    let clock = ContinuousClock()
+    let typeLock = NSLock(); var typeResult: SearchResults?; var typeFinishedAt: ContinuousClock.Instant?
+    Thread {
+        let r = eP.search("type:images", limit: 10_000, now: now)
+        let t = clock.now
+        typeLock.lock(); typeResult = r; typeFinishedAt = t; typeLock.unlock()
+    }.start()
+    let scopeLock = NSLock(); var scopeResult: SearchResults?; var scopeFinishedAt: ContinuousClock.Instant?
+    Thread {
+        let r = eP.search("", sortKey: .name, limit: 10_000, now: now, scopeRoot: kindDirId)
+        let t = clock.now
+        scopeLock.lock(); scopeResult = r; scopeFinishedAt = t; scopeLock.unlock()
+    }.start()
+    Thread.sleep(forTimeInterval: 0.1)   // let both background threads actually enter their wait
+    let beforePhases = clock.now
+
+    idxP.buildNameMasksPhase()   // Phase B — unblocks the type:images wait
+    idxP.buildTreePhase()        // Phase C — unblocks the folder-scope wait
+
+    var waited = 0.0             // bounded poll for both background threads to land
+    while (typeResult == nil || scopeResult == nil) && waited < 15.0 {
+        Thread.sleep(forTimeInterval: 0.01); waited += 0.01
+    }
+    typeLock.lock(); let finalType = typeResult; let finalTypeAt = typeFinishedAt; typeLock.unlock()
+    scopeLock.lock(); let finalScope = scopeResult; let finalScopeAt = scopeFinishedAt; scopeLock.unlock()
+    check("phased: type:images query actually blocked until Phase B ran (WAIT, not over-broad)",
+          finalTypeAt.map { $0 >= beforePhases } ?? false,
+          finalTypeAt == nil ? "TIMED OUT waiting for background thread" : "finished before Phase B started")
+    check("phased: folder-scope query actually blocked until Phase C ran (WAIT, not empty-leak)",
+          finalScopeAt.map { $0 >= beforePhases } ?? false,
+          finalScopeAt == nil ? "TIMED OUT waiting for background thread" : "finished before Phase C started")
+    check("phased: type:images WAIT result == full-build result (no over-broad leak)",
+          finalType != nil && finalType!.ids == e2.search("type:images", limit: 10_000, now: now).ids)
+    let fullScope = e2.search("", sortKey: .name, limit: 10_000, now: now, scopeRoot: kindDirId)
+    check("phased: folder-scope WAIT result == full-build result (no empty leak)",
+          finalScope != nil && finalScope!.total > 0 && finalScope?.ids == fullScope.ids)
+
+    // 7: post-Phase-C invariants (local brute/live children oracle — the module-scoped ones
+    // near the buildLiveIndexes tests are local to that `do` block).
+    func phasedBruteChildren(_ idx: FileIndex, _ d: Int32) -> Set<Int32> {
+        var s = Set<Int32>()
+        for i in 0..<idx.count where idx.parentOf(i) == d && !idx.isDeleted(i) { s.insert(Int32(i)) }
+        return s
+    }
+    func phasedLiveChildren(_ idx: FileIndex, _ d: Int32) -> Set<Int32> {
+        Set(idx._debugChildren(of: d).filter { !idx.isDeleted(Int($0)) })
+    }
+    check("phased: liveIndexesReady == true after Phase C", idxP.liveIndexesReady == true)
+    check("phased: overlay empty after Phase C", idxP._debugOverlayCount == 0)
+    for d in 0..<min(idxP.count, 200) where idxP.isDir(d) && !idxP.isDeleted(d) {
+        check("phased: csr children after Phase C d=\(d) == brute",
+              phasedLiveChildren(idxP, Int32(d)) == phasedBruteChildren(idxP, Int32(d)))
+    }
+    // C8 self-heal: the SAME subtreeSize call now reads the authoritative CSR.
+    if let kd = kindDirId {
+        check("phased: subtreeSize self-heals to a real total after Phase C (C8)",
+              idxP.subtreeSize(of: kd) > 0 && idxP.subtreeSize(of: kd) == idx2.subtreeSize(of: kd))
+    }
+}
+
+// 6: B2 narrow-cache window — with the `needMasks` WAIT in `_search`, a `type:` query can
+// NEVER cache against sentinel typeClass, so build the narrow base with a NON-type query in
+// Phase A (liveGen0), then bump the gen via buildNameMasksPhase(), then a `type:` refinement:
+// the liveBuildGen bump must reject the stale narrow base (warm result == a cold full scan).
+do {
+    let idxP2 = FileIndex()
+    _ = idxP2.loadSnapshot(blob)
+    let eP2 = SearchEngine(index: idxP2)
+    _ = eP2.search("png", sortKey: .name, limit: 10_000, now: now)   // seed a narrow base @ liveGen0
+    idxP2.buildNameMasksPhase()                                      // bumps liveBuildGen
+    let warmType = eP2.search("png type:images", sortKey: .name, limit: 10_000, now: now)
+    let coldType = SearchEngine(index: idxP2)
+        .search("png type:images", sortKey: .name, limit: 10_000, now: now)   // fresh engine, no cache
+    check("phased B2: type: refinement after Phase B rejects the stale sentinel-gen narrow base",
+          warmType.ids == coldType.ids, "warm=\(warmType.ids.count) cold=\(coldType.ids.count)")
+
+    // Same window spanning buildTreePhase(): a run-history sort resolved while CSR is still
+    // empty (C5 degrade — frecency map empty, membership correct, sort falls back to name
+    // order) must self-heal to the true run-count order once Phase C's gen bump lands.
+    let rcRoot = root + "/phasedRunCount"; mkdir(rcRoot)
+    writeAbs(rcRoot + "/zzz_report.txt", bytes: 4)
+    writeAbs(rcRoot + "/alpha_report.txt", bytes: 4)
+    let rcIdx = FileIndex()
+    _ = FileEnumerator(index: rcIdx).crawl(roots: [rcRoot])
+    rcIdx.buildLiveIndexes()
+    let rcStats = RunStats(url: nil, cap: 4)
+    for _ in 0..<5 { rcStats.record(path: rcRoot + "/zzz_report.txt", now: now) }
+    let rcBlob = rcIdx.snapshotData(lastEventId: 0, savedAt: now)
+    let idxP3 = FileIndex()
+    _ = idxP3.loadSnapshot(rcBlob)   // Phase A only
+    let eP3 = SearchEngine(index: idxP3)
+    eP3.runStats = rcStats
+    _ = eP3.search("report", sortKey: .runCount, ascending: false, limit: 5, now: now)  // resolve pre-Phase-C (C5 degrade)
+    idxP3.buildNameMasksPhase()
+    idxP3.buildTreePhase()   // gen bump → frecencyCache (keyed on the index gen) must re-resolve
+    let afterPhaseC = eP3.search("report", sortKey: .runCount, ascending: false, limit: 5, now: now)
+                          .ids.map { idxP3.name(Int($0)) }
+    check("phased C5: run-count frecency self-heals after Phase C gen bump",
+          afterPhaseC.first == "zzz_report.txt", afterPhaseC.joined(separator: ","))
+}
 
 // ---- Unix-socket query server (mvfind/MCP backend) round-trip ----
 do {
@@ -2204,6 +2485,51 @@ for _ in 0..<200 { for q in qs {
 times.sort()
 let p50 = times[times.count/2], p95 = times[Int(Double(times.count)*0.95)]
 let avg = times.reduce(0,+)/Double(times.count)
+
+// ---- [11]/[21] launch-latency + snapshot-size print (§3.5, informational — not asserted) ----
+do {
+    func msBetween(_ a: ContinuousClock.Instant, _ b: ContinuousClock.Instant) -> Double {
+        let d = a.duration(to: b)
+        return Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) * 1e-15
+    }
+    // Snapshot size: v6 (raw + compressed, already computed above as `rawBlob`/`blob`) vs a
+    // genuine v5 layout (`realV5Blob`, raw only — v5 compression isn't independently
+    // reachable from mvsim since `Snapshot.compress` is module-internal and re-saving always
+    // emits the CURRENT version). Reports the real [11] savings (OI-5: ~26% raw expected).
+    let rawV5n = realV5Blob.count, rawV6n = rawBlob.count
+    let pctRaw = rawV5n > 0 ? 100.0 * Double(rawV5n - rawV6n) / Double(rawV5n) : 0
+    print(String(format: "[11] snapshot size @ %d entries: raw v5=%d B, raw v6=%d B (%.1f%% slimmer); compressed v6=%d B",
+                 idx2.count, rawV5n, rawV6n, pctRaw, blob.count))
+
+    // Launch latency: BEFORE (one-shot buildLiveIndexes — the pre-[21] cold-warm path) vs
+    // AFTER (Phase A serves immediately, Phase B/C fill in afterward) on a bigger synthetic
+    // tree so the mask-scan/CSR-build cost is measurable.
+    let latRoot = root + "/launchLatency"; mkdir(latRoot)
+    for i in 0..<200_000 { writeAbs(latRoot + "/f\(i)_lat.dat", bytes: 4) }
+    let latSrc = FileIndex()
+    _ = FileEnumerator(index: latSrc).crawl(roots: [latRoot])
+    latSrc.buildLiveIndexes()
+    let latBlob = latSrc.snapshotData(lastEventId: 0, savedAt: now, compress: false)
+
+    let beforeIdx = FileIndex()
+    let bt0 = ContinuousClock().now
+    _ = beforeIdx.loadSnapshot(latBlob)
+    beforeIdx.buildLiveIndexes()
+    _ = SearchEngine(index: beforeIdx).search("a", limit: 100, now: now)
+    let bt1 = ContinuousClock().now
+    print(String(format: "[21] BEFORE model (one-shot buildLiveIndexes): time-to-first-correct-search = %.1f ms",
+                 msBetween(bt0, bt1)))
+
+    let afterIdx = FileIndex()
+    let at0 = ContinuousClock().now
+    _ = afterIdx.loadSnapshot(latBlob)
+    _ = SearchEngine(index: afterIdx).search("a", limit: 100, now: now)   // Phase A
+    let at1 = ContinuousClock().now
+    afterIdx.buildNameMasksPhase(); afterIdx.buildTreePhase()
+    let at2 = ContinuousClock().now
+    print(String(format: "[21] AFTER model: first-name-search = %.1f ms · full-ready (Phase C) = %.1f ms",
+                 msBetween(at0, at1), msBetween(at0, at2)))
+}
 
 // ---- report ----
 let passed = cases.filter { $0.pass }.count

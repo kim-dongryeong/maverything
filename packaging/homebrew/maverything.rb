@@ -27,8 +27,8 @@ cask "maverything" do
   binary "#{appdir}/Maverything.app/Contents/Helpers/mvfind"
   binary "#{appdir}/Maverything.app/Contents/Helpers/mv-mcp"
 
-  # The saved index snapshot + app data. UserDefaults (com.maverything.app) are
-  # left alone by design; add "~/Library/Preferences/com.maverything.app.plist"
+  # The saved index snapshot + app data. UserDefaults (kr.kdr.maverything) are
+  # left alone by design; add "~/Library/Preferences/kr.kdr.maverything.plist"
   # here if a scorched-earth zap is preferred.
   zap trash: [
     "~/Library/Application Support/Maverything",

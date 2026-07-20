@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.maverything.app</string>
+	<string>kr.kdr.maverything</string>
 	<key>CFBundleName</key>
 	<string>Maverything</string>
 	<key>CFBundlePackageType</key>

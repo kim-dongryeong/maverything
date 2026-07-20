@@ -128,6 +128,14 @@ func names(_ q: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly
 func has(_ q: String, _ name: String, mode: MatchMode = .exact, scope: SearchScope = .nameOnly) -> Bool {
     names(q, mode: mode, scope: scope).contains(name)
 }
+// SPEC-B5-FINAL §7.9: physical footprint (RSS), print-only — validates the §1 memory ledger.
+func rssBytes() -> Int {
+    var info = task_vm_info_data_t()
+    var cnt = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(cnt)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &cnt) } }
+    return kr == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+}
 
 print("=== Maverything simulation — \(index.count) entries from \(root) ===")
 print(String(format: "crawl: %d items in %.3fs\n", stats.total, stats.seconds))
@@ -760,12 +768,20 @@ do {
     // (site 3, outside any single chunk) can put them in alphabetical order.
     fastWrite(benchRoot + "/b0/chunktie_apple.txt", bytes: 1)
     fastWrite(benchRoot + "/b\(dirs - 1)/chunktie_zebra.txt", bytes: 1)
+    // SPEC-B5-FINAL §7.9 (print-only, RSS is noisy): physical footprint before/after building
+    // the ~1M index, validating the ~24 MB [35]/[19]/[38]/[30] memory ledger (§1).
+    let rssBefore = rssBytes()
     let idxB = FileIndex()
     _ = FileEnumerator(index: idxB).crawl(roots: [benchRoot], exclude: [], mountPoints: [])
     let csr0 = ContinuousClock().now
     idxB.buildLiveIndexes()                                             // CSR (csrChildIds/csrChildOff) build
     let csr1 = ContinuousClock().now
+    let rssAfter = rssBytes()
     let eB = SearchEngine(index: idxB); eB.useFolderSizes = false
+    print(String(format: "[B5] RSS @ %d entries: before=%.1f MB after=%.1f MB delta=%.1f MB (%.1f B/entry)",
+                 idxB.count, Double(rssBefore) / 1_048_576, Double(rssAfter) / 1_048_576,
+                 Double(rssAfter - rssBefore) / 1_048_576,
+                 idxB.count > 0 ? Double(rssAfter - rssBefore) / Double(idxB.count) : 0))
 
     let chunkTie = eB.search("chunktie", mode: .exact, sortKey: .relevance, ascending: false,
                              limit: 10, now: now).ids.map { idxB.name(Int($0)) }
@@ -818,6 +834,13 @@ do {
           "comparator=\(String(format: "%.4f", radixB.comparatorSeconds))s " +
           "ratio=\(String(format: "%.2f", ratio))x (n=\(radixB.n))")
     print("inc13(bench) n=\(idxB.count) full=\(tb0.duration(to: tb1)) incr(+1)=\(tb2.duration(to: tb3))")
+    // [38]/[30] at 1M scale: bitmap stays well-formed and the bound caches stay under their caps.
+    check("[B5] deletedBits well-formed at 1M scale", idxB._debugBitmapWellFormed())
+    let fpB = eB._debugCacheFootprint()
+    check("[B5] orderCache bounded to 3 at 1M scale", fpB.orderEntries <= 3, "entries=\(fpB.orderEntries)")
+    print(String(format: "[B5] cache footprint @ %d entries: order=%.1f MB (%d entries) inc=%.1f MB gn=%.1f MB",
+                 idxB.count, Double(fpB.orderBytes) / 1_048_576, fpB.orderEntries,
+                 Double(fpB.incBytes) / 1_048_576, Double(fpB.gnBytes) / 1_048_576))
     try? fm.removeItem(atPath: benchRoot)
 }
 
@@ -2529,6 +2552,255 @@ do {
     let at2 = ContinuousClock().now
     print(String(format: "[21] AFTER model: first-name-search = %.1f ms · full-ready (Phase C) = %.1f ms",
                  msBetween(at0, at1), msBetween(at0, at2)))
+}
+
+// ---- SPEC-B5-FINAL memory batch: [19]/[35] width-bound fail-safe, [38] bitmap/hidden
+// equivalence, [30] cache eviction correctness, [37] compaction hysteresis ----
+
+// [35]/[19] width-bound fail-safe (§3, §7.3) — the drop-sentinel contract, exercised without a
+// real 4 GiB allocation via the test-only cap override.
+b5WidthBoundBlock: do {
+    let wIdx = FileIndex()
+    let rootId = wIdx.appendRoot(path: "/b5widthroot")
+    check("[B5][35/19] root append succeeds under the real cap", rootId >= 0)
+    let countAfterRoot = wIdx.count
+
+    FileIndex._debugSetNameBlobCapOverride(4)   // any real child name overflows this
+    let dropped = wIdx._debugAppendOneChild(parent: rootId, name: "overflow_child_name.txt")
+    check("[B5][35/19][MF-3] appendChildren returns -1 (drop sentinel) at cap", dropped == -1)
+    check("[B5][35/19] dropped batch appends zero entries", wIdx.count == countAfterRoot)
+
+    FileIndex._debugSetNameBlobCapOverride(nil)   // restore the real UInt32.max cap
+    let ok = wIdx._debugAppendOneChild(parent: rootId, name: "fits_fine.txt")
+    check("[B5][35/19] append succeeds once the cap is restored",
+          ok >= 0 && wIdx.count == countAfterRoot + 1)
+}
+
+// MF-3 end-to-end: the FileEnumerator caller MUST NOT enqueue subdir jobs for a dropped batch
+// (would carry a parent id that was never appended → corrupted crawl tree, strictly worse than
+// a crash). Tune the cap so the root itself fits but its own children batch overflows.
+b5MF3Block: do {
+    let wroot = NSTemporaryDirectory() + "mvsim-b5-mf3-\(getpid())"
+    try? fm.removeItem(atPath: wroot)
+    mkdir(wroot)
+    writeAbs(wroot + "/subdirA/child.txt", bytes: 4)
+    writeAbs(wroot + "/subdirB/child.txt", bytes: 4)
+    let rootLen = wroot.utf8.count
+    let wIdx = FileIndex()
+    FileIndex._debugSetNameBlobCapOverride(rootLen + 2)   // root fits; "subdirA"+"subdirB" (14B) doesn't
+    let mf3Stats = FileEnumerator(index: wIdx).crawl(roots: [wroot])
+    FileIndex._debugSetNameBlobCapOverride(nil)
+    _ = mf3Stats   // reaching here at all (no crash/hang) IS the "does not trap" proof
+    check("[B5][MF-3] crawl completes without corruption when a children batch drops at the cap",
+          wIdx.count == 1)   // root only — the dropped batch never enqueued subdirA/subdirB jobs
+    try? fm.removeItem(atPath: wroot)
+}
+
+// [38] deletedBits bitmap — targeted edge ids crossing a 64-bit word boundary (63/64) plus the
+// LAST entry, well-formedness, and bit isolation (neighbors of a flipped bit stay clear). The
+// MAIN oracle for "deleted/hidden semantics identical to before" is the full pre-existing mvsim
+// suite passing unchanged — isDeleted/hideHidden are exercised throughout it via the SAME public
+// API, and every read site in FileIndex/SearchEngine/Snapshot was migrated to the bitmap. This
+// block adds the specific word-boundary cases the spec calls out by name.
+b5BitmapBlock: do {
+    let bRoot = NSTemporaryDirectory() + "mvsim-b5-bitmap-\(getpid())"
+    try? fm.removeItem(atPath: bRoot)
+    mkdir(bRoot)
+    let n = 130   // spans 3 words: id 63 = last bit of deletedBits[0], id 64 = first bit of
+                  // deletedBits[1], and the LAST entry exercises the tail-word partial-fill case.
+    for i in 0..<n { writeAbs(bRoot + String(format: "/f%03d.dat", i), bytes: 4) }
+    let bIdx = FileIndex()
+    _ = FileEnumerator(index: bIdx).crawl(roots: [bRoot])
+    bIdx.buildLiveIndexes()
+    check("[B5][38] fixture has root + \(n) flat children", bIdx.count == n + 1)
+    check("[B5][38] deletedBits well-formed after crawl", bIdx._debugBitmapWellFormed())
+
+    let targets = [63, 64, n]   // id 0 = root; word-boundary pair + the last id
+    let targetPaths = targets.map { bIdx.path($0) }
+    for p in targetPaths { try? fm.removeItem(atPath: p) }
+    let recB5 = Reconciler(index: bIdx, exclude: [])
+    _ = recB5.reconcile(eventPaths: [bRoot])
+
+    for t in targets {
+        check("[B5][38] isDeleted(\(t)) true after tombstone (word-boundary/last id)", bIdx.isDeleted(t))
+    }
+    check("[B5][38] deletedBits well-formed after tombstoning", bIdx._debugBitmapWellFormed())
+    check("[B5][38] liveStats().deleted counts exactly the 3 tombstones",
+          bIdx.liveStats().deleted == targets.count)
+    // Bit isolation: neighbors of the word-boundary ids must be UNAFFECTED (no off-by-one
+    // shift/mask into the adjacent bit or word — SPEC-B5-FINAL §4.1 setDeletedBitLocked).
+    check("[B5][38] neighbor id 62 untouched", !bIdx.isDeleted(62))
+    check("[B5][38] neighbor id 65 untouched", !bIdx.isDeleted(65))
+    try? fm.removeItem(atPath: bRoot)
+}
+
+// [38]/SF-1: a zero-length name (as the LAST entry) must not index nameBlob[nameOff[i]] out of
+// bounds — neither in SearchEngine's hideHidden result filter nor in Snapshot.swift's save-time
+// hidden-byte recompute. Exercised via the test-only append hook since a real filesystem entry
+// can never have an empty name.
+b5SF1Block: do {
+    let sIdx = FileIndex()
+    let sRoot = sIdx.appendRoot(path: "/b5sf1root")
+    _ = sIdx._debugAppendOneChild(parent: sRoot, name: "normal.txt")
+    let zeroId = sIdx._debugAppendOneChild(parent: sRoot, name: "")   // LAST entry, zero-length name
+    check("[B5][SF-1] zero-length name append succeeds (no trap)", zeroId >= 0)
+    sIdx.buildLiveIndexes()
+    let sEngine = SearchEngine(index: sIdx)
+    sEngine.hideHidden = true
+    let visibleNames = sEngine.search("", sortKey: .name, limit: 10, now: now)
+        .ids.map { sIdx.name(Int($0)) }
+    check("[B5][SF-1] hideHidden does not crash and does not treat a 0-len name as a dotfile",
+          visibleNames.contains(""))
+    let sBlob = sIdx.snapshotData(lastEventId: 0, savedAt: now, compress: false)
+    let sIdx2 = FileIndex()
+    let sMeta = sIdx2.loadSnapshot(sBlob)
+    check("[B5][SF-1] snapshot save/load round-trips a zero-length-name last entry (no OOB)",
+          sMeta != nil && sIdx2.count == sIdx.count)
+}
+
+// [38]/§4.2 UF_HIDDEN flag branch — VERIFIER-ADDED. Dropping the stored `hidden` array moved the
+// derivation to read-time (SearchEngine hideHidden filter) and save-time (Snapshot recompute).
+// The dotfile branch is covered by existing `.hidden/.secret.txt` fixtures, but the `(flags &
+// UF_HIDDEN)` branch had ZERO coverage before/after this change. A non-dotfile carrying UF_HIDDEN
+// must be hidden by BOTH the live filter and the recomputed snapshot byte (proves the flag path,
+// not just the name path, survives the array drop). Uses a real chflags'd file end-to-end.
+b5UFHiddenBlock: do {
+    let hRoot = NSTemporaryDirectory() + "mvsim-b5-ufhidden-\(getpid())"
+    try? fm.removeItem(atPath: hRoot)
+    mkdir(hRoot)
+    writeAbs(hRoot + "/plain.txt", bytes: 4)
+    writeAbs(hRoot + "/flagged.txt", bytes: 4)   // NOT a dotfile — only UF_HIDDEN can hide it
+    let chOK = chflags(hRoot + "/flagged.txt", UInt32(UF_HIDDEN)) == 0
+    check("[B5][38/UF_HIDDEN] chflags UF_HIDDEN applied to fixture", chOK)
+    let hIdx = FileIndex()
+    _ = FileEnumerator(index: hIdx).crawl(roots: [hRoot])
+    hIdx.buildLiveIndexes()
+    let hEngine = SearchEngine(index: hIdx)
+    hEngine.hideHidden = false
+    let shown = hEngine.search("", sortKey: .name, limit: 100, now: now).ids.map { hIdx.name(Int($0)) }
+    check("[B5][38/UF_HIDDEN] hideHidden=false shows the UF_HIDDEN, non-dotfile entry (control)",
+          shown.contains("flagged.txt") && shown.contains("plain.txt"))
+    hEngine.hideHidden = true
+    let visible = hEngine.search("", sortKey: .name, limit: 100, now: now).ids.map { hIdx.name(Int($0)) }
+    check("[B5][38/UF_HIDDEN] live hideHidden filter excludes a UF_HIDDEN non-dotfile (flag branch)",
+          !visible.contains("flagged.txt") && visible.contains("plain.txt"))
+    // Snapshot save recomputes the hidden byte from flags[] (array dropped); after round-trip the
+    // filter must STILL exclude the flagged row — proving the flag branch of the save-time
+    // recompute (Snapshot.swift :116) and that flags[] persists it.
+    let hBlob = hIdx.snapshotData(lastEventId: 0, savedAt: now, compress: false)
+    let hIdx2 = FileIndex()
+    let hMeta = hIdx2.loadSnapshot(hBlob); hIdx2.buildLiveIndexes()
+    let hEngine2 = SearchEngine(index: hIdx2); hEngine2.hideHidden = true
+    let visible2 = hEngine2.search("", sortKey: .name, limit: 100, now: now).ids.map { hIdx2.name(Int($0)) }
+    check("[B5][38/UF_HIDDEN] UF_HIDDEN survives snapshot round-trip (recomputed hidden byte)",
+          hMeta != nil && !visible2.contains("flagged.txt") && visible2.contains("plain.txt"))
+    try? fm.removeItem(atPath: hRoot)
+}
+
+// [30] orderCache LRU eviction correctness (§6.1) — bounded to ≤3, `.name` pinned, a stale-but-
+// evicted entry recomputes correctly (not just "doesn't crash"), and [13] incremental order
+// maintenance stays sane after a cache re-entry (not a needless full rebuild every time). Uses
+// an ISOLATED fixture/index/engine (not the shared global `root`/`index`/`engine`) so a later
+// reconcile's directory diff can't sweep up unrelated files another test wrote under the shared
+// `root` on disk without ever indexing them (would inflate the incremental-window size and force
+// a full rebuild for a reason that has nothing to do with the eviction/LRU logic under test).
+b5EvictionBlock: do {
+    func isMonotoneByMtime(_ ids: [Int32], ascending: Bool, _ idx: FileIndex) -> Bool {
+        var last: Int64? = nil
+        for id in ids {
+            let m = idx.row(Int(id)).mtime
+            if let l = last, ascending ? m < l : m > l { return false }
+            last = m
+        }
+        return true
+    }
+
+    let evRoot = NSTemporaryDirectory() + "mvsim-b5-eviction-\(getpid())"
+    try? fm.removeItem(atPath: evRoot)
+    mkdir(evRoot)
+    for i in 0..<300 { writeAbs(evRoot + "/f\(i).dat", bytes: 4 + (i % 7), mtime: now - Double(i)) }
+    let evIdx = FileIndex()
+    _ = FileEnumerator(index: evIdx).crawl(roots: [evRoot])
+    evIdx.buildLiveIndexes()
+    let evEngine = SearchEngine(index: evIdx)
+    evEngine.useFolderSizes = false
+
+    // Cycle 3 fresh, distinct orders (fills the cache to its cap without touching dateModified).
+    for k in [SortKey.name, .size, .path] { _ = evEngine.search("", sortKey: k, limit: 10, now: now) }
+    let dmFirst = evEngine.search("", sortKey: .dateModified, limit: 100_000, now: now).ids   // 4th distinct key
+    let fpAfterInsert = evEngine._debugCacheFootprint()
+    check("[B5][30] orderCache bounded to 3 after a 4th distinct order forces eviction",
+          fpAfterInsert.orderEntries <= 3, "entries=\(fpAfterInsert.orderEntries)")
+
+    // Cycle 2 MORE distinct orders to push dateModified itself out of the capped LRU set.
+    _ = evEngine.search("", sortKey: .dateCreated, limit: 10, now: now)
+    evEngine.useFolderSizes = true
+    _ = evEngine.search("", sortKey: .size, limit: 10, now: now)
+    evEngine.useFolderSizes = false
+
+    evEngine._debugResetOrderStats()
+    let dmAfterEvict = evEngine.search("", sortKey: .dateModified, limit: 100_000, now: now).ids
+    let statsAfterEvict = evEngine._debugOrderStats()
+    check("[B5][30] evicted dateModified order triggers a real recompute (not a stale hit)",
+          statsAfterEvict.full == 1, "full=\(statsAfterEvict.full)")
+    check("[B5][30] evicted order recomputes correctly (same live id set, monotone mtime)",
+          Set(dmAfterEvict) == Set(dmFirst) && isMonotoneByMtime(dmAfterEvict, ascending: true, evIdx))
+    // COW: the array captured BEFORE eviction is still valid/correct (a dict-entry removal on
+    // eviction never mutates a live array the caller already holds — mere Swift COW semantics,
+    // asserted here as a correctness property, not just "didn't crash").
+    check("[B5][30] held order value unchanged after eviction of its cache entry (COW)",
+          isMonotoneByMtime(dmFirst, ascending: true, evIdx) && Set(dmFirst) == Set(dmAfterEvict))
+
+    // .name is pinned — the cycling above (which evicted size/path/dateModified in turn) must
+    // never have evicted it, and no filesystem mutation happened in this block, so re-requesting
+    // it must be an O(1) cache HIT (no full rebuild).
+    evEngine._debugResetOrderStats()
+    _ = evEngine.search("", sortKey: .name, limit: 10, now: now)
+    let statsName = evEngine._debugOrderStats()
+    check("[B5][30] .name base never evicted (pinned — no full rebuild on re-request)",
+          statsName.full == 0, "full=\(statsName.full) incr=\(statsName.incr) noop=\(statsName.noop)")
+
+    // [13] incremental state sane after re-entry: after the evict→recompute cycle above, a real
+    // live mutation must still apply INCREMENTALLY off the freshly cache-re-entered `.name`
+    // state (not silently regress to a full rebuild), and the result must include the change —
+    // proves the OrderState rebuilt on cache re-entry (epoch/structSeen/appliedSeq) is wired
+    // correctly, not just "some" state that happens to return non-crashing results.
+    writeAbs(evRoot + "/b5_reentry_marker.txt", bytes: 4)
+    let recEv = Reconciler(index: evIdx, exclude: [])
+    _ = recEv.reconcile(eventPaths: [evRoot])
+    evEngine._debugResetOrderStats()
+    let nameAfterReentry = evEngine.search("", sortKey: .name, limit: 100_000, now: now).ids
+    let statsReentry = evEngine._debugOrderStats()
+    check("[B5][30][13] post-eviction re-entry still applies incrementally (no needless full rebuild)",
+          statsReentry.full == 0 && statsReentry.incr == 1,
+          "full=\(statsReentry.full) incr=\(statsReentry.incr)")
+    check("[B5][30][13] post-eviction incremental result includes the newly-added entry",
+          nameAfterReentry.contains { evIdx.name(Int($0)) == "b5_reentry_marker.txt" })
+    try? fm.removeItem(atPath: evRoot)
+}
+
+// [37] CompactionPolicy.shouldCompact hysteresis (§5, SF-2) — the pure predicate now lives in
+// MaverythingCore (testable from mvsim, which cannot reach AppModel), so this is a HARD check,
+// not a manual/CI gap.
+b5CompactionBlock: do {
+    check("[B5][37] shouldCompact 24% false",
+          !CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 240_000, now: 1000, lastAt: 0))
+    check("[B5][37] shouldCompact 25%(26%) cooldown-elapsed true",
+          CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 260_000, now: 700, lastAt: 0))
+    check("[B5][37] shouldCompact 26% in-cooldown false",
+          !CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 260_000, now: 100, lastAt: 0))
+    check("[B5][37] shouldCompact 40%+ ignores cooldown true",
+          CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 400_001, now: 100, lastAt: 0))
+    check("[B5][37] shouldCompact total <= 50_000 never compacts false",
+          !CompactionPolicy.shouldCompact(total: 50_000, deleted: 45_000, now: 10_000, lastAt: 0))
+    // Hysteresis boundary precision: the SAME ratio is false just before the cooldown elapses,
+    // true exactly AT the cooldown boundary (`now - lastAt >= cooldown`, not `>`).
+    check("[B5][37] exactly at the cooldown boundary compacts",
+          CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 260_000,
+                                         now: CompactionPolicy.cooldown, lastAt: 0))
+    check("[B5][37] one second before the cooldown boundary does not",
+          !CompactionPolicy.shouldCompact(total: 1_000_000, deleted: 260_000,
+                                          now: CompactionPolicy.cooldown - 1, lastAt: 0))
 }
 
 // ---- report ----

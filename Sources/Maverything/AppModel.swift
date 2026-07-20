@@ -1195,6 +1195,9 @@ final class AppModel: ObservableObject {
 
     private var snapshotDirty = false
     private var saveTimer: Timer?
+    // [37] SPEC-B5-FINAL §5: last compaction-triggered reindex time (systemUptime), for the
+    // CompactionPolicy hysteresis (≤1 compaction / 10 min, except the 40% hard cap).
+    private var lastCompactionAt: TimeInterval = 0
 
     private func startPeriodicSave() {
         saveTimer?.invalidate()
@@ -1203,8 +1206,11 @@ final class AppModel: ObservableObject {
             // Compact away accumulated tombstones (long high-churn sessions) by
             // re-indexing — reuses the well-tested crawl path and reclaims RAM.
             let s = self.index.liveStats()
-            if s.total > 50_000, s.deleted > s.total * 2 / 5 {
-                Diag.log("compacting: \(s.deleted)/\(s.total) tombstoned → reindex")
+            let now = ProcessInfo.processInfo.systemUptime
+            if CompactionPolicy.shouldCompact(total: s.total, deleted: s.deleted, now: now, lastAt: self.lastCompactionAt) {
+                let hard = s.deleted * CompactionPolicy.hardDen > s.total * CompactionPolicy.hardNum
+                Diag.log("compacting: \(s.deleted)/\(s.total) tombstoned (>=25%\(hard ? ", hard>=40%" : "")) → reindex")
+                self.lastCompactionAt = now
                 self.beginIndexing()
                 return
             }

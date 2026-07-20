@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The in-memory file index, modeled after Everything's flat RAM structure.
 ///
@@ -18,10 +19,10 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var nameBlob: [UInt8] = []   // original UTF-8 bytes
     public internal(set) var foldBlob: [UInt8] = []   // ASCII-lowercased shadow (same offsets)
     public internal(set) var unicodeFoldBlob: [UInt8] = []
-    public internal(set) var nameOff: [UInt64] = []
+    public internal(set) var nameOff: [UInt32] = []
     public internal(set) var nameLen: [UInt16] = []
-    public internal(set) var unicodeFoldOff: [UInt64] = []
-    public internal(set) var unicodeFoldLen: [UInt32] = []
+    public internal(set) var unicodeFoldOff: [UInt32] = []
+    public internal(set) var unicodeFoldLen: [UInt16] = []
 
     // Character bloom mask (one UInt64 per entry): a case-folded set of which
     // characters appear anywhere in the name. A search term can only match a name
@@ -78,8 +79,42 @@ public final class FileIndex: @unchecked Sendable {
     public internal(set) var crtime: [Int64] = []     // created, nanoseconds since 1970
     public internal(set) var objType: [UInt8] = []    // VREG=1 VDIR=2 VLNK=5
     public internal(set) var flags: [UInt32] = []     // BSD st_flags
-    public internal(set) var hidden: [Bool] = []      // name starts with '.' or UF_HIDDEN
-    public internal(set) var deleted: [Bool] = []     // tombstones (live removals)
+    // [38] `hidden` is DELETED (computed on the fly, SPEC-B5-FINAL §4.2) — see `isHiddenLocked`.
+    // `deleted: [Bool]` → `deletedBits: [UInt64]` (RENAME, SPEC-B5-FINAL §4.1): one bit per
+    // entry, ceil(count/64) words. Bit i set ⇔ entry i is tombstoned.
+    public internal(set) var deletedBits: [UInt64] = []
+
+    @inline(__always) func isDeletedBitLocked(_ i: Int) -> Bool {
+        (deletedBits[i >> 6] >> (UInt64(i) & 63)) & 1 != 0
+    }
+    @inline(__always) func setDeletedBitLocked(_ i: Int) {
+        deletedBits[i >> 6] |= (UInt64(1) << (UInt64(i) & 63))
+    }
+    /// One entry, always born live. MUST be called while `count` still equals the id about to
+    /// be appended — i.e. BEFORE `nameOff.append` at every single-append site (§4.3).
+    @inline(__always) func appendLiveBitLocked() {
+        if (count & 63) == 0 { deletedBits.append(0) }
+    }
+    /// Batch path: size the bitmap to ceil(count/64) AFTER all nameOff appends for the batch.
+    @inline(__always) func growLiveBitsLocked(by n: Int) {
+        let need = (count + 63) >> 6
+        if deletedBits.count < need {
+            deletedBits.append(contentsOf: repeatElement(0, count: need - deletedBits.count))
+        }
+    }
+    /// TEST-ONLY: the bitmap word count matches ceil(count/64) exactly (§4.3 invariant).
+    public func _debugBitmapWellFormed() -> Bool {
+        rdlock(); defer { unlock() }
+        return deletedBits.count == (count + 63) >> 6
+    }
+    /// Recomputed on demand (§4.2): `hidden` is DROPPED, single source of truth is the name +
+    /// flags. SF-1: a zero-length name must not index `nameBlob[nameOff[i]]` (would alias the
+    /// next entry's offset, or — for the last entry — equal `nameBlob.count`, an OOB read).
+    @inline(__always) func isHiddenLocked(_ i: Int) -> Bool {
+        if (flags[i] & UInt32(UF_HIDDEN)) != 0 { return true }
+        guard nameLen[i] > 0 else { return false }
+        return nameBlob[Int(nameOff[i])] == UInt8(ascii: ".")
+    }
 
     // Live-update indexes (built during crawl, maintained by the reconciler).
     // CSR (csrChildIds/csrChildOff) + childOverlay map a directory entry to its child entry
@@ -365,8 +400,8 @@ public final class FileIndex: @unchecked Sendable {
     }
     @inline(__always) public func isDeleted(_ i: Int) -> Bool {
         rdlock(); defer { unlock() }
-        guard i >= 0, i < deleted.count else { return true }
-        return deleted[i]
+        guard i >= 0, i < count else { return true }   // entry count, NOT deletedBits.count (word count)
+        return isDeletedBitLocked(i)
     }
 
     /// Empties the index (for a full re-crawl).
@@ -385,8 +420,8 @@ public final class FileIndex: @unchecked Sendable {
         parent.removeAll(keepingCapacity: false); size.removeAll(keepingCapacity: false)
         mtime.removeAll(keepingCapacity: false); crtime.removeAll(keepingCapacity: false)
         objType.removeAll(keepingCapacity: false)
-        flags.removeAll(keepingCapacity: false); hidden.removeAll(keepingCapacity: false)
-        deleted.removeAll(keepingCapacity: false)
+        flags.removeAll(keepingCapacity: false)
+        deletedBits.removeAll(keepingCapacity: false)
         _deletedCount = 0
         csrChildIds.removeAll(); csrChildOff.removeAll(); childOverlay.removeAll()
         dirIndexByHash.removeAll(keepingCapacity: false)
@@ -411,11 +446,50 @@ public final class FileIndex: @unchecked Sendable {
         nameMask.reserveCapacity(n)
         parent.reserveCapacity(n); size.reserveCapacity(n); mtime.reserveCapacity(n)
         crtime.reserveCapacity(n)
-        objType.reserveCapacity(n); flags.reserveCapacity(n); hidden.reserveCapacity(n)
-        deleted.reserveCapacity(n)
+        objType.reserveCapacity(n); flags.reserveCapacity(n)
+        deletedBits.reserveCapacity((n + 63) >> 6)
     }
 
-    // MARK: - Building
+    // MARK: - [35]/[19] name-blob overflow fail-safe (SPEC-B5-FINAL §3)
+    //
+    // Narrowing nameOff/unicodeFoldOff to UInt32 makes a naive cast TRAP at 4 GiB. Guard
+    // BEFORE the append: skip the whole batch, os_log once, return a drop sentinel. Caller
+    // holds the wrlock already (called first thing inside appendRoot/appendChildren).
+
+    // TEST-ONLY (SPEC-B5-FINAL §7.3): overrides the UInt32.max name-blob cap so mvsim can
+    // exercise the overflow fail-safe deterministically without a real 4 GiB allocation. nil
+    // (the default) is the real production cap.
+    static var _debugNameBlobCapOverride: Int? = nil
+    public static func _debugSetNameBlobCapOverride(_ cap: Int?) { _debugNameBlobCapOverride = cap }
+
+    @inline(__always) private func nameBlobWouldOverflow(adding n: Int) -> Bool {
+        let cap = Self._debugNameBlobCapOverride ?? Int(UInt32.max)
+        return nameBlob.count &+ n > cap                  // Int is 64-bit on arm64/x86_64; no wrap
+    }
+    @inline(__always) private func unicodeBlobWouldOverflow(adding n: Int) -> Bool {
+        unicodeFoldBlob.count &+ n >= Int(UInt32.max)     // strict: reserve .max sentinel
+    }
+
+    private static var _overflowLogged = false
+    private func osLogOnce(_ msg: String) {
+        guard !Self._overflowLogged else { return }
+        Self._overflowLogged = true
+        os_log(.fault, "%{public}@", msg)
+    }
+
+    /// TEST-ONLY (SPEC-B5-FINAL §7.3): appends one child under `parent` via the real
+    /// `appendChildren` path (same drop-sentinel contract: -1 on overflow, else the append
+    /// base), so mvsim can exercise the width-bound fail-safe end-to-end without exposing the
+    /// internal `ChildBatch` type across the module boundary.
+    public func _debugAppendOneChild(parent: Int32, name: String, isDir: Bool = false) -> Int32 {
+        var batch = ChildBatch()
+        let bytes = Array(name.utf8)
+        bytes.withUnsafeBufferPointer {
+            batch.add(nameBytes: $0, size: 0, mtime: 0, crtime: 0,
+                      objType: isDir ? VNODE_VDIR : VNODE_VREG, flags: 0)
+        }
+        return appendChildren(parent: parent, displayParent: "/", batch)
+    }
 
     /// Appends a crawl root (absolute path stored as the name). Returns its index.
     public func appendRoot(path: String) -> Int32 {
@@ -425,8 +499,15 @@ public final class FileIndex: @unchecked Sendable {
         // findable by an NFC query / full-path match (APFS may store names as NFD).
         let bytes = Array(path.precomposedStringWithCanonicalMapping.utf8)
         let fold = bytes.map(asciiLower)
+        // A root path is ≤ PATH_MAX so this only trips if the blob is ALREADY at the cap —
+        // unreachable on a real Mac, but guarded per §3 for consistency with appendChildren.
+        if nameBlobWouldOverflow(adding: bytes.count) {
+            osLogOnce("index name blob at UInt32 cap — dropping root append")
+            return -1
+        }
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt64(nameBlob.count))
+        appendLiveBitLocked()   // §4.3: BEFORE nameOff.append, while `count` still == idx
+        nameOff.append(UInt32(nameBlob.count))
         nameLen.append(UInt16(bytes.count))
         nameBlob.append(contentsOf: bytes)
         foldBlob.append(contentsOf: fold)
@@ -434,7 +515,7 @@ public final class FileIndex: @unchecked Sendable {
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(-1)
         size.append(0); mtime.append(0); crtime.append(0)
-        objType.append(VNODE_VDIR); flags.append(0); hidden.append(false); deleted.append(false)
+        objType.append(VNODE_VDIR); flags.append(0)
         nameMask.append(.max)   // authoritative value filled by buildLiveIndexes (safe passthrough meanwhile)
         typeClass.append(fold.withUnsafeBufferPointer { FileTypeClass.mask(foldedName: $0.baseAddress!, 0, $0.count) })
         camelBits.append(bytes.withUnsafeBufferPointer { Self.camelBitsOf($0.baseAddress!, 0, bytes.count) })
@@ -447,19 +528,29 @@ public final class FileIndex: @unchecked Sendable {
     /// base global index; child `j` lives at `base + j`. Kept deliberately lean —
     /// no string/dict work under the lock — so the parallel crawl stays fast.
     /// Live-update maps are built afterwards by `buildLiveIndexes()`.
+    /// Returns the DROP SENTINEL `-1` if the name/unicode blob would overflow UInt32 — the
+    /// whole batch is skipped (a directory's children are one contiguous blob; a partial
+    /// append would desync the parallel arrays). The caller (FileEnumerator.swift) MUST
+    /// guard `if base >= 0` before enqueuing subdir jobs (§3 MF-3).
     func appendChildren(parent parentIdx: Int32, displayParent: String, _ batch: ChildBatch) -> Int32 {
         wrlock(); defer { unlock() }
         bumpMut()
+        if batch.overflowed
+           || nameBlobWouldOverflow(adding: batch.blob.count)
+           || unicodeBlobWouldOverflow(adding: batch.unicodeFoldBlob.count) {
+            osLogOnce("index name blob at UInt32 cap — dropping \(batch.len.count) entries")
+            return -1   // DROP SENTINEL — caller must NOT enqueue this batch's subdirs
+        }
         let base = Int32(nameOff.count)
-        let blobBase = UInt64(nameBlob.count)
-        let unicodeBlobBase = UInt64(unicodeFoldBlob.count)
+        let blobBase = UInt32(nameBlob.count)
+        let unicodeBlobBase = UInt32(unicodeFoldBlob.count)
         nameBlob.append(contentsOf: batch.blob)
         foldBlob.append(contentsOf: batch.fold)
         unicodeFoldBlob.append(contentsOf: batch.unicodeFoldBlob)
         for o in batch.off { nameOff.append(checkedBlobOffset(o, adding: blobBase)) }
         nameLen.append(contentsOf: batch.len)
         for o in batch.unicodeFoldOff {
-            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : checkedBlobOffset(o, adding: unicodeBlobBase))
+            unicodeFoldOff.append(o == noUnicodeFoldOffset ? o : checkedUnicodeOffset(o, adding: unicodeBlobBase))
         }
         unicodeFoldLen.append(contentsOf: batch.unicodeFoldLen)
         size.append(contentsOf: batch.size)
@@ -467,9 +558,9 @@ public final class FileIndex: @unchecked Sendable {
         crtime.append(contentsOf: batch.crtime)
         objType.append(contentsOf: batch.objType)
         flags.append(contentsOf: batch.flags)
-        hidden.append(contentsOf: batch.hidden)
         let n = batch.len.count
-        for _ in 0..<n { parent.append(parentIdx); deleted.append(false) }
+        for _ in 0..<n { parent.append(parentIdx) }
+        growLiveBitsLocked(by: n)   // §4.3: AFTER all nameOff appends for the batch
         nameMask.append(contentsOf: repeatElement(.max, count: n))   // filled by buildLiveIndexes
         // typeClass is a FILTER (not a prefilter) computed EXACT at append time (a search during
         // the crawl must not miss these). Now computed in ChildBatch.appendName off the write
@@ -793,7 +884,7 @@ public final class FileIndex: @unchecked Sendable {
     /// never resolve to a WRONG directory — a colliding query just misses (nil), which
     /// callers already treat as "unknown dir" (safe parent-rescan fallback).
     @inline(__always) private func _dirIndexVerified(_ p: String) -> Int32? {
-        guard let i = dirIndexByHash[pathHash(p)], !deleted[Int(i)], _path(Int(i)) == p else { return nil }
+        guard let i = dirIndexByHash[pathHash(p)], !isDeletedBitLocked(Int(i)), _path(Int(i)) == p else { return nil }
         return i
     }
 
@@ -826,7 +917,7 @@ public final class FileIndex: @unchecked Sendable {
             guard let pid = _dirIndexVerified(parent) else { continue }
             let childIdxs = childrenLocked(of: pid)
             var nameToId = [String: Int32](minimumCapacity: childIdxs.count)
-            for ci in childIdxs where !deleted[Int(ci)] { nameToId[_name(Int(ci))] = ci }
+            for ci in childIdxs where !isDeletedBitLocked(Int(ci)) { nameToId[_name(Int(ci))] = ci }
             for (full, base) in kids where nameToId[String(base)] != nil { out[full] = nameToId[String(base)]! }
         }
         return out
@@ -905,7 +996,7 @@ public final class FileIndex: @unchecked Sendable {
         var out = [Int64](repeating: 0, count: n)
         var i = n - 1
         while i >= 0 {
-            if !deleted[i] {
+            if !isDeletedBitLocked(i) {
                 let own = objType[i] == VNODE_VDIR ? out[i] : size[i]   // dir own-size ignored; VLNK counts as file
                 let p = parent[i]
                 if p >= 0, Int(p) < n { out[Int(p)] &+= own }
@@ -956,7 +1047,7 @@ public final class FileIndex: @unchecked Sendable {
         var out = [Int64](repeating: 0, count: n)
         var i = n - 1
         while i >= 0 {
-            if !deleted[i] {
+            if !isDeletedBitLocked(i) {
                 let own = objType[i] == VNODE_VDIR ? out[i] : size[i]
                 let p = parent[i]
                 if p >= 0, Int(p) < n { out[Int(p)] &+= own }
@@ -986,7 +1077,7 @@ public final class FileIndex: @unchecked Sendable {
         while let cur = stack.popLast() {
             hops += 1; if hops > 20_000_000 { break }
             let i = Int(cur)
-            if i < 0 || i >= objType.count || deleted[i] { continue }
+            if i < 0 || i >= objType.count || isDeletedBitLocked(i) { continue }
             if objType[i] != VNODE_VDIR { total += size[i] }
             stack.append(contentsOf: childrenLocked(of: cur))
         }
@@ -1067,12 +1158,12 @@ public final class FileIndex: @unchecked Sendable {
         var removed = 0
         // The stub lives under the parent dir's children; the root copy has parent == -1.
         if let pi = _dirIndexVerified(parentPath) {
-            for k in childrenLocked(of: pi) where !deleted[Int(k)] && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
+            for k in childrenLocked(of: pi) where !isDeletedBitLocked(Int(k)) && objType[Int(k)] == VNODE_VDIR && _name(Int(k)) == lastName {
                 removed += _markDeletedSubtree(k)
             }
         }
         // Ensure the path resolves to the surviving root copy for future reconciles.
-        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] && _name(i) == p {
+        for i in 0..<parent.count where parent[i] == -1 && !isDeletedBitLocked(i) && _name(i) == p {
             dirIndexByHash[pathHash(p)] = Int32(i)
             break
         }
@@ -1085,7 +1176,7 @@ public final class FileIndex: @unchecked Sendable {
     public func liveRootPaths() -> [String] {
         rdlock(); defer { unlock() }
         var out: [String] = []
-        for i in 0..<parent.count where parent[i] == -1 && !deleted[i] { out.append(_name(i)) }
+        for i in 0..<parent.count where parent[i] == -1 && !isDeletedBitLocked(i) { out.append(_name(i)) }
         return out
     }
 
@@ -1097,17 +1188,20 @@ public final class FileIndex: @unchecked Sendable {
         var res = ReconcileResult()
         guard epochValue == expectedEpoch else { return res }   // stale reconcile from a prior crawl
         let di = Int(dirIdx)
-        guard di < deleted.count, !deleted[di] else { return res }
+        guard di < count, !isDeletedBitLocked(di) else { return res }   // MF-1: entry count, NOT deletedBits.count (word count)
 
         let oldIdxs = childrenLocked(of: dirIdx)   // slice; consumed into oldByName below before any mutation (R5)
         var oldByName = [String: Int32](minimumCapacity: oldIdxs.count)
-        for ci in oldIdxs where !deleted[Int(ci)] { oldByName[_name(Int(ci))] = ci }
+        for ci in oldIdxs where !isDeletedBitLocked(Int(ci)) { oldByName[_name(Int(ci))] = ci }
 
         // Append a fresh child entry, registering it as a dir (map + recurse) if applicable.
+        // §3: -1 is the drop sentinel (name blob at the UInt32 cap) — unreachable on a real
+        // Mac, but never register it as a dir / recurse into it / add it to newList (identical
+        // outcome to "this FS event was dropped").
         func appendChild(_ c: DirEntry, _ nameStr: String) -> Int32 {
             let ni = _appendOne(parent: dirIdx, name: c.name, size: c.size,
                                 mtime: c.mtime, crtime: c.crtime, objType: c.objType, flags: c.flags)
-            if c.objType == VNODE_VDIR {
+            if ni >= 0, c.objType == VNODE_VDIR {
                 let cp = displayPath == "/" ? "/" + nameStr : displayPath + "/" + nameStr
                 dirIndexByHash[pathHash(cp)] = ni
                 res.newDirs.append(LiveDir(idx: ni, path: cp))  // recurse into it
@@ -1125,7 +1219,8 @@ public final class FileIndex: @unchecked Sendable {
                     // ghost dir (or an un-indexed new dir). Tombstone the old subtree and
                     // re-add so a new directory gets registered + recursed into.
                     _markDeletedSubtree(oi); res.removed += 1
-                    newList.append(appendChild(c, nameStr)); res.added += 1
+                    let ni = appendChild(c, nameStr)
+                    if ni >= 0 { newList.append(ni); res.added += 1 }
                 } else {
                     // flags/hidden affect FILTERING (hidden, UF_HIDDEN) but never a sort key
                     // (name/path/size/mtime/crtime) — log an attr record only when a sort key
@@ -1134,14 +1229,15 @@ public final class FileIndex: @unchecked Sendable {
                     if sortKeyChanged || flags[o] != c.flags {
                         let sizeDelta = c.size &- size[o]                 // BEFORE the in-place write (OI-1)
                         size[o] = c.size; mtime[o] = c.mtime; crtime[o] = c.crtime; flags[o] = c.flags
-                        hidden[o] = (c.name.first == UInt8(ascii: ".")) || (c.flags & UInt32(UF_HIDDEN)) != 0
+                        // hidden is computed on the fly (§4.2) — a flags change is picked up for free.
                         res.changed += 1
                         if sortKeyChanged { logAttr(oi, sizeDelta) }      // delta may be 0 (mtime/crtime-only) — harmless
                     }
                     newList.append(oi)
                 }
             } else {
-                newList.append(appendChild(c, nameStr)); res.added += 1
+                let ni = appendChild(c, nameStr)
+                if ni >= 0 { newList.append(ni); res.added += 1 }
             }
         }
         for (_, oi) in oldByName { _markDeletedSubtree(oi); res.removed += 1 }
@@ -1152,15 +1248,21 @@ public final class FileIndex: @unchecked Sendable {
 
     private func _appendOne(parent p: Int32, name: [UInt8], size s: Int64, mtime mt: Int64,
                             crtime ct: Int64, objType t: UInt8, flags f: UInt32) -> Int32 {
+        // §3: guard before the append; on overflow skip (FS event dropped + logged, identical
+        // to the entry never having been crawled). Unreachable on a real Mac.
+        if nameBlobWouldOverflow(adding: name.count) {
+            osLogOnce("index name blob at UInt32 cap — dropping live reconcile insert")
+            return -1
+        }
         let idx = Int32(nameOff.count)
-        nameOff.append(UInt64(nameBlob.count)); nameLen.append(UInt16(name.count))
+        appendLiveBitLocked()   // §4.3 MINOR: BEFORE nameOff.append, while `count` still == idx
+        nameOff.append(UInt32(nameBlob.count)); nameLen.append(UInt16(name.count))
         nameBlob.append(contentsOf: name)
         for b in name { foldBlob.append(asciiLower(b)) }
         appendUnicodeFoldStorage(for: name, blob: &unicodeFoldBlob,
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         parent.append(p); size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
-        hidden.append((name.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0)
-        deleted.append(false)
+        // hidden is computed on the fly from name+flags (§4.2) — nothing to append.
         // Reconcile-inserted (live FS change): compute the real mask now from the name's
         // fold + unicode-fold bytes so this entry is accelerated immediately (buildLiveIndexes
         // isn't re-run after reconcile). Both representations OR'd → no diacritic false-negative.
@@ -1191,8 +1293,8 @@ public final class FileIndex: @unchecked Sendable {
         var stack = [idx]
         while let cur = stack.popLast() {
             let c = Int(cur)
-            if deleted[c] { continue }
-            deleted[c] = true
+            if isDeletedBitLocked(c) { continue }
+            setDeletedBitLocked(c)
             logTombstone(cur)   // sole deleted=true site: covers every deletion path (spec §1)
             removed += 1
             // Drop the hash→id mapping so it can't leak for the whole session on high churn
@@ -1237,7 +1339,10 @@ public let VNODE_VREG: UInt8 = 1
 public let VNODE_VDIR: UInt8 = 2
 public let VNODE_VLNK: UInt8 = 5   // symbolic link (crawled with NOFOLLOW)
 
-let noUnicodeFoldOffset = UInt64.max
+let noUnicodeFoldOffset: UInt32 = .max
+// Disk-only sentinel (unicodeFoldOff stays UInt64 on disk, v6 format unchanged) — used ONLY
+// by Snapshot.swift's save/load narrowing/widening (§2.2/§2.3 of SPEC-B5-FINAL).
+let diskNoUnicodeFoldOffset: UInt64 = .max
 private let searchFoldLocale = Locale(identifier: "en_US_POSIX")
 
 // FNV-1a 64 primitives for dirIndexByHash keys (streamed byte-by-byte so
@@ -1248,9 +1353,28 @@ private let fnvPrime: UInt64 = 0x100_0000_01b3
     (h ^ UInt64(b)) &* fnvPrime
 }
 
-@inline(__always) private func checkedBlobOffset(_ local: UInt64, adding base: UInt64) -> UInt64 {
+/// [38] Hot unsafe-buffer-pointer bitmap read (SearchEngine scan loops).
+@inline(__always) func bitIsSet(_ buf: UnsafeBufferPointer<UInt64>, _ i: Int) -> Bool {
+    (buf[i >> 6] >> (UInt64(i) & 63)) & 1 != 0
+}
+
+/// [38] Value-type bitmap read for COW-snapshot reads (`let del = index.deletedBits`).
+@inline(__always) func isDeletedIn(_ bits: [UInt64], _ i: Int) -> Bool {
+    (bits[i >> 6] >> (UInt64(i) & 63)) & 1 != 0
+}
+
+@inline(__always) private func checkedBlobOffset(_ local: UInt32, adding base: UInt32) -> UInt32 {
     let (offset, overflow) = local.addingReportingOverflow(base)
+    // Pre-append guards (nameBlobWouldOverflow / unicodeBlobWouldOverflow, called BEFORE the
+    // splice in appendChildren/appendRoot) guarantee no caller ever reaches this. Unreachable
+    // backstop only (§3).
     if overflow { fatalError("Maverything name blob offset overflow") }
+    return offset
+}
+
+@inline(__always) private func checkedUnicodeOffset(_ local: UInt32, adding base: UInt32) -> UInt32 {
+    let (offset, overflow) = local.addingReportingOverflow(base)
+    if overflow { fatalError("Maverything unicode fold blob offset overflow") }
     return offset
 }
 
@@ -1280,22 +1404,40 @@ func unicodeSearchFoldBytes(_ bytes: UnsafeBufferPointer<UInt8>) -> [UInt8] {
 }
 
 func appendUnicodeFoldStorage(for bytes: [UInt8], blob: inout [UInt8],
-                              off: inout [UInt64], len: inout [UInt32]) {
+                              off: inout [UInt32], len: inout [UInt16]) {
     bytes.withUnsafeBufferPointer { bp in
         appendUnicodeFoldStorage(for: bp, blob: &blob, off: &off, len: &len)
     }
 }
 
 func appendUnicodeFoldStorage(for bytes: UnsafeBufferPointer<UInt8>, blob: inout [UInt8],
-                              off: inout [UInt64], len: inout [UInt32]) {
+                              off: inout [UInt32], len: inout [UInt16]) {
     guard containsNonASCII(bytes) else {
         off.append(noUnicodeFoldOffset)
         len.append(0)
         return
     }
     let folded = unicodeSearchFoldBytes(bytes)
-    off.append(UInt64(blob.count))
-    len.append(UInt32(folded.count))
+    // OI-C: a single name's fold is ≤ ~1 KB (NAME_MAX=255 bytes) — UInt16 is astronomically
+    // safe, but guard anyway rather than trap; fall back to "no fold" (ASCII-only match).
+    guard let l16 = UInt16(exactly: folded.count) else {
+        off.append(noUnicodeFoldOffset)
+        len.append(0)
+        return
+    }
+    // §2.5 + Codex B5 review: SELF-guarding strict < UInt32.max bound (reserve .max as the
+    // sentinel). appendRoot/_appendOne call this on the INDEX blob with no splice-time guard,
+    // and the batch-local path could in principle exceed the bound within one giant batch —
+    // relying on callers left both holes (sentinel collision → silent unicode-match loss,
+    // then a trap). On overflow: degrade to "no fold" (ASCII-only match for this entry),
+    // never trap, never collide.
+    guard UInt64(blob.count) &+ UInt64(folded.count) < UInt64(UInt32.max) else {
+        off.append(noUnicodeFoldOffset)
+        len.append(0)
+        return
+    }
+    off.append(UInt32(blob.count))
+    len.append(l16)
     blob.append(contentsOf: folded)
 }
 
@@ -1315,19 +1457,19 @@ func appendUnicodeFoldStorage(for bytes: UnsafeBufferPointer<UInt8>, blob: inout
 
 /// A per-directory accumulation buffer, built thread-locally then appended once.
 struct ChildBatch {
+    var overflowed = false   // batch-local name bytes would pass UInt32.max — must be DROPPED at splice
     var blob: [UInt8] = []
     var fold: [UInt8] = []
     var unicodeFoldBlob: [UInt8] = []
-    var off: [UInt64] = []
+    var off: [UInt32] = []
     var len: [UInt16] = []
-    var unicodeFoldOff: [UInt64] = []
-    var unicodeFoldLen: [UInt32] = []
+    var unicodeFoldOff: [UInt32] = []
+    var unicodeFoldLen: [UInt16] = []
     var size: [Int64] = []
     var mtime: [Int64] = []
     var crtime: [Int64] = []
     var objType: [UInt8] = []
     var flags: [UInt32] = []
-    var hidden: [Bool] = []
     var typeClass: [UInt8] = []   // media-category mask, computed here (parallel) not under the write lock
     var camelBits: [UInt64] = []  // [28] camelCase boundary bitmap, computed here from CASED nameBytes
     /// (localIndex, name) of child directories, to enqueue for further crawling.
@@ -1348,8 +1490,14 @@ struct ChildBatch {
 
     private mutating func appendName(_ nameBytes: UnsafeBufferPointer<UInt8>, size s: Int64, mtime mt: Int64,
                                      crtime ct: Int64, objType t: UInt8, flags f: UInt32) {
+        // Codex B5 review: one directory CAN exceed 4 GiB of child-name bytes (~17M children
+        // on APFS), and this narrowing runs during BATCHING — before appendChildren's
+        // whole-batch drop guard ever sees it. Poison the batch instead of trapping; the
+        // splice-time guard then drops it via the same -1 sentinel path.
+        if UInt64(blob.count) &+ UInt64(nameBytes.count) > UInt64(UInt32.max) { overflowed = true }
+        if overflowed { return }   // stop growing a batch that is already un-appendable
         let localIdx = Int32(len.count)
-        off.append(UInt64(blob.count))
+        off.append(UInt32(blob.count))   // batch-local; guarded above
         len.append(UInt16(nameBytes.count))
         blob.append(contentsOf: nameBytes)
         let foldStart = fold.count
@@ -1365,8 +1513,7 @@ struct ChildBatch {
         appendUnicodeFoldStorage(for: nameBytes, blob: &unicodeFoldBlob,
                                  off: &unicodeFoldOff, len: &unicodeFoldLen)
         size.append(s); mtime.append(mt); crtime.append(ct); objType.append(t); flags.append(f)
-        let isHidden = (nameBytes.first == UInt8(ascii: ".")) || (f & UInt32(UF_HIDDEN)) != 0
-        hidden.append(isHidden)
+        // hidden is computed on the fly from name+flags (§4.2) — nothing to append.
         if t == VNODE_VDIR {
             subdirs.append((localIdx, String(decoding: nameBytes, as: UTF8.self)))
         }

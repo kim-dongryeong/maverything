@@ -98,6 +98,9 @@ public final class FileEnumerator: @unchecked Sendable {
 
         for r in roots {
             let rootIdx = index.appendRoot(path: r.displayPath)
+            // Codex B5 review: a dropped root (-1, blob at cap) must NOT be crawled —
+            // its children would splice in with parent == -1 and become bogus roots.
+            guard rootIdx >= 0 else { continue }
             let guardFsid = restrictToVolume ? fsidOf(path: r.fsPath) : -1
             stack.append((r.fsPath, r.displayPath, rootIdx, guardFsid))
         }
@@ -149,7 +152,11 @@ public final class FileEnumerator: @unchecked Sendable {
                 cond.lock()
                 if !batch.isEmpty {
                     let base = index.appendChildren(parent: dirIdx, displayParent: displayPath, batch)
-                    if !batch.subdirs.isEmpty {
+                    // §3 MF-3: base == -1 is the drop sentinel (name/unicode blob at the UInt32
+                    // cap — the whole batch was skipped). Never enqueue subdir jobs carrying a
+                    // parent id that was never appended; treat it exactly like "dir had no
+                    // readable children" / a permission error.
+                    if base >= 0, !batch.subdirs.isEmpty {
                         var pushed = false
                         for (localIdx, name) in batch.subdirs {
                             let childFs = fsPath == "/" ? "/" + name : fsPath + "/" + name

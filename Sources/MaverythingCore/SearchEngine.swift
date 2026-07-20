@@ -51,6 +51,18 @@ public final class SearchEngine: @unchecked Sendable {
     }
     private var orderCache: [OrderKey: OrderState] = [:]
     private let cacheLock = NSLock()
+    // [30] SPEC-B5-FINAL §6.1: bound orderCache to ≤3 orders (one window = one active sort;
+    // multi-window shares the engine but each re-requests its sort — a small cache + full
+    // rebuild on miss is correct if occasionally slower). `.name` is pinned (base for
+    // name/relevance/runCount/fuzzy, warmed every refresh) so it's never evicted.
+    private var orderCacheLRU: [OrderKey] = []          // guarded by cacheLock; last = MRU
+    private static let maxOrderEntries = 3
+    private static let pinnedNameKey = OrderKey(sort: .name, folderSizes: false)
+    /// Caller holds `cacheLock`. Moves `k` to MRU position (removes then appends).
+    @inline(__always) private func touchLRU(_ k: OrderKey) {
+        if let i = orderCacheLRU.firstIndex(of: k) { orderCacheLRU.remove(at: i) }
+        orderCacheLRU.append(k)
+    }
 
     private enum OrderFamily { case name, attr, fsSize }
     @inline(__always) private func family(_ key: SortKey, folderSizes: Bool) -> OrderFamily {
@@ -75,6 +87,18 @@ public final class SearchEngine: @unchecked Sendable {
         statsLock.unlock()
     }
 
+    /// TEST-ONLY (SPEC-B5-FINAL §6.4): the current bound-cache footprint, for mvsim assertions
+    /// that orderCache stays ≤3 entries and incIDs/gnIDs stay under their narrowing caps.
+    public func _debugCacheFootprint() -> (orderBytes: Int, orderEntries: Int, incBytes: Int, gnBytes: Int) {
+        cacheLock.lock()
+        let oe = orderCache.count
+        let ob = orderCache.values.reduce(0) { $0 + $1.ids.count * MemoryLayout<Int32>.stride }
+        cacheLock.unlock()
+        incLock.lock();       let ib = incIDs.count * MemoryLayout<Int32>.stride; incLock.unlock()
+        genNarrowLock.lock(); let gb = gnIDs.count  * MemoryLayout<Int32>.stride; genNarrowLock.unlock()
+        return (ob, oe, ib, gb)
+    }
+
     // Incremental "narrow as you type": remember the FULL match set of the last simple
     // exact query so the next keystroke (which appends to it) can rescan only that set
     // instead of the whole index. Everything's key perceived-speed trick.
@@ -85,7 +109,7 @@ public final class SearchEngine: @unchecked Sendable {
     private var incSortKey: SortKey = .name
     private var incAscending = true
     private var incGen = -1
-    private static let incMaxCacheIDs = 8_000_000   // memory bound for the narrowing cache
+    private static let incMaxCacheIDs = 4_000_000   // [30] SPEC-B5-FINAL §6.2: memory bound for the narrowing cache (was 8M)
 
     // [23] general-path "narrow as you type": remember the FULL match set of the last NON-relevance
     // general() call so the next keystroke that provably REFINES it rescans only that set. Separate
@@ -350,8 +374,22 @@ public final class SearchEngine: @unchecked Sendable {
             extraMillis += secondsBetween(t0, clock.now) * 1000
         }
         if hhOpt {
-            let hid = index.withReadLock { index.hidden }   // COW snapshot, race-free
-            ids = ids.filter { Int($0) < hid.count && !hid[Int($0)] }
+            // [38] hidden is computed on the fly (§4.2) — filter the already-matched result
+            // set (bounded by match count, not per-candidate) under one lock acquisition.
+            ids = index.withReadLock {
+                index.nameBlob.withUnsafeBufferPointer { nb in
+                index.nameOff.withUnsafeBufferPointer { offB in
+                index.nameLen.withUnsafeBufferPointer { lnB in
+                index.flags.withUnsafeBufferPointer { flB in
+                    ids.filter {
+                        let i = Int($0)
+                        guard i < offB.count else { return false }
+                        if (flB[i] & UInt32(UF_HIDDEN)) != 0 { return false }
+                        guard lnB[i] > 0 else { return true }   // SF-1: 0-len name, not a dotfile
+                        return nb[Int(offB[i])] != UInt8(ascii: ".")
+                    }
+                }}}}
+            }
             total = ids.count
         }
         if sortKey == .runCount {
@@ -534,12 +572,13 @@ public final class SearchEngine: @unchecked Sendable {
         if parsed.isEmpty && scopeRoot == nil {
             let order = orderArray(for: scanOrderKey(sortKey))
             let n = order.count
-            let del = index.deleted   // COW snapshot under the read lock
+            let del = index.deletedBits   // COW snapshot under the read lock
+            let liveCount = index.count   // MF-2: entry count, NOT del.count (word count)
             var out = [Int32](); out.reserveCapacity(min(limit, n))
             var k = 0
             while k < n && out.count < limit {
                 let id = ascending ? order[k] : order[n - 1 - k]
-                if Int(id) >= del.count || !del[Int(id)] { out.append(id) }
+                if Int(id) >= liveCount || !isDeletedIn(del, Int(id)) { out.append(id) }
                 k += 1
             }
             let total = index.count - index.deletedCountLocked   // live entries (tombstones excluded)
@@ -597,7 +636,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func foldedPathBytes(_ id: Int,
                                  blob: UnsafePointer<UInt8>,
-                                 offB: UnsafeBufferPointer<UInt64>,
+                                 offB: UnsafeBufferPointer<UInt32>,
                                  lenB: UnsafeBufferPointer<UInt16>,
                                  parB: UnsafeBufferPointer<Int32>,
                                  stack: UnsafeMutableBufferPointer<Int32>,
@@ -632,11 +671,11 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func searchFoldedPathBytes(_ id: Int,
                                        asciiBlob: UnsafePointer<UInt8>,
-                                       offB: UnsafeBufferPointer<UInt64>,
+                                       offB: UnsafeBufferPointer<UInt32>,
                                        lenB: UnsafeBufferPointer<UInt16>,
                                        unicodeBlob: UnsafePointer<UInt8>?,
-                                       unicodeOffB: UnsafeBufferPointer<UInt64>,
-                                       unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                       unicodeOffB: UnsafeBufferPointer<UInt32>,
+                                       unicodeLenB: UnsafeBufferPointer<UInt16>,
                                        parB: UnsafeBufferPointer<Int32>,
                                        stack: UnsafeMutableBufferPointer<Int32>,
                                        out: UnsafeMutableBufferPointer<UInt8>) -> Int {
@@ -672,11 +711,11 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func foldedNameContains(id: Int,
                                     asciiBase: UnsafePointer<UInt8>,
-                                    offB: UnsafeBufferPointer<UInt64>,
+                                    offB: UnsafeBufferPointer<UInt32>,
                                     lenB: UnsafeBufferPointer<UInt16>,
                                     unicodeBase: UnsafePointer<UInt8>?,
-                                    unicodeOffB: UnsafeBufferPointer<UInt64>,
-                                    unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                    unicodeOffB: UnsafeBufferPointer<UInt32>,
+                                    unicodeLenB: UnsafeBufferPointer<UInt16>,
                                     needle: UnsafeRawPointer,
                                     needleLen: Int) -> Bool {
         let o = Int(offB[id]); let l = Int(lenB[id])
@@ -707,7 +746,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.foldBlob.withUnsafeBufferPointer { fb in
         index.nameOff.withUnsafeBufferPointer { offB in
         index.nameLen.withUnsafeBufferPointer { lenB in
-        index.deleted.withUnsafeBufferPointer { delB in
+        index.deletedBits.withUnsafeBufferPointer { delB in
             let base = fb.baseAddress!
             @inline(__always) func nameHash(_ i: Int) -> UInt64 {
                 var h: UInt64 = 0xcbf2_9ce4_8422_2325           // FNV-1a
@@ -715,8 +754,8 @@ public final class SearchEngine: @unchecked Sendable {
                 for j in 0..<l { h = (h ^ UInt64(base[o + j])) &* 0x1_0000_0000_01b3 }
                 return h
             }
-            for i in 0..<n where !delB[i] { counts[nameHash(i), default: 0] &+= 1 }
-            for i in 0..<n where !delB[i] { if counts[nameHash(i)] ?? 0 > 1 { bitmap[i] = true } }
+            for i in 0..<n where !bitIsSet(delB, i) { counts[nameHash(i), default: 0] &+= 1 }
+            for i in 0..<n where !bitIsSet(delB, i) { if counts[nameHash(i)] ?? 0 > 1 { bitmap[i] = true } }
         }}}}
 
         dupeLock.lock()
@@ -744,10 +783,10 @@ public final class SearchEngine: @unchecked Sendable {
         let n = index.count
         var bitmap = [Bool](repeating: false, count: n)
         index.parent.withUnsafeBufferPointer { parB in
-        index.deleted.withUnsafeBufferPointer { delB in
+        index.deletedBits.withUnsafeBufferPointer { delB in
         index.objType.withUnsafeBufferPointer { otB in
-            for i in 0..<n where !delB[i] && otB[i] == VNODE_VDIR { bitmap[i] = true }
-            for i in 0..<n where !delB[i] {
+            for i in 0..<n where !bitIsSet(delB, i) && otB[i] == VNODE_VDIR { bitmap[i] = true }
+            for i in 0..<n where !bitIsSet(delB, i) {
                 let p = Int(parB[i])
                 if p >= 0 && p < n { bitmap[p] = false }   // has a live child → not empty
             }
@@ -788,9 +827,9 @@ public final class SearchEngine: @unchecked Sendable {
         index.nameOff.withUnsafeBufferPointer { offB in
         index.nameLen.withUnsafeBufferPointer { lenB in
         index.objType.withUnsafeBufferPointer { otB in
-        index.deleted.withUnsafeBufferPointer { delB in
+        index.deletedBits.withUnsafeBufferPointer { delB in
             let base = fb.baseAddress!
-            for i in 0..<n where !delB[i] && otB[i] == VNODE_VDIR {
+            for i in 0..<n where !bitIsSet(delB, i) && otB[i] == VNODE_VDIR {
                 let o = Int(offB[i]); let l = Int(lenB[i])
                 var dot = -1
                 var j = l - 1
@@ -839,11 +878,11 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func matchFoldedName(id: Int,
                                  asciiBase: UnsafePointer<UInt8>,
-                                 offB: UnsafeBufferPointer<UInt64>,
+                                 offB: UnsafeBufferPointer<UInt32>,
                                  lenB: UnsafeBufferPointer<UInt16>,
                                  unicodeBase: UnsafePointer<UInt8>?,
-                                 unicodeOffB: UnsafeBufferPointer<UInt64>,
-                                 unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                 unicodeOffB: UnsafeBufferPointer<UInt32>,
+                                 unicodeLenB: UnsafeBufferPointer<UInt16>,
                                  needle: UnsafePointer<UInt8>,
                                  needleLen: Int,
                                  mode: MatchMode,
@@ -869,11 +908,11 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func matchFoldedNameDP(id: Int,
                                    asciiBase: UnsafePointer<UInt8>,
-                                   offB: UnsafeBufferPointer<UInt64>,
+                                   offB: UnsafeBufferPointer<UInt32>,
                                    lenB: UnsafeBufferPointer<UInt16>,
                                    unicodeBase: UnsafePointer<UInt8>?,
-                                   unicodeOffB: UnsafeBufferPointer<UInt64>,
-                                   unicodeLenB: UnsafeBufferPointer<UInt32>,
+                                   unicodeOffB: UnsafeBufferPointer<UInt32>,
+                                   unicodeLenB: UnsafeBufferPointer<UInt16>,
                                    needle: UnsafePointer<UInt8>,
                                    needleLen: Int,
                                    camelBits: UInt64,
@@ -931,7 +970,7 @@ public final class SearchEngine: @unchecked Sendable {
             index.nameLen.withUnsafeBufferPointer { lenB in
             index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
             index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
-            index.deleted.withUnsafeBufferPointer { delB in
+            index.deletedBits.withUnsafeBufferPointer { delB in
             needle.withUnsafeBufferPointer { nd in
                 let hayBase = fb.baseAddress!
                 let unicodeBase = ufb.baseAddress
@@ -939,7 +978,7 @@ public final class SearchEngine: @unchecked Sendable {
                 let needleLen = needle.count
                 for id32 in base {
                     let id = Int(id32)
-                    if delB[id] { continue }
+                    if bitIsSet(delB, id) { continue }
                     if self.foldedNameContains(id: id, asciiBase: hayBase,
                                                offB: offB, lenB: lenB,
                                                unicodeBase: unicodeBase,
@@ -975,7 +1014,7 @@ public final class SearchEngine: @unchecked Sendable {
             index.nameLen.withUnsafeBufferPointer { lenB in
             index.unicodeFoldOff.withUnsafeBufferPointer { uOffB in
             index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
-            index.deleted.withUnsafeBufferPointer { delB in
+            index.deletedBits.withUnsafeBufferPointer { delB in
             index.nameMask.withUnsafeBufferPointer { maskB in
             order.withUnsafeBufferPointer { ordB in
             needle.withUnsafeBufferPointer { nd in
@@ -990,7 +1029,7 @@ public final class SearchEngine: @unchecked Sendable {
                         var ids = [Int32]()
                         for k in lo..<hi {
                             let id = Int(ascending ? ordB[k] : ordB[n - 1 - k])
-                            if delB[id] { continue }   // defensive tombstone skip
+                            if bitIsSet(delB, id) { continue }   // defensive tombstone skip
                             if needleMask & maskB[id] != needleMask { continue }   // bloom reject
                             if singleCharExact {          // bloom pass == match (see above)
                                 ids.append(Int32(id)); continue
@@ -1077,7 +1116,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
         index.parent.withUnsafeBufferPointer { parB in
         index.objType.withUnsafeBufferPointer { otB in
-        index.deleted.withUnsafeBufferPointer { delB in
+        index.deletedBits.withUnsafeBufferPointer { delB in
             let fbBase = fb.baseAddress!
             let ufbBase = ufb.baseAddress
             let ndBase = UnsafeRawPointer(nd.baseAddress!)
@@ -1167,7 +1206,7 @@ public final class SearchEngine: @unchecked Sendable {
                             let spBase = spB.baseAddress!
                             for k in lo..<hi {
                                 let id = Int(ascending ? ordB[k] : ordB[oc - 1 - k])
-                                if delB[id] { continue }
+                                if bitIsSet(delB, id) { continue }
                                 if otB[id] == VNODE_VDIR { if dcB[id] { ids.append(Int32(id)) }; continue }
                                 let (nmPtr, nmLen) = nameSeg(id)
                                 let p = Int(parB[id])
@@ -1264,10 +1303,10 @@ public final class SearchEngine: @unchecked Sendable {
             index.withReadLock {
                 guard index.epochLocked == epoch0 else { superseded = true; return }   // Codex P0
                 index.parent.withUnsafeBufferPointer { parB in
-                index.deleted.withUnsafeBufferPointer { delB in
+                index.deletedBits.withUnsafeBufferPointer { delB in
                     for j in k..<hi {
                         let id = Int(ascending ? order[j] : order[n - 1 - j])
-                        if id < delB.count, delB[id] { continue }              // current tombstone
+                        if id < index.count, bitIsSet(delB, id) { continue }   // current tombstone (entry count, NOT word count)
                         if let root = scopeRoot, !self.isUnder(id, root: root, parentB: parB) { continue }
                         batch.append((Int32(id), usePath ? self.index._path(id) : self.index._name(id)))
                     }
@@ -1287,12 +1326,13 @@ public final class SearchEngine: @unchecked Sendable {
         // already in sort order; total = live-and-matched count.
         let (out, total): ([Int32], Int) = index.withReadLock {
             guard index.epochLocked == epoch0 else { return ([], 0) }   // Codex P0: dead-index ids
-            return index.deleted.withUnsafeBufferPointer { delB in
+            let n = index.count   // MF-2-style bound: entry count, NOT deletedBits.count (word count)
+            return index.deletedBits.withUnsafeBufferPointer { delB in
                 var o = [Int32](); o.reserveCapacity(min(matched.count, limit))
                 var t = 0
                 for id in matched {
                     let i = Int(id)
-                    if i < delB.count, delB[i] { continue }
+                    if i < n, bitIsSet(delB, i) { continue }
                     t += 1
                     if o.count < limit { o.append(id) }
                 }
@@ -1539,7 +1579,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.unicodeFoldLen.withUnsafeBufferPointer { uLenB in
         index.size.withUnsafeBufferPointer { szB in
         index.mtime.withUnsafeBufferPointer { mtB in
-        index.deleted.withUnsafeBufferPointer { delB in
+        index.deletedBits.withUnsafeBufferPointer { delB in
         index.objType.withUnsafeBufferPointer { otB in
         index.parent.withUnsafeBufferPointer { parB in
         index.nameMask.withUnsafeBufferPointer { maskB in
@@ -1598,7 +1638,7 @@ public final class SearchEngine: @unchecked Sendable {
                         // produced), so no flip; the cold order array is ascending and flips for
                         // descending (unchanged behavior).
                         let id = narrowing ? Int(ordB[k]) : Int(ascending ? ordB[k] : ordB[n - 1 - k])
-                        if delB[id] { continue }   // defensive: skip tombstones even if order is stale
+                        if bitIsSet(delB, id) { continue }   // defensive: skip tombstones even if order is stale
                         // character bloom prefilter: reject before any byte scan when the
                         // name can't possibly contain the needle's characters (cheapest,
                         // most-selective gate for text queries — esp. fuzzy).
@@ -1982,7 +2022,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func affixMatches(_ id: Int, _ affixBase: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
                               unicodeBase: UnsafePointer<UInt8>?,
-                              uOffB: UnsafeBufferPointer<UInt64>, uLenB: UnsafeBufferPointer<UInt32>,
+                              uOffB: UnsafeBufferPointer<UInt32>, uLenB: UnsafeBufferPointer<UInt16>,
                               prefixes: [[UInt8]], suffixes: [[UInt8]]) -> Bool {
         let hasU = unicodeBase != nil && uOffB[id] != noUnicodeFoldOffset
         let uo = hasU ? Int(uOffB[id]) : 0, ul = hasU ? Int(uLenB[id]) : 0
@@ -2005,7 +2045,7 @@ public final class SearchEngine: @unchecked Sendable {
     @inline(__always)
     private func excludedByAffix(_ id: Int, _ affixBase: UnsafePointer<UInt8>, _ o: Int, _ l: Int,
                                  unicodeBase: UnsafePointer<UInt8>?,
-                                 uOffB: UnsafeBufferPointer<UInt64>, uLenB: UnsafeBufferPointer<UInt32>,
+                                 uOffB: UnsafeBufferPointer<UInt32>, uLenB: UnsafeBufferPointer<UInt16>,
                                  notPrefixes: [[UInt8]], notSuffixes: [[UInt8]]) -> Bool {
         let hasU = unicodeBase != nil && uOffB[id] != noUnicodeFoldOffset
         let uo = hasU ? Int(uOffB[id]) : 0, ul = hasU ? Int(uLenB[id]) : 0
@@ -2062,14 +2102,17 @@ public final class SearchEngine: @unchecked Sendable {
             case .name:
                 if s.epoch == epoch && s.structSeen == structSeq {
                     if s.appliedSeq != totalSeq { s.appliedSeq = totalSeq; orderCache[ck] = s }   // CF-2: in-lock
+                    touchLRU(ck)
                     let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
                 }
             case .attr:
                 if s.epoch == epoch && s.appliedSeq == totalSeq {
+                    touchLRU(ck)
                     let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
                 }
             case .fsSize:
                 if s.mutGen == mutGen {
+                    touchLRU(ck)
                     let ids = s.ids; cacheLock.unlock(); bumpNoop(); return ids
                 }
             }
@@ -2088,7 +2131,17 @@ public final class SearchEngine: @unchecked Sendable {
 
         let newState = OrderState(epoch: epoch, mutGen: mutGen, appliedSeq: totalSeq,
                                   structSeen: structSeq, ids: order)
-        cacheLock.lock(); orderCache[ck] = newState; cacheLock.unlock()
+        cacheLock.lock()
+        orderCache[ck] = newState; touchLRU(ck)
+        // [30] Evict LRU entries beyond the cap, never the just-inserted key or the pinned
+        // `.name` base. Eviction only ever drops a dict entry — a returned order is a COW
+        // `[Int32]` value already copied out to the caller, so this never mutates a live array.
+        while orderCache.count > Self.maxOrderEntries {
+            guard let victim = orderCacheLRU.first(where: { $0 != ck && $0 != Self.pinnedNameKey }) else { break }
+            orderCache.removeValue(forKey: victim)
+            orderCacheLRU.removeAll { $0 == victim }
+        }
+        cacheLock.unlock()
         return order
     }
 
@@ -2211,18 +2264,18 @@ public final class SearchEngine: @unchecked Sendable {
 
     /// First 8 folded name bytes packed into a UInt64 for a cheap integer-compare fast path.
     @inline(__always) func nameKey64(_ i: Int, _ base: UnsafePointer<UInt8>,
-            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> UInt64 {
+            _ offB: UnsafeBufferPointer<UInt32>, _ lenB: UnsafeBufferPointer<UInt16>) -> UInt64 {
         let o = Int(offB[i]); let l = min(Int(lenB[i]), 8); var k: UInt64 = 0; var j = 0
         while j < l { k |= UInt64(base[o + j]) << (56 - 8 * j); j += 1 }; return k
     }
     @inline(__always) func nameLessTie(_ ia: Int, _ ib: Int, _ base: UnsafePointer<UInt8>,
-            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
+            _ offB: UnsafeBufferPointer<UInt32>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
         let oa = Int(offB[ia]), la = Int(lenB[ia]), ob = Int(offB[ib]), lb = Int(lenB[ib])
         let m = min(la, lb); let r = m > 0 ? memcmp(base + oa, base + ob, m) : 0
         if r != 0 { return r < 0 }; if la != lb { return la < lb }; return ia < ib   // id tie-break
     }
     @inline(__always) func nameLess(_ a: Int32, _ b: Int32, _ base: UnsafePointer<UInt8>,
-            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
+            _ offB: UnsafeBufferPointer<UInt32>, _ lenB: UnsafeBufferPointer<UInt16>) -> Bool {
         let ka = nameKey64(Int(a), base, offB, lenB), kb = nameKey64(Int(b), base, offB, lenB)
         return ka != kb ? ka < kb : nameLessTie(Int(a), Int(b), base, offB, lenB)
     }
@@ -2285,9 +2338,9 @@ public final class SearchEngine: @unchecked Sendable {
     private func computeOrder(_ key: SortKey) -> [Int32] {
         if key == .path { return computePathOrder() }   // true full-path order (folded), not basename
         let n = index.count
-        let del = index.deleted
+        let del = index.deletedBits
         var ids = [Int32](); ids.reserveCapacity(n)
-        for i in 0..<n where !del[i] { ids.append(Int32(i)) }
+        for i in 0..<n where !isDeletedIn(del, i) { ids.append(Int32(i)) }
         switch key {
         case .size:
             let size = index.size
@@ -2338,7 +2391,7 @@ public final class SearchEngine: @unchecked Sendable {
     /// Produces the EXACT same total order as `pairs.sort { (key64, nameLessTie) }` — key64 asc, then folded-name
     /// memcmp beyond 8 bytes, then length, then id. Runs under the inherited index rdlock.
     private func radixNameOrder(_ ids: inout [Int32], _ base: UnsafePointer<UInt8>,
-            _ offB: UnsafeBufferPointer<UInt64>, _ lenB: UnsafeBufferPointer<UInt16>) {
+            _ offB: UnsafeBufferPointer<UInt32>, _ lenB: UnsafeBufferPointer<UInt16>) {
         let n = ids.count; if n < 2 { return }
         var srcK = [UInt64](repeating: 0, count: n)
         for k in 0..<n { srcK[k] = nameKey64(Int(ids[k]), base, offB, lenB) }
@@ -2375,9 +2428,9 @@ public final class SearchEngine: @unchecked Sendable {
     public func _debugNameOrders() -> (radix: [Int32], comparator: [Int32]) {
         index.withReadLock {
             let n = index.count
-            let del = index.deleted
+            let del = index.deletedBits
             var ids = [Int32](); ids.reserveCapacity(n)
-            for i in 0..<n where !del[i] { ids.append(Int32(i)) }
+            for i in 0..<n where !isDeletedIn(del, i) { ids.append(Int32(i)) }
             return index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
@@ -2400,9 +2453,9 @@ public final class SearchEngine: @unchecked Sendable {
     public func _debugBenchNameOrders() -> (radixSeconds: Double, comparatorSeconds: Double, n: Int) {
         index.withReadLock {
             let n = index.count
-            let del = index.deleted
+            let del = index.deletedBits
             var ids = [Int32](); ids.reserveCapacity(n)
-            for i in 0..<n where !del[i] { ids.append(Int32(i)) }
+            for i in 0..<n where !isDeletedIn(del, i) { ids.append(Int32(i)) }
             return index.foldBlob.withUnsafeBufferPointer { fb in
             index.nameOff.withUnsafeBufferPointer { offB in
             index.nameLen.withUnsafeBufferPointer { lenB in
@@ -2442,7 +2495,7 @@ public final class SearchEngine: @unchecked Sendable {
         index.nameOff.withUnsafeBufferPointer { offB -> [Int32] in
         index.nameLen.withUnsafeBufferPointer { lenB -> [Int32] in
         index.parent.withUnsafeBufferPointer { parB -> [Int32] in
-        index.deleted.withUnsafeBufferPointer { delB -> [Int32] in
+        index.deletedBits.withUnsafeBufferPointer { delB -> [Int32] in
             let base = fb.baseAddress!
             var pathBlob = [UInt8](); pathBlob.reserveCapacity(n * 24)   // ~avg folded path length
             var offs = [Int]();   offs.reserveCapacity(n)                // start of each path in pathBlob
@@ -2452,7 +2505,7 @@ public final class SearchEngine: @unchecked Sendable {
             var stack   = [Int32](repeating: 0, count: 4096)             // reused ancestor stack
             scratch.withUnsafeMutableBufferPointer { sb in
             stack.withUnsafeMutableBufferPointer { stk in
-                for i in 0..<n where !delB[i] {
+                for i in 0..<n where !bitIsSet(delB, i) {
                     let w = foldedPathBytes(i, blob: base, offB: offB, lenB: lenB,
                                             parB: parB, stack: stk, out: sb)
                     offs.append(pathBlob.count)

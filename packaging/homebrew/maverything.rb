@@ -1,17 +1,15 @@
 # ============================================================================
-# DRAFT — NOT SUBMITTED. Do not `brew install` this yet.
+# Backed by the v1.0.0 GitHub release: Maverything-1.0.0.dmg is Developer ID
+# signed, Apple-notarized, and stapled, so this cask installs cleanly (no
+# --no-quarantine needed). Version, sha256, and url below all point at v1.0.0.
 #
-# Prepared for a future GitHub release of Maverything. Before this cask works:
-#   1. Publish a GitHub release with dist/Maverything-<version>.dmg attached
-#      (built by ./make-dmg.sh).
-#   2. Fill in `sha256` (shasum -a 256 dist/Maverything-<version>.dmg).
-#   3. For homebrew/cask submission the app must be Developer ID-signed and
-#      notarized (see the TODO block in make-dmg.sh); unsigned apps are only
-#      acceptable in a personal tap with `--no-quarantine` caveats.
+# Not yet submitted to the official homebrew/cask tap — usable from a personal
+# tap today. On each release bump `version` + `sha256`
+# (shasum -a 256 dist/Maverything-<version>.dmg); the url template follows.
 # ============================================================================
 cask "maverything" do
-  version "0.1"
-  sha256 "PLACEHOLDER_SHA256_OF_DMG" # TODO: shasum -a 256 Maverything-#{version}.dmg
+  version "1.0.0"
+  sha256 "3d1e34b4a2aa60364868d7033cc3048e2ada328a114f5374c01875f63b62d255"
 
   url "https://github.com/kim-dongryeong/maverything/releases/download/v#{version}/Maverything-#{version}.dmg"
   name "Maverything"
@@ -34,11 +32,11 @@ cask "maverything" do
     "~/Library/Application Support/Maverything",
   ]
 
-  # Caveat note (kept as a comment while this is a draft):
+  # Caveat note:
   # - Developers who built from source may also have the make-cert.sh signing
   #   keychain at ~/Library/Keychains/maverything-signing.keychain-db and a
   #   "Maverything Dev Cert" identity; those are dev-machine artifacts, not
   #   installed by this cask, so zap deliberately does not touch them.
-  # - Until releases are notarized, first launch needs right-click -> Open
-  #   (or install with `brew install --cask --no-quarantine maverything`).
+  # - v1.0.0 is notarized, so it launches without a Gatekeeper prompt — no
+  #   right-click -> Open and no --no-quarantine required.
 end

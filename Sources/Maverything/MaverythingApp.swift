@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import MaverythingCore
+import ServiceManagement
 import Sparkle
 import SwiftUI
 
@@ -271,6 +272,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && ev?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
         startHiddenPending = launchedAtLogin
         NSApp.setActivationPolicy(launchedAtLogin ? .accessory : .regular)
+
+        // Default "Start at login" ON — a real-time index is only useful if the app is
+        // actually running to keep it warm, so we opt in on the FIRST launch from
+        // /Applications. Done exactly once: if the user later turns it off in Settings the
+        // flag stays set and we never re-enable it (never fight the user). Gated on
+        // /Applications so a translocated/Downloads first-run doesn't register a bad path;
+        // the flag is only recorded once we're properly installed. macOS shows its own
+        // "added a login item" notice, so this is transparent, not silent.
+        let defs = UserDefaults.standard
+        if !defs.bool(forKey: "didInitialLoginItemSetup"),
+           Bundle.main.bundlePath.hasPrefix("/Applications/") {
+            defs.set(true, forKey: "didInitialLoginItemSetup")
+            if SMAppService.mainApp.status != .enabled {
+                try? SMAppService.mainApp.register()
+            }
+        }
 
         HotkeyController.shared.onTrigger = { [weak self] in self?.toggle() }
         HotkeyController.shared.reregister()   // user-configurable global hotkey (default ⌥Space)

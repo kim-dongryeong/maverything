@@ -167,23 +167,56 @@ struct HotkeyRecorder: NSViewRepresentable {
     }
 }
 
+/// Surfaces the hosting `NSWindow` of a SwiftUI view so window-level behavior (here: the
+/// ESC-to-close key monitor) can scope itself to exactly this window.
+private struct WindowAccessor: NSViewRepresentable {
+    @Binding var window: NSWindow?
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { window = v.window }
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async { if window !== v.window { window = v.window } }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var hotkeyDisplay = HotkeyConfig.current.display
     /// Live login-item state, read from the system (SMAppService), not UserDefaults —
     /// the user can also flip it in System Settings ▸ General ▸ Login Items.
     @State private var startAtLogin = SMAppService.mainApp.status == .enabled
+    // ESC-to-close: SwiftUI's `.onExitCommand` only fires when the SwiftUI tree holds
+    // first responder, but this window's AppKit controls (the hotkey recorder) steal focus,
+    // so ESC was often swallowed. A window-scoped keyDown monitor is reliable instead.
+    @State private var settingsWindow: NSWindow?
+    @State private var escMonitor: Any?
 
     var body: some View {
         TabView {
             general.tabItem { Label("General", systemImage: "gearshape") }
             indexing.tabItem { Label("Indexing", systemImage: "externaldrive") }
         }
-        .onExitCommand {   // ESC closes Settings (macOS default is ⌘W only)
-            NSApp.keyWindow?.performClose(nil)
-        }
         .frame(width: 500, height: 540)
         .environmentObject(model)
+        .background(WindowAccessor(window: $settingsWindow))
+        .onAppear {
+            guard escMonitor == nil else { return }
+            escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+                // ESC (53), and ONLY when the Settings window is the key window (so the main
+                // search window's own ESC handling is untouched).
+                guard ev.keyCode == 53, let win = settingsWindow, win.isKeyWindow else { return ev }
+                // While recording a hotkey the recorder is first responder — let ESC reach it
+                // (it cancels recording) instead of closing the window.
+                if win.firstResponder is HotkeyRecorder.RecorderView { return ev }
+                win.performClose(nil)
+                return nil   // consume
+            }
+        }
+        .onDisappear {
+            if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+        }
     }
 
     private var general: some View {

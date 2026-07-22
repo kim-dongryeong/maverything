@@ -443,6 +443,12 @@ public final class SearchEngine: @unchecked Sendable {
                                 isStale: (@Sendable () -> Bool)? = nil) -> (ids: [Int32], incomplete: Bool, skippedLarge: Int) {
         guard !needle.isEmpty else { return (ids, false, 0) }
         let folded = caseSensitive ? needle : needle.map(asciiLower)
+        // Policy: content: must NEVER materialize an online-only cloud file — reading a
+        // streaming placeholder's bytes would trigger a download. `SF_DATALESS` (0x40000000
+        // in st_flags) marks those dataless placeholders; mirrored/downloaded cloud files
+        // (and all local files) have it clear and ARE searched. COW snapshot, race-free.
+        let flags = index.flags
+        let SF_DATALESS: UInt32 = 0x4000_0000
         var out: [Int32] = []
         var scanned = 0
         var skippedLarge = 0
@@ -451,6 +457,7 @@ public final class SearchEngine: @unchecked Sendable {
             // Superseded by a newer query? Stop reading files — the result is about to be
             // dropped, and each iteration can be a full file open+scan.
             if i & 0xFF == 0, isStale?() == true { break }
+            if Int(id) < flags.count, (flags[Int(id)] & SF_DATALESS) != 0 { continue }   // streaming → skip
             let r = index.row(Int(id))
             if r.isDir { continue }
             if r.size > contentMaxFileBytes { skippedLarge += 1; continue }

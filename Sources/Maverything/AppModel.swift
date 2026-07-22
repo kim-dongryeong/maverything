@@ -167,9 +167,20 @@ final class AppModel: ObservableObject {
     /// read it without touching @MainActor state (Codex + red-team: reading the
     /// @Published Bool off-main is a data race / Swift-6 break).
     static let indexingMirror = OSAllocatedUnfairLock(initialState: true)
+    /// True while the crawl is in its SECOND phase (cloud storage), so the status bar can
+    /// say "local done — indexing cloud" instead of a single opaque counter. Main-thread only;
+    /// @Published (like statusText) so its accessor is nonisolated for the progress closures.
+    @Published private var indexingCloudPhase = false
     @Published var hasFullDiskAccess = true
     @Published var showOnboarding = false
-    @Published var includeCloud = false        // index ~/Library/CloudStorage etc.
+    // Index ~/Library/CloudStorage (Google Drive/OneDrive/Dropbox) + ~/Library/Mobile
+    // Documents (iCloud). Default ON so cloud files are findable like Spotlight; persisted so
+    // the user's choice sticks (previously it silently reset to false every launch). Name
+    // indexing never downloads (getattrlistbulk reads placeholders); content: skips streaming
+    // files (SF_DATALESS). Cloud is crawled as a SECOND phase after local volumes.
+    @Published var includeCloud: Bool = UserDefaults.standard.object(forKey: "mv.includeCloud") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(includeCloud, forKey: "mv.includeCloud") }
+    }
     /// Everything 1.5-style OFFLINE VOLUMES (r/macapps ask; the paid "Offline Disks File
     /// Searcher" app's whole value prop): keep an unplugged volume's entries in the index —
     /// searchable, dimmed — instead of tombstoning them on unmount. Re-plugging re-crawls
@@ -700,7 +711,10 @@ final class AppModel: ObservableObject {
                     }
                 }
                 self.updateOfflineRoots()
-                let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
+                // Include cloud roots so a snapshot that indexed them keeps getting live
+                // updates; `.filter` drops any that weren't actually in this snapshot.
+                let resumeRoots = roots + (self.includeCloud ? Volumes.cloudCrawlRoots() : [])
+                let indexedRoots = resumeRoots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
                 self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
                                    sinceWhen: meta.lastEventId)
@@ -748,14 +762,25 @@ final class AppModel: ObservableObject {
         resultShown = 0
         resultTotal = 0
         queryNonce &+= 1
+        indexingCloudPhase = false
         statusText = "Indexing all local volumes…"
 
-        let roots = self.desiredCrawlRoots()
-        let exclude = currentExclusions()
         // Snapshot the user-editable crawl config on the MAIN actor now — reading these
         // @Published/computed properties from the background indexQueue would race a
         // concurrent Settings edit (Codex red-team). Everything the crawl needs is captured
         // here as immutable locals and passed in.
+        let cfg = crawlConfig
+        let roots = AppModel.desiredCrawlRoots(cfg)          // local volumes + custom roots
+        // Two-phase crawl: the LOCAL crawl always excludes the cloud File Providers (so name
+        // search over local files is ready first); when the user opts in they are crawled as a
+        // SECOND phase over their own roots. `localExclude` forces cloud out regardless of the
+        // toggle; `cloudExclude` keeps the always-skips (snapshot dir/autofs) + user excludes.
+        var localCfg = cfg; localCfg.includeCloud = false
+        let localExclude = AppModel.exclusions(localCfg)     // always excludes cloud
+        let cloudRoots = cfg.includeCloud ? Volumes.cloudCrawlRoots() : []
+        let cloudExclude = AppModel.exclusions(cfg)          // includeCloud → always+user (cloud allowed)
+        let allRoots = roots + cloudRoots                    // watched + snapshot-root set
+        let watchExclude = currentExclusions()               // cloud NOT excluded from the watcher iff opted in
         let filePatterns = parsedFilePatterns
         let includeOnly = parsedIncludeOnly
         Diag.log("crawl[\(gen)] roots: \(roots.map { "\($0.fsPath)→\($0.displayPath)" }.joined(separator: ", "))  FDA=\(hasFullDiskAccess) cloud=\(includeCloud)")
@@ -765,9 +790,10 @@ final class AppModel: ObservableObject {
         progressTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.indexedCount = self.index.safeCount()
-            self.statusText = "Indexing… \(self.indexedCount.formatted()) items"
+            let prefix = self.indexingCloudPhase ? "Indexing cloud storage… " : "Indexing… "
+            self.statusText = prefix + "\(self.indexedCount.formatted()) items"
             ticks += 1
-            if ticks % 8 == 0 { Diag.log("…progress \(self.indexedCount) items") }
+            if ticks % 8 == 0 { Diag.log("…progress \(self.indexedCount) items (cloud=\(self.indexingCloudPhase))") }
         }
 
         // Serial queue guarantees the previous crawl's worker threads have fully
@@ -786,11 +812,28 @@ final class AppModel: ObservableObject {
             // Capture the FSEvents cursor BEFORE crawling so changes made during the
             // crawl are replayed once the stream starts (not lost).
             let sinceId = FSEventsGetCurrentEventId()
-            let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: exclude,
+            // Phase 1 — local volumes (cloud always excluded here).
+            let stats = en.crawl(roots: roots, restrictToVolume: false, exclude: localExclude,
                                  mountPoints: Volumes.allMountPoints(),
                                  excludeFilePatterns: filePatterns,
                                  includeOnlyFiles: includeOnly)
             if en.isCancelled { return }                     // superseded; skip extra work
+            // Phase 2 — cloud File Providers (opt-in), appended after local so name search is
+            // already live. getattrlistbulk reads placeholders → no download; content: skips
+            // streaming files. Runs on the SAME enumerator/index (crawl appends, never clears).
+            var cloudSeconds = 0.0
+            if !cloudRoots.isEmpty {
+                DispatchQueue.main.async {
+                    guard gen == self.indexGen else { return }
+                    self.indexingCloudPhase = true
+                }
+                let cstats = en.crawl(roots: cloudRoots, restrictToVolume: false, exclude: cloudExclude,
+                                      mountPoints: Volumes.allMountPoints(),
+                                      excludeFilePatterns: filePatterns,
+                                      includeOnlyFiles: includeOnly)
+                if en.isCancelled { return }
+                cloudSeconds = cstats.seconds
+            }
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
                 self.statusText = "Preparing live updates…"
@@ -801,14 +844,15 @@ final class AppModel: ObservableObject {
                 self.currentEnumerator = nil
                 self.progressTimer?.invalidate(); self.progressTimer = nil
                 self.isIndexing = false
+                self.indexingCloudPhase = false
                 self.nameSearchReady = true   // [21] cold path: buildLiveIndexes() above did both phases
                 self.indexedCount = self.index.count
                 self.statusText = String(format: "Indexed %@ items in %.1fs",
-                                         self.index.count.formatted(), stats.seconds)
+                                         self.index.count.formatted(), stats.seconds + cloudSeconds)
                 self.engine.invalidate()
-                Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(stats.seconds)s (\(stats.openErrors) open-errors)")
+                Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(String(format: "%.1f", stats.seconds + cloudSeconds))s (local+cloud, \(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
-                self.startWatching(roots: roots, exclude: exclude, sinceWhen: sinceId)
+                self.startWatching(roots: allRoots, exclude: watchExclude, sinceWhen: sinceId)
                 self.updateOfflineRoots()   // a full recrawl only covers mounted volumes
                 self.saveSnapshot()   // so the next launch is instant
                 if self.pendingVolumeRefresh {

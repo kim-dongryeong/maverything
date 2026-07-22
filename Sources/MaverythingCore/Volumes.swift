@@ -53,13 +53,35 @@ public enum Volumes {
     }
 
     public static func defaultExclusions() -> [String] {
+        return alwaysExclusions() + cloudPrefixes()
+        // Note: /Volumes and cross-volume mounts are handled by the fsid guard,
+        // not by path exclusion (so explicit /Volumes/* roots still crawl fully).
+    }
+
+    /// The cloud File Provider path prefixes. The LOCAL crawl always excludes these; when
+    /// the user opts in they are crawled as a SEPARATE second phase (see cloudCrawlRoots).
+    public static func cloudPrefixes() -> [String] {
         let home = NSHomeDirectory()
-        return alwaysExclusions() + [
+        return [
             home + "/Library/CloudStorage",       // Google Drive, OneDrive, Dropbox, Box…
             home + "/Library/Mobile Documents",   // iCloud Drive
         ]
-        // Note: /Volumes and cross-volume mounts are handled by the fsid guard,
-        // not by path exclusion (so explicit /Volumes/* roots still crawl fully).
+    }
+
+    /// Cloud roots to crawl as the second phase (only the ones that actually exist, so a
+    /// missing provider dir doesn't append a bogus empty root). Crawled AFTER local volumes
+    /// so name search over local files is ready first and the churny/online cloud scan
+    /// doesn't delay it.
+    public static func cloudCrawlRoots() -> [CrawlRoot] {
+        let fm = FileManager.default
+        var roots: [CrawlRoot] = []
+        for p in cloudPrefixes() {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue {
+                roots.append(CrawlRoot(fsPath: p, displayPath: p))
+            }
+        }
+        return roots
     }
 
     /// All mount points on the system (any fs type). The crawler skips descending

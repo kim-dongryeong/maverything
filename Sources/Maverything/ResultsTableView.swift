@@ -357,6 +357,7 @@ struct ResultsTableView: NSViewRepresentable {
                 tv?.deselectAll(nil)   // reloadData keeps selection by position → drop it on a new query
                 model.selectedID = nil; model.selectionCount = 0; model.selectionBytes = 0
                 tv?.scrollRowToVisible(0)
+                coord.pendingSelectPath = nil   // a new query supersedes a pending rename re-select
             } else if !keep.isEmpty {
                 var rows = IndexSet()
                 for (i, id) in coord.renderedIDs.enumerated() {
@@ -376,6 +377,9 @@ struct ResultsTableView: NSViewRepresentable {
                 p.reloadData()
             }
         }
+        // After a rename+Enter the file's id changes on reconcile; re-select it once it
+        // reappears in the (now reloaded) results. No-op when nothing is pending.
+        coord.applyPendingSelection()
     }
 
     private func addColumn(_ table: NSTableView, id: String, title: String,
@@ -1132,6 +1136,25 @@ struct ResultsTableView: NSViewRepresentable {
         // MARK: - inline rename (F2 / configurable Enter)
 
         private var renamingID: Int32?
+        /// After a rename commits via Enter, the file's index id changes (rename = tombstone
+        /// old + append new), so id-based selection loses it. Remember the new path and
+        /// re-select it once the async reconcile lands it back into the results.
+        var pendingSelectPath: String?
+
+        /// Re-select the just-renamed file by its new path once it reappears. Cheap: the
+        /// basename compare short-circuits before the (costly) full-path reconstruction, so
+        /// path() runs only for name matches. No-op (and self-clearing) when nothing pending.
+        func applyPendingSelection() {
+            guard let path = pendingSelectPath, let tv = tableView else { return }
+            let want = (path as NSString).lastPathComponent
+            guard let row = renderedIDs.firstIndex(where: { model.name($0) == want && model.path($0) == path })
+            else { return }   // not reconciled yet → retry on the next reload
+            pendingSelectPath = nil
+            tv.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            tv.scrollRowToVisible(row)
+            tv.window?.makeFirstResponder(tv)
+        }
+
         func beginRename() {
             guard let tv = tableView, tv.selectedRow >= 0, tv.selectedRow < ids.count else { return }
             let row = tv.selectedRow
@@ -1167,9 +1190,11 @@ struct ResultsTableView: NSViewRepresentable {
 
         func controlTextDidEndEditing(_ obj: Notification) {
             model.isInlineRenaming = false
+            // Enter (vs click-away / Tab) means "commit and stay in the list".
+            let viaReturn = (obj.userInfo?["NSTextMovement"] as? Int) == NSTextMovement.return.rawValue
             // Live refreshes were suppressed during the edit (updateNSView skips reloadData
             // while renaming); adopt whatever result changes landed meanwhile so the table
-            // isn't left stale after the edit ends.
+            // isn't left stale, then restore keyboard focus + re-select the file on Enter.
             defer {
                 if lastVersion != model.resultsVersion {
                     renderedIDs = model.resultsStore.ids
@@ -1177,6 +1202,12 @@ struct ResultsTableView: NSViewRepresentable {
                     invalidateRowMemo()
                     tableView?.reloadData()
                 }
+                if viaReturn {
+                    // Return the field editor's first responder to the TABLE so arrow-key
+                    // navigation works again (it was previously left on the vanished editor).
+                    tableView?.window?.makeFirstResponder(tableView)
+                }
+                applyPendingSelection()   // re-select now if already reconciled; else on next reload
             }
             guard let tf = obj.object as? NSTextField, let id = renamingID else { return }
             renamingID = nil
@@ -1189,9 +1220,10 @@ struct ResultsTableView: NSViewRepresentable {
             }
             let newPath = ((oldPath as NSString).deletingLastPathComponent as NSString)
                 .appendingPathComponent(newName)
-            do { try FileManager.default.moveItem(atPath: oldPath, toPath: newPath) }
-            catch { NSSound.beep(); tf.stringValue = oldName }
-            // the FSEvents watcher reconciles the rename into the index shortly
+            do {
+                try FileManager.default.moveItem(atPath: oldPath, toPath: newPath)
+                pendingSelectPath = newPath   // follow the file across the async FSEvents reconcile
+            } catch { NSSound.beep(); tf.stringValue = oldName }
         }
 
         @objc func moveToTrash() {

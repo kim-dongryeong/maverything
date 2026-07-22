@@ -931,10 +931,19 @@ final class AppModel: ObservableObject {
     /// the renamed row becomes re-selectable within a few ms rather than after a visible lag.
     func reconcileNow(dirs: [String]) {
         guard let rec = reconciler, !dirs.isEmpty else { return }
-        reconcileQueue.async { [weak self] in
+        // .userInitiated so this hop isn't deprioritized behind low-QoS background (cloud)
+        // reconciles on the same serial queue — a rename must reflect promptly, not in 7-8s.
+        reconcileQueue.async(qos: .userInitiated) { [weak self] in
             let r = rec.reconcile(eventPaths: dirs)
             guard r.didMutate else { return }
-            DispatchQueue.main.async { self?.scheduleLiveRefresh() }
+            DispatchQueue.main.async {
+                guard let self, !self.isIndexing else { return }
+                // Re-run the query NOW (skip the live-refresh throttle's 0.35–1.5 s debounce,
+                // which is for sustained background churn, not a one-off user action).
+                self.indexedCount = self.index.safeCount()
+                self.runSearch()
+                self.broadcastResultsRefresh()
+            }
         }
     }
 

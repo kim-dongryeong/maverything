@@ -1,15 +1,15 @@
 # ============================================================================
-# Backed by the v1.0.0 GitHub release: Maverything-1.0.0.dmg is Developer ID
+# Backed by the v1.0.1 GitHub release: Maverything-1.0.1.dmg is Developer ID
 # signed, Apple-notarized, and stapled, so this cask installs cleanly (no
-# --no-quarantine needed). Version, sha256, and url below all point at v1.0.0.
+# --no-quarantine needed). Version, sha256, and url below all point at v1.0.1.
 #
 # Not yet submitted to the official homebrew/cask tap — usable from a personal
 # tap today. On each release bump `version` + `sha256`
 # (shasum -a 256 dist/Maverything-<version>.dmg); the url template follows.
 # ============================================================================
 cask "maverything" do
-  version "1.0.0"
-  sha256 "3d1e34b4a2aa60364868d7033cc3048e2ada328a114f5374c01875f63b62d255"
+  version "1.0.1"
+  sha256 "0ecb0cbc3a3a86bc50f55beb3fa361b7050c29ef1500db9da7ac43441124a39a"
 
   url "https://github.com/kim-dongryeong/maverything/releases/download/v#{version}/Maverything-#{version}.dmg"
   name "Maverything"
@@ -37,6 +37,6 @@ cask "maverything" do
   #   keychain at ~/Library/Keychains/maverything-signing.keychain-db and a
   #   "Maverything Dev Cert" identity; those are dev-machine artifacts, not
   #   installed by this cask, so zap deliberately does not touch them.
-  # - v1.0.0 is notarized, so it launches without a Gatekeeper prompt — no
+  # - v1.0.1 is notarized, so it launches without a Gatekeeper prompt — no
   #   right-click -> Open and no --no-quarantine required.
 end

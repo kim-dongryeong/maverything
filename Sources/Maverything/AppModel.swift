@@ -330,6 +330,11 @@ final class AppModel: ObservableObject {
     let isPrimary: Bool
     weak var window: NSWindow?   // this model's own NSWindow (ContentView's WindowAccessor sets it)
     private var escMonitor: Any?   // window-level ESC hook (see installEscMonitor)
+    /// True while an inline rename (F2 / Enter) field editor is active in this window's
+    /// results table. Set by the table Coordinator; read by the ESC monitor so ESC cancels
+    /// the rename instead of hiding the window, and by the table so a live refresh doesn't
+    /// reloadData the field editor out from under the edit.
+    var isInlineRenaming = false
     private var keyObserver: NSObjectProtocol?   // secondary: first-become-key focus grant
     private var grantedInitialFocus = false
     /// Posted by whichever model changed state that affects every window's RESULTS
@@ -498,6 +503,9 @@ final class AppModel: ObservableObject {
                   let w = self.window, ev.window === w else { return ev }
             // An active IME composition (e.g. Korean jamo) must keep its ESC-to-cancel.
             if let fr = w.firstResponder as? NSTextView, fr.hasMarkedText() { return ev }
+            // During an inline rename, ESC must CANCEL the edit (handled by the rename field
+            // editor), not hide/close the window — otherwise ESC quit the whole app mid-rename.
+            if self.isInlineRenaming { return ev }
             Diag.log("ESC monitor: window #\(w.windowNumber) primary=\(self.isPrimary) syntax=\(self.showSyntax)")
             if self.showSyntax { self.showSyntax = false; return nil }   // 1st ESC closes help
             self.requestHide?()   // primary: hide via delegate · secondary: close the window

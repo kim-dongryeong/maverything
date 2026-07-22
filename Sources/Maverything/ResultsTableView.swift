@@ -337,7 +337,9 @@ struct ResultsTableView: NSViewRepresentable {
                 tv.scrollRowToVisible(max(0, tv.selectedRow))
             }
         }
-        if coord.lastVersion != model.resultsVersion {
+        if coord.lastVersion != model.resultsVersion, !model.isInlineRenaming {
+            // Skip while an inline rename is up: reloadData would tear down the field editor
+            // and cancel the edit. controlTextDidEndEditing catches up when the edit ends.
             coord.lastVersion = model.resultsVersion
             // Only a genuinely NEW query jumps to the top + drops selection. A live
             // FS refresh of the same query preserves the FULL (multi-)selection &
@@ -1144,13 +1146,38 @@ struct ResultsTableView: NSViewRepresentable {
             tf.drawsBackground = true; tf.backgroundColor = .textBackgroundColor
             tf.delegate = self
             tv.window?.makeFirstResponder(tf)
+            model.isInlineRenaming = true   // ESC cancels the edit (not the window); live refresh won't reloadData over it
             if let editor = tf.currentEditor() {   // select basename (like Finder)
                 let base = (tf.stringValue as NSString).deletingPathExtension
                 editor.selectedRange = NSRange(location: 0, length: (base as NSString).length)
             }
         }
 
+        /// ESC while the rename field editor is up → cancel WITHOUT renaming. Clearing
+        /// `renamingID` first makes the resulting controlTextDidEndEditing a no-op; handing
+        /// first responder back to the table ends the edit and restores the plain cell.
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+            guard sel == #selector(NSResponder.cancelOperation(_:)) else { return false }
+            renamingID = nil
+            model.isInlineRenaming = false
+            control.window?.makeFirstResponder(tableView)
+            tableView?.reloadData()
+            return true
+        }
+
         func controlTextDidEndEditing(_ obj: Notification) {
+            model.isInlineRenaming = false
+            // Live refreshes were suppressed during the edit (updateNSView skips reloadData
+            // while renaming); adopt whatever result changes landed meanwhile so the table
+            // isn't left stale after the edit ends.
+            defer {
+                if lastVersion != model.resultsVersion {
+                    renderedIDs = model.resultsStore.ids
+                    lastVersion = model.resultsVersion
+                    invalidateRowMemo()
+                    tableView?.reloadData()
+                }
+            }
             guard let tf = obj.object as? NSTextField, let id = renamingID else { return }
             renamingID = nil
             tf.isEditable = false; tf.isSelectable = false; tf.isBordered = false; tf.drawsBackground = false

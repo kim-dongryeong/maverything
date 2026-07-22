@@ -1222,7 +1222,11 @@ struct ResultsTableView: NSViewRepresentable {
                 .appendingPathComponent(newName)
             do {
                 try FileManager.default.moveItem(atPath: oldPath, toPath: newPath)
-                pendingSelectPath = newPath   // follow the file across the async FSEvents reconcile
+                // NFC-normalize so the re-select match lines up with the index's stored names.
+                pendingSelectPath = newPath.precomposedStringWithCanonicalMapping
+                // Reflect the rename in the index NOW (don't wait for the throttled FSEvents
+                // watcher) so the new name shows + the row is re-selectable immediately.
+                model.reconcileNow(dirs: [(oldPath as NSString).deletingLastPathComponent])
             } catch { NSSound.beep(); tf.stringValue = oldName }
         }
 

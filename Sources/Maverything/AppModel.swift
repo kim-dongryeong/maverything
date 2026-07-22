@@ -770,6 +770,12 @@ final class AppModel: ObservableObject {
         resultShown = 0
         resultTotal = 0
         queryNonce &+= 1
+        // Bump resultsVersion so the table actually ADOPTS the cleared set: without this the
+        // clear above never reaches the view (ResultsStore.ids has no observer), so the table
+        // kept rendering stale OLD-generation ids — and Reveal/Open/rename on those rows hit
+        // the wrong files once the index was rebuilt. Now the stale rows are dropped up front
+        // and the post-crawl search repopulates with valid ids.
+        resultsVersion &+= 1
         indexingCloudPhase = false
         statusText = "Indexing all local volumes…"
 
@@ -917,6 +923,19 @@ final class AppModel: ObservableObject {
             }
         }
         Diag.log("watching: \(watchPaths.joined(separator: ", ")) since=\(sinceWhen)")
+    }
+
+    /// Reflect a rename/move we just performed into the index IMMEDIATELY by reconciling the
+    /// affected directories, instead of waiting for the FSEvents watcher (which is throttled +
+    /// latent). Same path the watcher uses (reconcile → live refresh), so results update and
+    /// the renamed row becomes re-selectable within a few ms rather than after a visible lag.
+    func reconcileNow(dirs: [String]) {
+        guard let rec = reconciler, !dirs.isEmpty else { return }
+        reconcileQueue.async { [weak self] in
+            let r = rec.reconcile(eventPaths: dirs)
+            guard r.didMutate else { return }
+            DispatchQueue.main.async { self?.scheduleLiveRefresh() }
+        }
     }
 
     @objc private func volumeDidMount(_ note: Notification) {

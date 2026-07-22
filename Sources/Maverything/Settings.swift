@@ -193,10 +193,30 @@ struct SettingsView: View {
     @State private var settingsWindow: NSWindow?
     @State private var escMonitor: Any?
 
+    /// Exact build identity: marketing version + Sparkle build number + the git commit the
+    /// build was made from (stamped by build.sh into Info.plist as MVGitCommit; `-dirty` =
+    /// built with uncommitted changes). Lets you confirm which commit a running build is.
+    static var buildStamp: String {
+        let d = Bundle.main.infoDictionary
+        let v = d?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = d?["CFBundleVersion"] as? String ?? "?"
+        if let c = d?["MVGitCommit"] as? String, !c.isEmpty {
+            return "Maverything \(v) (build \(b) · \(c))"
+        }
+        return "Maverything \(v) (build \(b))"
+    }
+
     var body: some View {
-        TabView {
-            general.tabItem { Label("General", systemImage: "gearshape") }
-            indexing.tabItem { Label("Indexing", systemImage: "externaldrive") }
+        VStack(spacing: 0) {
+            TabView {
+                general.tabItem { Label("General", systemImage: "gearshape") }
+                indexing.tabItem { Label("Indexing", systemImage: "externaldrive") }
+            }
+            Divider()
+            Text(Self.buildStamp)
+                .font(.caption2).foregroundStyle(.secondary)
+                .textSelection(.enabled)   // so the commit is copy-pasteable
+                .padding(.vertical, 4)
         }
         .frame(width: 500, height: 540)
         .environmentObject(model)

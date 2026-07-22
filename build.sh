@@ -48,6 +48,17 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/" || true
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Stamp the exact git commit into the BUNDLE's Info.plist (the source Resources/Info.plist
+# stays untouched, so the repo never goes dirty from a build). The About panel + Settings
+# footer read MVGitCommit so you can tell precisely which commit a running build came from.
+# A `-dirty` suffix flags a build made with uncommitted changes. Runs BEFORE codesign so the
+# stamped plist is sealed.
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+[ -n "$(git status --porcelain 2>/dev/null)" ] && GIT_SHA="${GIT_SHA}-dirty"
+/usr/libexec/PlistBuddy -c "Add :MVGitCommit string $GIT_SHA" "$APP/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :MVGitCommit $GIT_SHA" "$APP/Contents/Info.plist"
+echo "▸ git commit stamp: MVGitCommit=$GIT_SHA"
+
 # ── Sparkle.framework ────────────────────────────────────────────────────────
 # The binary links @rpath/Sparkle.framework (SPM binary artifact). A raw
 # `swift build` run finds it next to the binary via @loader_path, but the .app

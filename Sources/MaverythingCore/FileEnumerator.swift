@@ -128,6 +128,13 @@ public final class FileEnumerator: @unchecked Sendable {
     // MARK: - Worker
 
     private func worker() {
+        // TN3150: getattrlistbulk on a cloud File Provider dir can enter dataless
+        // materialization and block for minutes while the provider fetches the namespace.
+        // Disable materialization on this dedicated crawl thread → such calls fail fast with
+        // EDEADLK, which scan() already treats as a transient error (count + skip the dir).
+        // Harmless for local files (nothing dataless to skip). Thread exits after the crawl.
+        _ = setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+                           IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
         var local = Stats()
         let bufSize = 1 << 20   // 1 MB — fewer syscalls
         let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 8)
@@ -291,6 +298,21 @@ public final class FileEnumerator: @unchecked Sendable {
 
     /// Lists a single directory's children (used by the live reconciler). Returns
     /// nil if the directory can't be opened (deleted / no permission).
+    /// Run `body` with dataless-file materialization DISABLED on the CURRENT thread. Cloud
+    /// File Provider enumeration (getattrlistbulk on an online-only dir) would otherwise block
+    /// for minutes while the provider populates the directory namespace (TN3150). With this
+    /// thread-scoped policy the syscall fails fast with EDEADLK instead — and listDirectory
+    /// already returns nil on that error, so the reconciler skips the dir (keeps its existing
+    /// entries, retries on the next event) rather than blocking the whole queue. Must wrap a
+    /// SYNCHRONOUS body on the exact worker thread (no await / queue hop inside).
+    @inline(__always) public static func withoutDatalessMaterialization<T>(_ body: () throws -> T) rethrows -> T {
+        let type = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, scope = IOPOL_SCOPE_THREAD
+        let saved = getiopolicy_np(type, scope)
+        _ = setiopolicy_np(type, scope, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
+        defer { if saved >= 0 { _ = setiopolicy_np(type, scope, saved) } }
+        return try body()
+    }
+
     public static func listDirectory(_ path: String) -> [DirEntry]? {
         let fd = open(path, O_RDONLY, 0)
         if fd < 0 { return nil }

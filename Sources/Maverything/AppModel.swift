@@ -719,9 +719,10 @@ final class AppModel: ObservableObject {
                     }
                 }
                 self.updateOfflineRoots()
-                // Watch LOCAL roots only — cloud is indexed but not live-reconciled (a blocked
-                // cloud listDirectory would stall the serial reconcile queue; see startWatching).
-                let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
+                // Watch local + cloud (cloud live-reconcile is safe — dataless materialization
+                // is disabled during enumeration). .filter drops roots not in this snapshot.
+                let resumeRoots = roots + (self.includeCloud ? Volumes.cloudCrawlRoots() : [])
+                let indexedRoots = resumeRoots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
                 self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
                                    sinceWhen: meta.lastEventId)
@@ -863,9 +864,9 @@ final class AppModel: ObservableObject {
                 self.engine.invalidate()
                 Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(String(format: "%.1f", stats.seconds + cloudSeconds))s (local+cloud, \(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
-                // Watch LOCAL roots only (cloud is crawled but not live-watched — see
-                // startWatching's cloud note); localExclude already excludes cloud.
-                self.startWatching(roots: roots, exclude: localExclude, sinceWhen: sinceId)
+                // Watch local + cloud. cloudExclude keeps cloud INCLUDED when opted in; cloud
+                // live-reconcile is safe now (dataless materialization disabled during enum).
+                self.startWatching(roots: roots + cloudRoots, exclude: cloudExclude, sinceWhen: sinceId)
                 self.updateOfflineRoots()   // a full recrawl only covers mounted volumes
                 self.saveSnapshot()   // so the next launch is instant
                 if self.pendingVolumeRefresh {
@@ -882,13 +883,11 @@ final class AppModel: ObservableObject {
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
         watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
-        // Cloud File Providers are indexed ONCE (the phase-2 crawl) but must NEVER be
-        // LIVE-reconciled: FileEnumerator.listDirectory on an online-only cloud dir can block
-        // for minutes, and this reconcile queue is serial — one blocked cloud enumeration
-        // stalls EVERY local update too (renames not reflecting for 5+ min). Force cloud into
-        // the reconciler's exclude regardless of the crawl toggle / which caller we came from.
-        let rec = Reconciler(index: index, exclude: exclude + Volumes.cloudPrefixes(),
-                             mountPoints: Volumes.allMountPoints(),
+        // Cloud File Providers ARE live-reconciled (so cloud edits reflect), but their
+        // enumeration runs with dataless materialization DISABLED (see the reconcile wrap
+        // below), so getattrlistbulk on an online-only cloud dir fails fast with EDEADLK
+        // instead of blocking the serial queue for minutes. `exclude` reflects the cloud toggle.
+        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
                              excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
         reconciler = rec
         let q = reconcileQueue
@@ -919,7 +918,10 @@ final class AppModel: ObservableObject {
                 return
             }
             q.async {
-                let r = rec.reconcile(eventPaths: paths)
+                // Dataless materialization OFF for this reconcile: a cloud dir among `paths`
+                // fails fast (EDEADLK → listDirectory nil → dir skipped, kept, retried) instead
+                // of blocking every local update queued behind it. Local dirs are unaffected.
+                let r = FileEnumerator.withoutDatalessMaterialization { rec.reconcile(eventPaths: paths) }
                 // Advance the persisted resume cursor ONLY now that this batch is applied,
                 // so a crash/quit can never persist an id ahead of the index.
                 self.watcher.markApplied(batchMax)

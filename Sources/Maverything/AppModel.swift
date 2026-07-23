@@ -719,10 +719,9 @@ final class AppModel: ObservableObject {
                     }
                 }
                 self.updateOfflineRoots()
-                // Include cloud roots so a snapshot that indexed them keeps getting live
-                // updates; `.filter` drops any that weren't actually in this snapshot.
-                let resumeRoots = roots + (self.includeCloud ? Volumes.cloudCrawlRoots() : [])
-                let indexedRoots = resumeRoots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
+                // Watch LOCAL roots only — cloud is indexed but not live-reconciled (a blocked
+                // cloud listDirectory would stall the serial reconcile queue; see startWatching).
+                let indexedRoots = roots.filter { self.index.dirIndex(forPath: $0.displayPath) != nil }
                 self.startWatching(roots: indexedRoots,
                                    exclude: self.currentExclusions(),
                                    sinceWhen: meta.lastEventId)
@@ -793,8 +792,6 @@ final class AppModel: ObservableObject {
         let localExclude = AppModel.exclusions(localCfg)     // always excludes cloud
         let cloudRoots = cfg.includeCloud ? Volumes.cloudCrawlRoots() : []
         let cloudExclude = AppModel.exclusions(cfg)          // includeCloud → always+user (cloud allowed)
-        let allRoots = roots + cloudRoots                    // watched + snapshot-root set
-        let watchExclude = currentExclusions()               // cloud NOT excluded from the watcher iff opted in
         let filePatterns = parsedFilePatterns
         let includeOnly = parsedIncludeOnly
         Diag.log("crawl[\(gen)] roots: \(roots.map { "\($0.fsPath)→\($0.displayPath)" }.joined(separator: ", "))  FDA=\(hasFullDiskAccess) cloud=\(includeCloud)")
@@ -866,7 +863,9 @@ final class AppModel: ObservableObject {
                 self.engine.invalidate()
                 Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(String(format: "%.1f", stats.seconds + cloudSeconds))s (local+cloud, \(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
-                self.startWatching(roots: allRoots, exclude: watchExclude, sinceWhen: sinceId)
+                // Watch LOCAL roots only (cloud is crawled but not live-watched — see
+                // startWatching's cloud note); localExclude already excludes cloud.
+                self.startWatching(roots: roots, exclude: localExclude, sinceWhen: sinceId)
                 self.updateOfflineRoots()   // a full recrawl only covers mounted volumes
                 self.saveSnapshot()   // so the next launch is instant
                 if self.pendingVolumeRefresh {
@@ -883,7 +882,13 @@ final class AppModel: ObservableObject {
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
         watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
-        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
+        // Cloud File Providers are indexed ONCE (the phase-2 crawl) but must NEVER be
+        // LIVE-reconciled: FileEnumerator.listDirectory on an online-only cloud dir can block
+        // for minutes, and this reconcile queue is serial — one blocked cloud enumeration
+        // stalls EVERY local update too (renames not reflecting for 5+ min). Force cloud into
+        // the reconciler's exclude regardless of the crawl toggle / which caller we came from.
+        let rec = Reconciler(index: index, exclude: exclude + Volumes.cloudPrefixes(),
+                             mountPoints: Volumes.allMountPoints(),
                              excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
         reconciler = rec
         let q = reconcileQueue

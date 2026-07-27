@@ -371,6 +371,11 @@ final class AppModel: ObservableObject {
     private let watcher = FSWatcher()
     private var reconciler: Reconciler?
     private let reconcileQueue = DispatchQueue(label: "maverything.reconcile", qos: .utility)
+    // Cloud dirty-dir reconciles run on their OWN queue + reconciler so a blocking cloud
+    // provider enumeration can never delay a LOCAL rename queued behind it (the 7–8 s → 5 min
+    // stall). Local reconciles stay on reconcileQueue; cloud is routed here by path prefix.
+    private var cloudReconciler: Reconciler?
+    private let cloudReconcileQueue = DispatchQueue(label: "maverything.reconcile.cloud", qos: .utility)
     private var watchedRoots: [CrawlRoot] = []
     private var volumeRefreshInFlight = false
     private var pendingVolumeRefresh = false
@@ -919,14 +924,20 @@ final class AppModel: ObservableObject {
                                sinceWhen: UInt64 = UInt64(kFSEventStreamEventIdSinceNow)) {
         watchedRoots = roots
         let watchPaths = Array(Set(roots.map { $0.displayPath }))
-        // Cloud File Providers ARE live-reconciled (so cloud edits reflect), but their
-        // enumeration runs with dataless materialization DISABLED (see the reconcile wrap
-        // below), so getattrlistbulk on an online-only cloud dir fails fast with EDEADLK
-        // instead of blocking the serial queue for minutes. `exclude` reflects the cloud toggle.
-        let rec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
-                             excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
-        reconciler = rec
-        let q = reconcileQueue
+        // TWO reconcilers, TWO queues: local dirty dirs never wait behind a (possibly blocking)
+        // cloud enumeration. localRec ALWAYS excludes cloud (belt: a stray cloud path routed to
+        // the local queue is skipped, never enumerated). cloudRec reconciles cloud (the passed
+        // `exclude` keeps cloud IN when opted in). Both wrap enumeration in the dataless-OFF I/O
+        // policy so a cloud getattrlistbulk fails fast (EDEADLK → skip) rather than blocking.
+        let localRec = Reconciler(index: index, exclude: exclude + Volumes.cloudPrefixes(),
+                                  mountPoints: Volumes.allMountPoints(),
+                                  excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
+        let cloudRec = Reconciler(index: index, exclude: exclude, mountPoints: Volumes.allMountPoints(),
+                                  excludeFilePatterns: parsedFilePatterns, includeOnlyFiles: parsedIncludeOnly)
+        reconciler = localRec
+        cloudReconciler = cloudRec
+        let cloudPfx = Volumes.cloudPrefixes()
+        func isCloudPath(_ p: String) -> Bool { cloudPfx.contains { p == $0 || p.hasPrefix($0 + "/") } }
         watcher.start(paths: watchPaths, sinceWhen: sinceWhen) { [weak self] paths, mustScanAll, rootChanged, batchMax in
             guard let self else { return }
             if mustScanAll {
@@ -953,16 +964,27 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
-            q.async {
-                // Dataless materialization OFF for this reconcile: a cloud dir among `paths`
-                // fails fast (EDEADLK → listDirectory nil → dir skipped, kept, retried) instead
-                // of blocking every local update queued behind it. Local dirs are unaffected.
-                let r = FileEnumerator.withoutDatalessMaterialization { rec.reconcile(eventPaths: paths) }
-                // Advance the persisted resume cursor ONLY now that this batch is applied,
-                // so a crash/quit can never persist an id ahead of the index.
-                self.watcher.markApplied(batchMax)
-                guard r.didMutate else { return }
-                DispatchQueue.main.async { self.scheduleLiveRefresh() }
+            // Split the batch: local dirs → local queue (fast), cloud dirs → cloud queue
+            // (isolated, may block a cloud provider without ever delaying local).
+            let cloudPaths = paths.filter(isCloudPath)
+            let localPaths = paths.filter { !isCloudPath($0) }
+            // Dataless materialization OFF: a cloud getattrlistbulk fails fast (EDEADLK →
+            // listDirectory nil → dir kept, retried) instead of blocking the queue.
+            if !localPaths.isEmpty {
+                self.reconcileQueue.async {
+                    let r = FileEnumerator.withoutDatalessMaterialization { localRec.reconcile(eventPaths: localPaths) }
+                    self.watcher.markApplied(batchMax)   // advance the resume cursor once local is applied
+                    if r.didMutate { DispatchQueue.main.async { self.scheduleLiveRefresh() } }
+                }
+            } else {
+                // cloud-only batch: still advance the cursor so it never stalls on cloud churn.
+                self.reconcileQueue.async { self.watcher.markApplied(batchMax) }
+            }
+            if !cloudPaths.isEmpty {
+                self.cloudReconcileQueue.async {
+                    let r = FileEnumerator.withoutDatalessMaterialization { cloudRec.reconcile(eventPaths: cloudPaths) }
+                    if r.didMutate { DispatchQueue.main.async { self.scheduleLiveRefresh() } }
+                }
             }
         }
         Diag.log("watching: \(watchPaths.joined(separator: ", ")) since=\(sinceWhen)")

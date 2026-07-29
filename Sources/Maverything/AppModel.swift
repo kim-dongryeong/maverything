@@ -351,10 +351,6 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let searchQueue = DispatchQueue(label: "maverything.search", qos: .userInteractive)
     private let indexQueue = DispatchQueue(label: "maverything.index", qos: .userInitiated)
-    // Cloud is crawled on its OWN queue, AFTER the app is already usable, so a cloud provider
-    // that blocks enumeration for minutes can never freeze the main index lifecycle.
-    private let cloudIndexQueue = DispatchQueue(label: "maverything.index.cloud", qos: .utility)
-    private var currentCloudEnumerator: FileEnumerator?
     // `searchSeq` is read/written from BOTH the main actor and the background search queue,
     // always under `seqLock` — so the accessors are `nonisolated` (a lock-guarded shared
     // counter, not actor state). This lets the engine's `@Sendable isStale` closure poll it
@@ -765,7 +761,6 @@ final class AppModel: ObservableObject {
         let gen = indexGen
         watcher.stop()                  // pause live updates during (re)index
         currentEnumerator?.cancel()     // abort any in-flight crawl fast
-        currentCloudEnumerator?.cancel()   // abort a best-effort cloud crawl too (don't append into a cleared index)
         isIndexing = true
         // [21] The crawl (cold) path is NOT phased (§2.5) — index.clear() below wipes the
         // arrays a stale `nameSearchReady = true` would otherwise let `runSearch` scan mid-clear/
@@ -844,9 +839,19 @@ final class AppModel: ObservableObject {
                                  excludeFilePatterns: filePatterns,
                                  includeOnlyFiles: includeOnly)
             if en.isCancelled { return }                     // superseded; skip extra work
-            // The app becomes usable after the LOCAL crawl. Cloud (opt-in) is crawled SEPARATELY
-            // afterwards, on its own queue (crawlCloudBestEffort), so a cloud File Provider that
-            // blocks enumeration for minutes can NEVER keep the app stuck on "Indexing…".
+            // Phase 2 — cloud (opt-in), crawled INLINE before the app is marked ready, so the
+            // whole cloud index is done BEFORE you start using it — no background cloud crawl
+            // competing with your renames for the index write lock during use (that was the
+            // 1:40 regression). The I/O policy fails-fast on iCloud/APFS dataless dirs so this
+            // doesn't block on those; the reconcile isolation below keeps cloud OFF the local
+            // live-update queue afterwards.
+            if !cloudRoots.isEmpty {
+                DispatchQueue.main.async { if gen == self.indexGen { self.indexingCloudPhase = true } }
+                _ = en.crawl(roots: cloudRoots, restrictToVolume: false, exclude: cloudExclude,
+                             mountPoints: Volumes.allMountPoints(),
+                             excludeFilePatterns: filePatterns, includeOnlyFiles: includeOnly)
+                if en.isCancelled { return }
+            }
             DispatchQueue.main.async {
                 guard gen == self.indexGen else { return }
                 self.statusText = "Preparing live updates…"
@@ -863,57 +868,15 @@ final class AppModel: ObservableObject {
                 self.statusText = String(format: "Indexed %@ items in %.1fs",
                                          self.index.count.formatted(), stats.seconds)
                 self.engine.invalidate()
-                Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(String(format: "%.1f", stats.seconds))s (local, \(stats.openErrors) open-errors)")
+                Diag.log("DONE[\(gen)] indexed \(self.index.count) items in \(String(format: "%.1f", stats.seconds))s (local+cloud, \(stats.openErrors) open-errors)")
                 self.prewarmAndSearch()
-                self.startWatching(roots: roots, exclude: localExclude, sinceWhen: sinceId)
+                self.startWatching(roots: roots + cloudRoots, exclude: cloudExclude, sinceWhen: sinceId)
                 self.updateOfflineRoots()   // a full recrawl only covers mounted volumes
                 self.saveSnapshot()   // so the next launch is instant
                 if self.pendingVolumeRefresh {
                     self.pendingVolumeRefresh = false
                     self.refreshMountedVolumes(reason: "pending after reindex")
                 }
-                // Cloud, now that the app is already usable — isolated so it can't freeze it.
-                if !cloudRoots.isEmpty {
-                    self.crawlCloudBestEffort(gen: gen, localRoots: roots,
-                                              cloudRoots: cloudRoots, cloudExclude: cloudExclude)
-                }
-            }
-        }
-    }
-
-    /// Phase-2 cloud crawl, started ONLY after the app is already usable, on a dedicated queue
-    /// with its own enumerator. A cloud File Provider that blocks enumeration therefore stalls
-    /// only THIS queue — never the app, the local reindex, or local live updates. Best-effort:
-    /// appends whatever it can reach, then rebuilds live indexes and adds cloud to the watcher.
-    private func crawlCloudBestEffort(gen: Int, localRoots: [CrawlRoot],
-                                      cloudRoots: [CrawlRoot], cloudExclude: [String]) {
-        let filePatterns = parsedFilePatterns, includeOnly = parsedIncludeOnly
-        indexingCloudPhase = true
-        statusText = "Indexing cloud storage… (background)"
-        cloudIndexQueue.async { [weak self] in
-            guard let self else { return }
-            let en = FileEnumerator(index: self.index)
-            DispatchQueue.main.sync {
-                if gen == self.indexGen { self.currentCloudEnumerator = en }
-            }
-            guard gen == self.indexGen, !en.isCancelled else { return }
-            _ = en.crawl(roots: cloudRoots, restrictToVolume: false, exclude: cloudExclude,
-                         mountPoints: Volumes.allMountPoints(),
-                         excludeFilePatterns: filePatterns, includeOnlyFiles: includeOnly)
-            if en.isCancelled { return }                     // superseded by a reindex mid-crawl
-            self.index.buildLiveIndexes()
-            DispatchQueue.main.async {
-                guard gen == self.indexGen else { return }
-                self.currentCloudEnumerator = nil
-                self.indexingCloudPhase = false
-                self.indexedCount = self.index.count
-                self.statusText = String(format: "Indexed %@ items", self.index.count.formatted())
-                self.engine.invalidate()
-                // Local watch is already live; add cloud to it now (cloudExclude keeps cloud in).
-                self.startWatching(roots: localRoots + cloudRoots, exclude: cloudExclude,
-                                   sinceWhen: UInt64(kFSEventStreamEventIdSinceNow))
-                self.runSearch()
-                self.saveSnapshot()
             }
         }
     }
